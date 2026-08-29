@@ -34,6 +34,88 @@ pub struct WidgetConfig {
     pub frames: Option<u32>,
 }
 
+/// Character-specific camera framing policy.
+///
+/// `distance_scale` is relative to the model's AABB height, while
+/// `headroom` is the fraction of the vertical viewport below its top edge.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CameraSettings {
+    pub fov_deg: f32,
+    pub distance_scale: f32,
+    pub headroom: f32,
+}
+
+impl Default for CameraSettings {
+    fn default() -> Self {
+        Self {
+            fov_deg: 40.0,
+            distance_scale: 0.6,
+            headroom: 0.05,
+        }
+    }
+}
+
+impl CameraSettings {
+    /// Keep live settings in a valid range so camera math cannot produce a
+    /// degenerate projection or camera distance.
+    fn sanitized(self) -> Self {
+        let defaults = Self::default();
+        Self {
+            fov_deg: if self.fov_deg.is_finite() {
+                self.fov_deg.clamp(1.0, 179.0)
+            } else {
+                defaults.fov_deg
+            },
+            distance_scale: if self.distance_scale.is_finite() {
+                self.distance_scale.clamp(0.1, 10.0)
+            } else {
+                defaults.distance_scale
+            },
+            // More than half a viewport of headroom would put the target
+            // above the top of the frame and is not useful framing policy.
+            headroom: if self.headroom.is_finite() {
+                self.headroom.clamp(0.0, 0.49)
+            } else {
+                defaults.headroom
+            },
+        }
+    }
+}
+
+const MIN_MODEL_HEIGHT: f32 = 0.001;
+/// Rest-pose AABBs can omit a small animated excursion from hair/accessories.
+const TOP_SAFETY_MARGIN: f32 = 0.02;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CameraFrame {
+    target: Vec3,
+    distance: f32,
+    fov_y: f32,
+    view_height: f32,
+}
+
+/// Resolve character-owned framing settings against model bounds.
+///
+/// The top of the model (including the safety margin) is placed at the
+/// requested normalized headroom below the top of the vertical viewport.
+fn resolve_camera_frame(aabb: (Vec3, Vec3), settings: CameraSettings) -> CameraFrame {
+    let settings = settings.sanitized();
+    let (min, max) = aabb;
+    let height = (max.y - min.y).max(MIN_MODEL_HEIGHT);
+    let distance = height * settings.distance_scale;
+    let fov_y = settings.fov_deg.to_radians();
+    let view_height = 2.0 * distance * (fov_y * 0.5).tan();
+    let framed_top = max.y + height * TOP_SAFETY_MARGIN;
+    let target_y = framed_top - (0.5 - settings.headroom) * view_height;
+
+    CameraFrame {
+        target: Vec3::new((min.x + max.x) * 0.5, target_y, (min.z + max.z) * 0.5),
+        distance,
+        fov_y,
+        view_height,
+    }
+}
+
 /// Rolling frame stats fed to the guest and to the measurement harness.
 struct FrameStats {
     frames: u32,
@@ -91,6 +173,7 @@ pub struct Widget {
     camera: Camera,
     hud: Hud,
     anchor: Vec3,
+    camera_settings: CameraSettings,
 
     stats: FrameStats,
     tick_count: u64,
@@ -123,6 +206,7 @@ impl Widget {
             camera: Camera::default(),
             hud: Hud::default(),
             anchor: Vec3::ZERO,
+            camera_settings: CameraSettings::default(),
             stats: FrameStats::new(),
             tick_count: 0,
             hovered: false,
@@ -130,6 +214,26 @@ impl Widget {
             exit: false,
             rendered_frames: 0,
         }
+    }
+
+    /// Update character framing live. The next composed frame uses the new
+    /// camera without recreating the renderer, surface, or pipelines.
+    pub fn set_camera_settings(&mut self, settings: CameraSettings) {
+        self.camera_settings = settings.sanitized();
+        if let Some(aabb) = self.model.as_ref().map(|model| model.aabb) {
+            self.apply_camera_settings(aabb);
+        }
+    }
+
+    fn apply_camera_settings(&mut self, aabb: (Vec3, Vec3)) {
+        let frame = resolve_camera_frame(aabb, self.camera_settings);
+        self.anchor = frame.target;
+        self.camera.fov_y = frame.fov_y;
+        self.camera.znear = 0.05;
+        self.camera.pos = frame.target + Vec3::new(0.0, 0.0, -frame.distance);
+        self.camera.look_at(frame.target);
+        self.sim.look_base = self.camera.pos;
+        self.sim.mouse_target = self.camera.pos;
     }
 
     fn apply_commands(&mut self, commands: Vec<Command>) {
@@ -244,20 +348,10 @@ impl Game for Widget {
         self.scene.transparent_clear = true;
         self.scene.models.push(inst);
 
-        // Camera: airi's VRM defaults — fov 40°, 1 m from the model anchor
-        // on the -Z side (VRM0 rigs face -Z; airi's default camera sits at
-        // z = -1 too).
-        // Anchor at chest height (airi frames the bust: head fills the top
-        // of its 450×600 stage) rather than the AABB midpoint.
-        let aabb = model.aabb;
-        let height = aabb.1.y - aabb.0.y;
-        self.anchor = Vec3::new(0.0, aabb.0.y + height * 0.72, 0.0);
-        self.camera.fov_y = 40f32.to_radians();
-        self.camera.znear = 0.05;
-        self.camera.pos = self.anchor + Vec3::new(0.0, 0.0, -1.0);
-        self.camera.look_at(self.anchor);
-        self.sim.look_base = self.camera.pos;
-        self.sim.mouse_target = self.camera.pos;
+        // Camera framing is character-owned and derived from the loaded
+        // model's bounds. It remains live through set_camera_settings().
+        self.model = Some(model.clone());
+        self.set_camera_settings(self.camera_settings);
 
         // Guest boots last so its boot table reflects the loaded assets.
         let bundle = std::fs::read_to_string(&self.cfg.bundle_path)
@@ -272,7 +366,6 @@ impl Game for Widget {
         )?);
 
         self.vrm = Some(vrm);
-        self.model = Some(model);
         log::info!("init: {:.0} ms", t0.elapsed().as_secs_f32() * 1000.0);
         Ok(())
     }
@@ -394,5 +487,103 @@ impl Game for Widget {
 
     fn wants_exit(&self) -> bool {
         self.exit
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn approx_eq(actual: f32, expected: f32) {
+        assert!((actual - expected).abs() < 1.0e-5, "{actual} != {expected}");
+    }
+
+    #[test]
+    fn default_frame_keeps_top_bounds_inside_requested_headroom() {
+        let aabb = (Vec3::new(-0.4, 0.0, -0.2), Vec3::new(0.6, 1.8, 0.4));
+        let settings = CameraSettings::default();
+        let frame = resolve_camera_frame(aabb, settings);
+        let framed_top = aabb.1.y + (aabb.1.y - aabb.0.y) * TOP_SAFETY_MARGIN;
+        let viewport_top = frame.target.y + frame.view_height * 0.5;
+
+        approx_eq(
+            viewport_top - framed_top,
+            settings.headroom * frame.view_height,
+        );
+        assert!(viewport_top > aabb.1.y, "model top must not be cropped");
+    }
+
+    #[test]
+    fn target_uses_aabb_horizontal_and_depth_center() {
+        let frame = resolve_camera_frame(
+            (Vec3::new(-2.0, 0.0, -4.0), Vec3::new(4.0, 1.8, 2.0)),
+            CameraSettings::default(),
+        );
+
+        approx_eq(frame.target.x, 1.0);
+        approx_eq(frame.target.z, -1.0);
+    }
+
+    #[test]
+    fn distance_scales_with_model_height() {
+        let settings = CameraSettings::default();
+        let short = resolve_camera_frame(
+            (Vec3::ZERO, Vec3::new(1.0, 1.0, 1.0)),
+            settings,
+        );
+        let tall = resolve_camera_frame(
+            (Vec3::ZERO, Vec3::new(1.0, 2.0, 1.0)),
+            settings,
+        );
+
+        approx_eq(tall.distance / short.distance, 2.0);
+        approx_eq(
+            (tall.view_height / tall.distance),
+            (short.view_height / short.distance),
+        );
+    }
+
+    #[test]
+    fn invalid_live_settings_are_sanitized() {
+        let settings = CameraSettings {
+            fov_deg: f32::NAN,
+            distance_scale: -1.0,
+            headroom: 1.0,
+        };
+        assert_eq!(settings.sanitized(), CameraSettings {
+            fov_deg: 40.0,
+            distance_scale: 0.1,
+            headroom: 0.49,
+        });
+
+        assert_eq!(
+            CameraSettings {
+                distance_scale: 100.0,
+                ..settings
+            }
+            .sanitized()
+            .distance_scale,
+            10.0
+        );
+    }
+
+    #[test]
+    fn live_settings_are_available_before_model_load() {
+        let mut widget = Widget::new(WidgetConfig {
+            model_path: PathBuf::new(),
+            vrma_path: PathBuf::new(),
+            bundle_path: PathBuf::new(),
+            size: (450, 600),
+            frames: None,
+        });
+        widget.set_camera_settings(CameraSettings {
+            fov_deg: 35.0,
+            distance_scale: 0.75,
+            headroom: 0.08,
+        });
+
+        assert_eq!(widget.camera_settings.fov_deg, 35.0);
+        assert_eq!(widget.camera_settings.distance_scale, 0.75);
+        assert_eq!(widget.camera_settings.headroom, 0.08);
     }
 }
