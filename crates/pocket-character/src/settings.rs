@@ -53,8 +53,9 @@ pub enum AntiAliasingPreference {
 
 impl Default for AntiAliasingPreference {
     fn default() -> Self {
-        // This is only the requested interactive preference. W04.2 does not
-        // make the renderer use MSAA, and headless rendering ignores it.
+        // This is only the requested interactive preference. Pocket3D may
+        // fall down to a lower hardware-effective count, and headless
+        // rendering ignores it.
         Self::X4
     }
 }
