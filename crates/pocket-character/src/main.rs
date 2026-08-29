@@ -6,6 +6,7 @@
 //! saves an RGBA screenshot — CI-friendly parity checks.
 
 mod guest;
+mod settings;
 mod widget;
 
 use std::path::PathBuf;
@@ -16,61 +17,88 @@ use pocket3d::gpu::{Gpu, OffscreenTarget};
 use pocket3d::input::Input;
 use pocket3d::renderer::Renderer;
 
+use settings::AppSettings;
 use widget::{Widget, WidgetConfig};
 
 const SIZE: (u32, u32) = (450, 600);
 const TICK_HZ: f32 = 60.0;
 
+fn flag(args: &[String], name: &str) -> Option<String> {
+    args.iter()
+        .position(|arg| arg == name)
+        .and_then(|index| args.get(index + 1).cloned())
+}
+
+fn explicit_max_fps(args: &[String]) -> Option<f32> {
+    flag(args, "--max-fps")
+        .and_then(|value| value.parse().ok())
+        .filter(|value: &f32| value.is_finite())
+}
+
+fn apply_cli_overrides(mut settings: AppSettings, args: &[String]) -> AppSettings {
+    // `--max-fps` is the only existing CLI option equivalent to a persisted
+    // setting. Unlike a parser default, this is only applied when present.
+    if let Some(max_fps) = explicit_max_fps(args) {
+        settings.rendering.max_fps = max_fps;
+    }
+    settings.sanitized()
+}
+
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let args: Vec<String> = std::env::args().collect();
-    let flag = |name: &str| -> Option<String> {
-        args.iter()
-            .position(|a| a == name)
-            .and_then(|i| args.get(i + 1).cloned())
-    };
+    // Headless paths intentionally load no interactive settings into their
+    // Widget or renderer. Loading here keeps startup policy centralized while
+    // preserving deterministic 1x headless behavior.
+    let settings = apply_cli_overrides(AppSettings::load(), &args);
     let root = std::env::var("POCKET_CHARACTER_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."));
 
-    let cfg = WidgetConfig {
-        model_path: flag("--model")
+    let mut cfg = WidgetConfig {
+        model_path: flag(&args, "--model")
             .map(PathBuf::from)
             .unwrap_or_else(|| root.join("assets/AvatarSample_A.vrm")),
-        vrma_path: flag("--vrma")
+        vrma_path: flag(&args, "--vrma")
             .map(PathBuf::from)
             .unwrap_or_else(|| root.join("assets/idle_loop.vrma")),
-        bundle_path: flag("--bundle")
+        bundle_path: flag(&args, "--bundle")
             .map(PathBuf::from)
             .unwrap_or_else(|| root.join("dist/character.js")),
         size: SIZE,
-        frames: flag("--frames").and_then(|s| s.parse().ok()),
+        frames: flag(&args, "--frames").and_then(|value| value.parse().ok()),
     };
 
-    if let Some(out) = flag("--headless-shot") {
-        let ticks: u32 = flag("--ticks").and_then(|s| s.parse().ok()).unwrap_or(60);
+    if let Some(out) = flag(&args, "--headless-shot") {
+        let ticks: u32 = flag(&args, "--ticks")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(60);
         return headless_shot(cfg, ticks, PathBuf::from(out));
     }
-    if let Some(dir) = flag("--headless-seq") {
-        let ticks: u32 = flag("--ticks").and_then(|s| s.parse().ok()).unwrap_or(300);
-        let skip: u32 = flag("--skip").and_then(|s| s.parse().ok()).unwrap_or(0);
+    if let Some(dir) = flag(&args, "--headless-seq") {
+        let ticks: u32 = flag(&args, "--ticks")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(300);
+        let skip: u32 = flag(&args, "--skip")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
         return headless_seq(cfg, ticks, skip, PathBuf::from(dir));
     }
 
-    let max_fps = flag("--max-fps").and_then(|s| s.parse().ok()).unwrap_or(60.0);
-    let widget = Widget::new(cfg);
+    cfg.size = (settings.window.width, settings.window.height);
+    let widget = Widget::new_with_camera_settings(cfg, settings.camera);
     pocket3d::app::run(
         AppConfig {
             title: "pocket-character".into(),
-            size: SIZE,
+            size: (settings.window.width, settings.window.height),
             tick_hz: TICK_HZ,
             capture_mouse: false,
             transparent: true,
             decorations: false,
-            always_on_top: true,
-            resizable: false,
-            max_fps: Some(max_fps),
+            always_on_top: settings.window.always_on_top,
+            resizable: settings.window.resizable,
+            max_fps: Some(settings.rendering.max_fps),
             drag_window: true,
         },
         widget,
@@ -126,4 +154,44 @@ fn headless_shot(cfg: WidgetConfig, ticks: u32, out: PathBuf) -> Result<()> {
     target.save_png(&gpu, &out)?;
     println!("wrote {}", out.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use settings::RenderSettings;
+
+    #[test]
+    fn persisted_max_fps_wins_when_cli_is_absent() {
+        let persisted = AppSettings {
+            rendering: RenderSettings {
+                max_fps: 30.0,
+                ..RenderSettings::default()
+            },
+            ..AppSettings::default()
+        };
+
+        let merged = apply_cli_overrides(persisted, &[]);
+        assert_eq!(merged.rendering.max_fps, 30.0);
+    }
+
+    #[test]
+    fn explicit_max_fps_overrides_persisted_and_default_values() {
+        let persisted = AppSettings {
+            rendering: RenderSettings {
+                max_fps: 30.0,
+                ..RenderSettings::default()
+            },
+            ..AppSettings::default()
+        };
+
+        let merged = apply_cli_overrides(
+            persisted,
+            &["pocket-character".into(), "--max-fps".into(), "120".into()],
+        );
+        assert_eq!(merged.rendering.max_fps, 120.0);
+
+        let defaults = apply_cli_overrides(AppSettings::default(), &[]);
+        assert_eq!(defaults.rendering.max_fps, 60.0);
+    }
 }

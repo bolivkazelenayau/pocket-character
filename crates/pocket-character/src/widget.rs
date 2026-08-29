@@ -11,6 +11,8 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use glam::{Mat4, Vec3};
+use pocket_character_core::{CharacterSim, TrackingMode};
+use pocket_vrm::{SpringSolver, VrmDoc};
 use pocket3d::anim::NodeTrs;
 use pocket3d::app::Game;
 use pocket3d::camera::Camera;
@@ -20,10 +22,9 @@ use pocket3d::input::Input;
 use pocket3d::model::{ModelAsset, ModelInstance, ModelLoadOptions};
 use pocket3d::renderer::Renderer;
 use pocket3d::scene::Scene;
-use pocket_character_core::{CharacterSim, TrackingMode};
-use pocket_vrm::{SpringSolver, VrmDoc};
 
 use crate::guest::{CharacterGuest, Command, TickEvent, TickState};
+use crate::settings::CameraSettings;
 
 pub struct WidgetConfig {
     pub model_path: PathBuf,
@@ -32,54 +33,6 @@ pub struct WidgetConfig {
     pub size: (u32, u32),
     /// Render N frames then exit (verification runs).
     pub frames: Option<u32>,
-}
-
-/// Character-specific camera framing policy.
-///
-/// `distance_scale` is relative to the model's AABB height, while
-/// `headroom` is the fraction of the vertical viewport below its top edge.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct CameraSettings {
-    pub fov_deg: f32,
-    pub distance_scale: f32,
-    pub headroom: f32,
-}
-
-impl Default for CameraSettings {
-    fn default() -> Self {
-        Self {
-            fov_deg: 40.0,
-            distance_scale: 0.6,
-            headroom: 0.05,
-        }
-    }
-}
-
-impl CameraSettings {
-    /// Keep live settings in a valid range so camera math cannot produce a
-    /// degenerate projection or camera distance.
-    fn sanitized(self) -> Self {
-        let defaults = Self::default();
-        Self {
-            fov_deg: if self.fov_deg.is_finite() {
-                self.fov_deg.clamp(1.0, 179.0)
-            } else {
-                defaults.fov_deg
-            },
-            distance_scale: if self.distance_scale.is_finite() {
-                self.distance_scale.clamp(0.1, 10.0)
-            } else {
-                defaults.distance_scale
-            },
-            // More than half a viewport of headroom would put the target
-            // above the top of the frame and is not useful framing policy.
-            headroom: if self.headroom.is_finite() {
-                self.headroom.clamp(0.0, 0.49)
-            } else {
-                defaults.headroom
-            },
-        }
-    }
 }
 
 const MIN_MODEL_HEIGHT: f32 = 0.001;
@@ -185,6 +138,10 @@ pub struct Widget {
 
 impl Widget {
     pub fn new(cfg: WidgetConfig) -> Self {
+        Self::new_with_camera_settings(cfg, CameraSettings::default())
+    }
+
+    pub fn new_with_camera_settings(cfg: WidgetConfig, camera_settings: CameraSettings) -> Self {
         // Seed fixed for reproducible measurement runs; behavior parity is
         // distributional, not per-run.
         let sim = CharacterSim::new(0x0c9a_11e0, Vec3::ZERO);
@@ -206,7 +163,7 @@ impl Widget {
             camera: Camera::default(),
             hud: Hud::default(),
             anchor: Vec3::ZERO,
-            camera_settings: CameraSettings::default(),
+            camera_settings: camera_settings.sanitized(),
             stats: FrameStats::new(),
             tick_count: 0,
             hovered: false,
@@ -323,7 +280,11 @@ impl Game for Widget {
         model
             .skeleton
             .sample_locals(None, 0.0, false, &mut self.locals);
-        self.springs = Some(SpringSolver::new(&vrm.springs, &model.skeleton, &self.locals));
+        self.springs = Some(SpringSolver::new(
+            &vrm.springs,
+            &model.skeleton,
+            &self.locals,
+        ));
 
         // Blink expression → morph slots.
         for expr in &vrm.expressions {
@@ -527,19 +488,13 @@ mod tests {
     #[test]
     fn distance_scales_with_model_height() {
         let settings = CameraSettings::default();
-        let short = resolve_camera_frame(
-            (Vec3::ZERO, Vec3::new(1.0, 1.0, 1.0)),
-            settings,
-        );
-        let tall = resolve_camera_frame(
-            (Vec3::ZERO, Vec3::new(1.0, 2.0, 1.0)),
-            settings,
-        );
+        let short = resolve_camera_frame((Vec3::ZERO, Vec3::new(1.0, 1.0, 1.0)), settings);
+        let tall = resolve_camera_frame((Vec3::ZERO, Vec3::new(1.0, 2.0, 1.0)), settings);
 
         approx_eq(tall.distance / short.distance, 2.0);
         approx_eq(
-            (tall.view_height / tall.distance),
-            (short.view_height / short.distance),
+            tall.view_height / tall.distance,
+            short.view_height / short.distance,
         );
     }
 
@@ -550,11 +505,14 @@ mod tests {
             distance_scale: -1.0,
             headroom: 1.0,
         };
-        assert_eq!(settings.sanitized(), CameraSettings {
-            fov_deg: 40.0,
-            distance_scale: 0.1,
-            headroom: 0.49,
-        });
+        assert_eq!(
+            settings.sanitized(),
+            CameraSettings {
+                fov_deg: 40.0,
+                distance_scale: 0.1,
+                headroom: 0.49,
+            }
+        );
 
         assert_eq!(
             CameraSettings {
