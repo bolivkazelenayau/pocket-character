@@ -163,8 +163,11 @@ pub struct Widget {
     debug_backend: String,
     debug_requested_msaa: u32,
     debug_effective_msaa: u32,
+    debug_smaa_enabled: bool,
     requested_msaa: u32,
     pending_msaa_request: Option<u32>,
+    requested_smaa: bool,
+    pending_smaa_request: Option<bool>,
     tick_count: u64,
     hovered: bool,
     pending_events: Vec<TickEvent>,
@@ -207,8 +210,11 @@ impl Widget {
             debug_backend: "unknown".into(),
             debug_requested_msaa: 1,
             debug_effective_msaa: 1,
+            debug_smaa_enabled: false,
             requested_msaa: 1,
             pending_msaa_request: None,
+            requested_smaa: false,
+            pending_smaa_request: None,
             tick_count: 0,
             hovered: false,
             pending_events: Vec::new(),
@@ -300,6 +306,8 @@ impl Game for Widget {
         self.requested_msaa = renderer.requested_sample_count();
         self.debug_requested_msaa = self.requested_msaa;
         self.debug_effective_msaa = renderer.effective_sample_count();
+        self.requested_smaa = renderer.smaa_enabled();
+        self.debug_smaa_enabled = self.requested_smaa;
 
         // 2048 halves the 4096² authoring textures: invisible at 450×600,
         // and GPU texture memory is the widget's dominant footprint.
@@ -390,6 +398,10 @@ impl Game for Widget {
         if input.key_pressed(KeyCode::F4) {
             self.requested_msaa = next_msaa_sample_count(self.requested_msaa);
             self.pending_msaa_request = Some(self.requested_msaa);
+        }
+        if input.key_pressed(KeyCode::F5) {
+            self.requested_smaa = !self.requested_smaa;
+            self.pending_smaa_request = Some(self.requested_smaa);
         }
 
         let hovered = input.cursor().is_some();
@@ -496,18 +508,29 @@ impl Game for Widget {
     }
 
     fn prepare_render(&mut self, gpu: &Gpu, renderer: &mut Renderer) {
-        let Some(requested) = self.pending_msaa_request.take() else {
+        let requested_msaa = self.pending_msaa_request.take();
+        let requested_smaa = self.pending_smaa_request.take();
+        if requested_msaa.is_none() && requested_smaa.is_none() {
             return;
-        };
+        }
 
-        let effective = renderer.set_requested_sample_count(gpu, requested);
+        if let Some(requested) = requested_msaa {
+            renderer.set_requested_sample_count(gpu, requested);
+        }
+        if let Some(enabled) = requested_smaa {
+            renderer.set_smaa_enabled(gpu, enabled);
+        }
+
         self.requested_msaa = renderer.requested_sample_count();
         self.debug_requested_msaa = self.requested_msaa;
-        self.debug_effective_msaa = effective;
+        self.debug_effective_msaa = renderer.effective_sample_count();
+        self.requested_smaa = renderer.smaa_enabled();
+        self.debug_smaa_enabled = self.requested_smaa;
         log::info!(
-            "AA: requested {}x, effective MSAA {}x",
+            "AA: requested {}x, effective MSAA {}x, SMAA {}",
             self.debug_requested_msaa,
-            self.debug_effective_msaa
+            self.debug_effective_msaa,
+            if self.debug_smaa_enabled { "on" } else { "off" }
         );
     }
 
@@ -559,6 +582,10 @@ impl Widget {
             "MSAA: requested {}x / effective {}x",
             self.debug_requested_msaa, self.debug_effective_msaa
         );
+        let smaa = format!(
+            "SMAA: {}",
+            if self.debug_smaa_enabled { "on" } else { "off" }
+        );
         let frame = format!("Frame: {}x{}", size.0, size.1);
         let body = [
             fps.as_str(),
@@ -566,6 +593,7 @@ impl Widget {
             gpu.as_str(),
             backend.as_str(),
             msaa.as_str(),
+            smaa.as_str(),
             frame.as_str(),
         ];
 
@@ -755,6 +783,72 @@ mod tests {
         widget.frame(0.0, &input);
         assert_eq!(widget.requested_msaa, 4);
         assert_eq!(widget.pending_msaa_request, Some(4));
+    }
+
+    #[test]
+    fn f5_queues_one_smaa_change_per_key_press() {
+        let mut widget = test_widget();
+        let mut input = Input::default();
+
+        assert!(!widget.requested_smaa);
+        assert_eq!(widget.pending_smaa_request, None);
+
+        input.inject_key(KeyCode::F5, true);
+        widget.frame(0.0, &input);
+        assert!(widget.requested_smaa);
+        assert_eq!(widget.pending_smaa_request, Some(true));
+
+        input.end_frame();
+        assert!(input.key_down(KeyCode::F5));
+        assert!(!input.key_pressed(KeyCode::F5));
+        widget.frame(0.0, &input);
+        assert!(widget.requested_smaa);
+        assert_eq!(widget.pending_smaa_request, Some(true));
+
+        input.inject_key(KeyCode::F5, false);
+        input.end_frame();
+        input.inject_key(KeyCode::F5, true);
+        widget.frame(0.0, &input);
+        assert!(!widget.requested_smaa);
+        assert_eq!(widget.pending_smaa_request, Some(false));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn prepare_render_applies_smaa_without_changing_msaa() {
+        let Ok(gpu) = Gpu::new_headless() else {
+            return;
+        };
+        let mut renderer = Renderer::new_with_config(
+            &gpu,
+            pocket3d::gpu::OFFSCREEN_FORMAT,
+            pocket3d::renderer::RendererConfig {
+                requested_sample_count: 2,
+            },
+        )
+        .unwrap();
+        let mut widget = test_widget();
+        widget.requested_smaa = true;
+        widget.pending_smaa_request = Some(true);
+
+        let requested_msaa = renderer.requested_sample_count();
+        let effective_msaa = renderer.effective_sample_count();
+        widget.prepare_render(&gpu, &mut renderer);
+
+        assert!(renderer.smaa_enabled());
+        assert_eq!(renderer.requested_sample_count(), requested_msaa);
+        assert_eq!(renderer.effective_sample_count(), effective_msaa);
+        assert!(widget.debug_smaa_enabled);
+        assert_eq!(widget.pending_smaa_request, None);
+
+        widget.requested_smaa = false;
+        widget.pending_smaa_request = Some(false);
+        widget.prepare_render(&gpu, &mut renderer);
+
+        assert!(!renderer.smaa_enabled());
+        assert_eq!(renderer.requested_sample_count(), requested_msaa);
+        assert_eq!(renderer.effective_sample_count(), effective_msaa);
+        assert!(!widget.debug_smaa_enabled);
     }
 
     #[test]
