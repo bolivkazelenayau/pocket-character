@@ -163,6 +163,8 @@ pub struct Widget {
     debug_backend: String,
     debug_requested_msaa: u32,
     debug_effective_msaa: u32,
+    requested_msaa: u32,
+    pending_msaa_request: Option<u32>,
     tick_count: u64,
     hovered: bool,
     pending_events: Vec<TickEvent>,
@@ -205,6 +207,8 @@ impl Widget {
             debug_backend: "unknown".into(),
             debug_requested_msaa: 1,
             debug_effective_msaa: 1,
+            requested_msaa: 1,
+            pending_msaa_request: None,
             tick_count: 0,
             hovered: false,
             pending_events: Vec::new(),
@@ -293,7 +297,8 @@ impl Game for Widget {
         let adapter_info = gpu.adapter.get_info();
         self.debug_gpu_name = adapter_info.name;
         self.debug_backend = format!("{:?}", adapter_info.backend);
-        self.debug_requested_msaa = renderer.requested_sample_count();
+        self.requested_msaa = renderer.requested_sample_count();
+        self.debug_requested_msaa = self.requested_msaa;
         self.debug_effective_msaa = renderer.effective_sample_count();
 
         // 2048 halves the 4096² authoring textures: invisible at 450×600,
@@ -381,6 +386,10 @@ impl Game for Widget {
         self.render_fps.record(dt);
         if input.key_pressed(KeyCode::F3) {
             self.debug_hud_enabled = !self.debug_hud_enabled;
+        }
+        if input.key_pressed(KeyCode::F4) {
+            self.requested_msaa = next_msaa_sample_count(self.requested_msaa);
+            self.pending_msaa_request = Some(self.requested_msaa);
         }
 
         let hovered = input.cursor().is_some();
@@ -486,6 +495,22 @@ impl Game for Widget {
         self.stats.record(t0.elapsed().as_secs_f32() * 1000.0);
     }
 
+    fn prepare_render(&mut self, gpu: &Gpu, renderer: &mut Renderer) {
+        let Some(requested) = self.pending_msaa_request.take() else {
+            return;
+        };
+
+        let effective = renderer.set_requested_sample_count(gpu, requested);
+        self.requested_msaa = renderer.requested_sample_count();
+        self.debug_requested_msaa = self.requested_msaa;
+        self.debug_effective_msaa = effective;
+        log::info!(
+            "AA: requested {}x, effective MSAA {}x",
+            self.debug_requested_msaa,
+            self.debug_effective_msaa
+        );
+    }
+
     fn compose(&mut self, _alpha: f32, time: f32, size: (u32, u32)) -> (&Scene, &Camera, &Hud) {
         self.scene.time = time;
         self.rendered_frames += 1;
@@ -503,6 +528,16 @@ impl Game for Widget {
 
     fn wants_exit(&self) -> bool {
         self.exit
+    }
+}
+
+fn next_msaa_sample_count(requested: u32) -> u32 {
+    match requested {
+        1 => 2,
+        2 => 4,
+        4 => 8,
+        8 => 1,
+        _ => 2,
     }
 }
 
@@ -695,6 +730,40 @@ mod tests {
         assert!(!widget.debug_hud_enabled);
         let (_, _, hud) = widget.compose(0.0, 0.0, (450, 600));
         assert!(hud.verts.is_empty());
+    }
+
+    #[test]
+    fn f4_queues_one_msaa_change_per_key_press() {
+        let mut widget = test_widget();
+        let mut input = Input::default();
+
+        input.inject_key(KeyCode::F4, true);
+        widget.frame(0.0, &input);
+        assert_eq!(widget.requested_msaa, 2);
+        assert_eq!(widget.pending_msaa_request, Some(2));
+
+        input.end_frame();
+        assert!(input.key_down(KeyCode::F4));
+        assert!(!input.key_pressed(KeyCode::F4));
+        widget.frame(0.0, &input);
+        assert_eq!(widget.requested_msaa, 2);
+        assert_eq!(widget.pending_msaa_request, Some(2));
+
+        input.inject_key(KeyCode::F4, false);
+        input.end_frame();
+        input.inject_key(KeyCode::F4, true);
+        widget.frame(0.0, &input);
+        assert_eq!(widget.requested_msaa, 4);
+        assert_eq!(widget.pending_msaa_request, Some(4));
+    }
+
+    #[test]
+    fn msaa_cycle_wraps_and_sanitizes() {
+        assert_eq!(next_msaa_sample_count(1), 2);
+        assert_eq!(next_msaa_sample_count(2), 4);
+        assert_eq!(next_msaa_sample_count(4), 8);
+        assert_eq!(next_msaa_sample_count(8), 1);
+        assert_eq!(next_msaa_sample_count(16), 2);
     }
 
     #[test]
