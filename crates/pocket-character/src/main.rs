@@ -100,7 +100,6 @@ fn main() -> Result<()> {
             resizable: settings.window.resizable,
             max_fps: Some(settings.rendering.max_fps),
             drag_window: true,
-            requested_sample_count: settings.rendering.anti_aliasing.samples().unwrap_or(1),
         },
         widget,
     )

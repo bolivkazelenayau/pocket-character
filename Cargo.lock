@@ -1660,13 +1660,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "pocket-ui-surface"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "log",
+ "pocket-mod",
+ "pocketjs-core",
+]
+
+[[package]]
 name = "pocket-ui-wgpu"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytemuck",
- "log",
- "pocket-mod",
+ "pocket-ui-surface",
  "pocket3d",
  "pocketjs-core",
  "wgpu",
@@ -1697,6 +1706,7 @@ dependencies = [
  "png",
  "pocket3d-bsp",
  "pollster",
+ "serde_json",
  "wgpu",
  "windows",
  "winit",
