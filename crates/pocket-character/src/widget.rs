@@ -22,6 +22,7 @@ use pocket3d::input::Input;
 use pocket3d::model::{ModelAsset, ModelInstance, ModelLoadOptions};
 use pocket3d::renderer::Renderer;
 use pocket3d::scene::Scene;
+use pocket3d::winit::keyboard::KeyCode;
 
 use crate::guest::{CharacterGuest, Command, TickEvent, TickState};
 use crate::settings::CameraSettings;
@@ -103,6 +104,33 @@ impl FrameStats {
     }
 }
 
+/// Rolling FPS measured at the rendered-frame cadence (`Widget::frame`).
+struct RenderFps {
+    frames: u32,
+    elapsed: f32,
+    fps: f32,
+}
+
+impl RenderFps {
+    fn new() -> Self {
+        Self {
+            frames: 0,
+            elapsed: 0.0,
+            fps: 0.0,
+        }
+    }
+
+    fn record(&mut self, dt: f32) {
+        self.frames += 1;
+        self.elapsed += if dt.is_finite() && dt >= 0.0 { dt } else { 0.0 };
+        if self.elapsed >= 1.0 {
+            self.fps = self.frames as f32 / self.elapsed;
+            self.frames = 0;
+            self.elapsed = 0.0;
+        }
+    }
+}
+
 pub struct Widget {
     cfg: WidgetConfig,
     guest: Option<CharacterGuest>,
@@ -129,6 +157,12 @@ pub struct Widget {
     camera_settings: CameraSettings,
 
     stats: FrameStats,
+    render_fps: RenderFps,
+    debug_hud_enabled: bool,
+    debug_gpu_name: String,
+    debug_backend: String,
+    debug_requested_msaa: u32,
+    debug_effective_msaa: u32,
     tick_count: u64,
     hovered: bool,
     pending_events: Vec<TickEvent>,
@@ -165,6 +199,12 @@ impl Widget {
             anchor: Vec3::ZERO,
             camera_settings: camera_settings.sanitized(),
             stats: FrameStats::new(),
+            render_fps: RenderFps::new(),
+            debug_hud_enabled: false,
+            debug_gpu_name: "unknown".into(),
+            debug_backend: "unknown".into(),
+            debug_requested_msaa: 1,
+            debug_effective_msaa: 1,
             tick_count: 0,
             hovered: false,
             pending_events: Vec::new(),
@@ -250,6 +290,12 @@ fn apply_expression(vrm: &VrmDoc, model: &Arc<ModelAsset>, scene: &mut Scene, na
 impl Game for Widget {
     fn init(&mut self, gpu: &Gpu, renderer: &mut Renderer) -> Result<()> {
         let t0 = Instant::now();
+        let adapter_info = gpu.adapter.get_info();
+        self.debug_gpu_name = adapter_info.name;
+        self.debug_backend = format!("{:?}", adapter_info.backend);
+        self.debug_requested_msaa = renderer.requested_sample_count();
+        self.debug_effective_msaa = renderer.effective_sample_count();
+
         // 2048 halves the 4096² authoring textures: invisible at 450×600,
         // and GPU texture memory is the widget's dominant footprint.
         let model = ModelAsset::load_glb_opts(
@@ -331,7 +377,12 @@ impl Game for Widget {
         Ok(())
     }
 
-    fn frame(&mut self, _dt: f32, input: &Input) {
+    fn frame(&mut self, dt: f32, input: &Input) {
+        self.render_fps.record(dt);
+        if input.key_pressed(KeyCode::F3) {
+            self.debug_hud_enabled = !self.debug_hud_enabled;
+        }
+
         let hovered = input.cursor().is_some();
         if hovered != self.hovered {
             self.hovered = hovered;
@@ -435,13 +486,17 @@ impl Game for Widget {
         self.stats.record(t0.elapsed().as_secs_f32() * 1000.0);
     }
 
-    fn compose(&mut self, _alpha: f32, time: f32, _size: (u32, u32)) -> (&Scene, &Camera, &Hud) {
+    fn compose(&mut self, _alpha: f32, time: f32, size: (u32, u32)) -> (&Scene, &Camera, &Hud) {
         self.scene.time = time;
         self.rendered_frames += 1;
         if let Some(n) = self.cfg.frames
             && self.rendered_frames >= n
         {
             self.exit = true;
+        }
+        self.hud.clear();
+        if self.debug_hud_enabled {
+            self.compose_debug_hud(size);
         }
         (&self.scene, &self.camera, &self.hud)
     }
@@ -451,9 +506,83 @@ impl Game for Widget {
     }
 }
 
+impl Widget {
+    fn compose_debug_hud(&mut self, size: (u32, u32)) {
+        const X: f32 = 14.0;
+        const TITLE_Y: f32 = 14.0;
+        const BODY_Y: f32 = 38.0;
+        const LINE_HEIGHT: f32 = 10.0;
+        const PANEL_TOP: f32 = 8.0;
+        const PANEL_PADDING: f32 = 8.0;
+
+        let title = "Pocket3D HUD";
+        let fps = format!("FPS: {:.1}", self.render_fps.fps);
+        let tick_cpu = format!("Tick CPU: {:.2} ms", self.stats.frame_ms);
+        let gpu = format!("GPU: {}", self.debug_gpu_name);
+        let backend = format!("Backend: {}", self.debug_backend);
+        let msaa = format!(
+            "MSAA: requested {}x / effective {}x",
+            self.debug_requested_msaa, self.debug_effective_msaa
+        );
+        let frame = format!("Frame: {}x{}", size.0, size.1);
+        let body = [
+            fps.as_str(),
+            tick_cpu.as_str(),
+            gpu.as_str(),
+            backend.as_str(),
+            msaa.as_str(),
+            frame.as_str(),
+        ];
+
+        let body_width = body
+            .iter()
+            .map(|line| Hud::text_width(line, 1.0))
+            .fold(0.0, f32::max);
+        let panel_width = Hud::text_width(title, 2.0).max(body_width) + PANEL_PADDING * 2.0;
+        let panel_bottom = BODY_Y + (body.len() - 1) as f32 * LINE_HEIGHT + 8.0;
+        let panel_height = panel_bottom - PANEL_TOP + PANEL_PADDING;
+
+        self.hud.rect(
+            X - PANEL_PADDING,
+            PANEL_TOP,
+            panel_width,
+            panel_height,
+            [0.01, 0.02, 0.03, 0.78],
+        );
+        self.hud.rect(
+            X - 1.0,
+            TITLE_Y + 20.0,
+            panel_width - PANEL_PADDING,
+            1.0,
+            [0.20, 0.72, 1.0, 0.95],
+        );
+        self.hud
+            .text(X, TITLE_Y, 2.0, [0.86, 0.96, 1.0, 1.0], title);
+        for (index, line) in body.iter().enumerate() {
+            self.hud.text(
+                X,
+                BODY_Y + index as f32 * LINE_HEIGHT,
+                1.0,
+                [0.92, 0.94, 0.96, 1.0],
+                line,
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_widget() -> Widget {
+        Widget::new(WidgetConfig {
+            model_path: PathBuf::new(),
+            vrma_path: PathBuf::new(),
+            bundle_path: PathBuf::new(),
+            size: (450, 600),
+            frames: None,
+        })
+    }
 
     fn approx_eq(actual: f32, expected: f32) {
         assert!((actual - expected).abs() < 1.0e-5, "{actual} != {expected}");
@@ -527,13 +656,7 @@ mod tests {
 
     #[test]
     fn live_settings_are_available_before_model_load() {
-        let mut widget = Widget::new(WidgetConfig {
-            model_path: PathBuf::new(),
-            vrma_path: PathBuf::new(),
-            bundle_path: PathBuf::new(),
-            size: (450, 600),
-            frames: None,
-        });
+        let mut widget = test_widget();
         widget.set_camera_settings(CameraSettings {
             fov_deg: 35.0,
             distance_scale: 0.75,
@@ -543,5 +666,46 @@ mod tests {
         assert_eq!(widget.camera_settings.fov_deg, 35.0);
         assert_eq!(widget.camera_settings.distance_scale, 0.75);
         assert_eq!(widget.camera_settings.headroom, 0.08);
+    }
+
+    #[test]
+    fn f3_toggles_debug_hud_once_per_key_press() {
+        let mut widget = test_widget();
+        let mut input = Input::default();
+
+        assert!(!widget.debug_hud_enabled);
+        let (_, _, hud) = widget.compose(0.0, 0.0, (450, 600));
+        assert!(hud.verts.is_empty());
+
+        input.inject_key(KeyCode::F3, true);
+        widget.frame(0.0, &input);
+        assert!(widget.debug_hud_enabled);
+        let (_, _, hud) = widget.compose(0.0, 0.0, (450, 600));
+        assert!(!hud.verts.is_empty());
+
+        input.end_frame();
+        widget.frame(0.0, &input);
+        assert!(widget.debug_hud_enabled);
+
+        input.inject_key(KeyCode::F3, false);
+        widget.frame(0.0, &input);
+        input.end_frame();
+        input.inject_key(KeyCode::F3, true);
+        widget.frame(0.0, &input);
+        assert!(!widget.debug_hud_enabled);
+        let (_, _, hud) = widget.compose(0.0, 0.0, (450, 600));
+        assert!(hud.verts.is_empty());
+    }
+
+    #[test]
+    fn render_fps_uses_render_frame_delta() {
+        let mut widget = test_widget();
+        let input = Input::default();
+
+        for _ in 0..4 {
+            widget.frame(0.25, &input);
+        }
+
+        approx_eq(widget.render_fps.fps, 4.0);
     }
 }
