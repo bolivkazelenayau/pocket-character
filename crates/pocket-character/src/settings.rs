@@ -1,8 +1,8 @@
 //! Persistent, character-owned Pocket Character settings.
 //!
 //! The JSON representation is intentionally small and UI-independent. The
-//! stored anti-aliasing value is a requested preference and is serialized as
-//! one of the strings `"off"`, `"2x"`, `"4x"`, or `"8x"`. Numeric values `1`,
+//! stored MSAA value is a requested preference and is serialized as one of
+//! the strings `"off"`, `"2x"`, `"4x"`, or `"8x"`. Numeric values `1`,
 //! `2`, `4`, and `8` are accepted when loading for convenience, with `1`
 //! meaning `"off"`; values outside that set fall back to `Off`.
 
@@ -61,13 +61,22 @@ impl Default for AntiAliasingPreference {
 }
 
 impl AntiAliasingPreference {
-    #[allow(dead_code)]
     pub fn samples(self) -> Option<u32> {
         match self {
             Self::Off => None,
             Self::X2 => Some(2),
             Self::X4 => Some(4),
             Self::X8 => Some(8),
+        }
+    }
+
+    pub fn from_samples(samples: u32) -> Option<Self> {
+        match samples {
+            1 => Some(Self::Off),
+            2 => Some(Self::X2),
+            4 => Some(Self::X4),
+            8 => Some(Self::X8),
+            _ => None,
         }
     }
 
@@ -206,19 +215,59 @@ impl WindowSettings {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct RenderSettings {
-    #[serde(default, deserialize_with = "deserialize_anti_aliasing")]
-    pub anti_aliasing: AntiAliasingPreference,
+    pub msaa: AntiAliasingPreference,
     #[serde(default = "default_max_fps", deserialize_with = "deserialize_max_fps")]
     pub max_fps: f32,
+    #[serde(
+        default = "default_smaa_enabled",
+        deserialize_with = "deserialize_smaa_enabled"
+    )]
+    pub smaa_enabled: bool,
+}
+
+#[derive(Deserialize)]
+struct RenderSettingsInput {
+    #[serde(default)]
+    msaa: Option<Value>,
+    #[serde(default)]
+    anti_aliasing: Option<Value>,
+    #[serde(default = "default_max_fps", deserialize_with = "deserialize_max_fps")]
+    max_fps: f32,
+    #[serde(
+        default = "default_smaa_enabled",
+        deserialize_with = "deserialize_smaa_enabled"
+    )]
+    smaa_enabled: bool,
+}
+
+impl<'de> Deserialize<'de> for RenderSettings {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let input = RenderSettingsInput::deserialize(deserializer)?;
+        let msaa = match input.msaa.or(input.anti_aliasing) {
+            Some(value) => AntiAliasingPreference::from_json_value(&value)
+                .unwrap_or(AntiAliasingPreference::Off),
+            None => AntiAliasingPreference::default(),
+        };
+
+        Ok(Self {
+            msaa,
+            max_fps: input.max_fps,
+            smaa_enabled: input.smaa_enabled,
+        })
+    }
 }
 
 impl Default for RenderSettings {
     fn default() -> Self {
         Self {
-            anti_aliasing: AntiAliasingPreference::default(),
+            msaa: AntiAliasingPreference::default(),
             max_fps: DEFAULT_MAX_FPS,
+            smaa_enabled: false,
         }
     }
 }
@@ -231,8 +280,9 @@ impl RenderSettings {
             DEFAULT_MAX_FPS
         };
         Self {
-            anti_aliasing: self.anti_aliasing,
+            msaa: self.msaa,
             max_fps,
+            smaa_enabled: self.smaa_enabled,
         }
     }
 }
@@ -493,6 +543,10 @@ fn default_max_fps() -> f32 {
     DEFAULT_MAX_FPS
 }
 
+fn default_smaa_enabled() -> bool {
+    false
+}
+
 fn deserialize_schema_version<'de, D>(deserializer: D) -> std::result::Result<u32, D::Error>
 where
     D: Deserializer<'de>,
@@ -594,13 +648,11 @@ where
     deserialize_f32_or(deserializer, DEFAULT_MAX_FPS)
 }
 
-fn deserialize_anti_aliasing<'de, D>(
-    deserializer: D,
-) -> std::result::Result<AntiAliasingPreference, D::Error>
+fn deserialize_smaa_enabled<'de, D>(deserializer: D) -> std::result::Result<bool, D::Error>
 where
     D: Deserializer<'de>,
 {
-    AntiAliasingPreference::deserialize(deserializer)
+    deserialize_bool_or(deserializer, false)
 }
 
 #[cfg(test)]
@@ -618,8 +670,9 @@ mod tests {
         assert!(!settings.window.resizable);
         assert!(settings.window.always_on_top);
         assert_eq!(settings.camera, CameraSettings::default());
-        assert_eq!(settings.rendering.anti_aliasing, AntiAliasingPreference::X4);
+        assert_eq!(settings.rendering.msaa, AntiAliasingPreference::X4);
         assert_eq!(settings.rendering.max_fps, 60.0);
+        assert!(!settings.rendering.smaa_enabled);
     }
 
     #[test]
@@ -637,14 +690,17 @@ mod tests {
                 headroom: 0.08,
             },
             rendering: RenderSettings {
-                anti_aliasing: AntiAliasingPreference::X8,
+                msaa: AntiAliasingPreference::X8,
                 max_fps: 144.0,
+                smaa_enabled: true,
             },
             ..AppSettings::default()
         };
 
         let json = serde_json::to_string(&settings).unwrap();
-        assert!(json.contains(r#""anti_aliasing":"8x""#));
+        assert!(json.contains(r#""msaa":"8x""#));
+        assert!(!json.contains("anti_aliasing"));
+        assert!(json.contains(r#""smaa_enabled":true"#));
         assert_eq!(AppSettings::from_json(&json).unwrap(), settings);
     }
 
@@ -658,6 +714,29 @@ mod tests {
         assert_eq!(settings.window.resizable, false);
         assert_eq!(settings.camera, CameraSettings::default());
         assert_eq!(settings.rendering, RenderSettings::default());
+    }
+
+    #[test]
+    fn partial_aa_settings_default_only_missing_aa_field() {
+        let msaa_only =
+            AppSettings::from_json(r#"{"schema_version":1,"rendering":{"anti_aliasing":"8x"}}"#)
+                .unwrap();
+        assert_eq!(msaa_only.rendering.msaa, AntiAliasingPreference::X8);
+        assert!(!msaa_only.rendering.smaa_enabled);
+
+        let smaa_only =
+            AppSettings::from_json(r#"{"schema_version":1,"rendering":{"smaa_enabled":true}}"#)
+                .unwrap();
+        assert_eq!(smaa_only.rendering.msaa, AntiAliasingPreference::default());
+        assert!(smaa_only.rendering.smaa_enabled);
+    }
+
+    #[test]
+    fn canonical_msaa_wins_over_legacy_anti_aliasing() {
+        let settings =
+            AppSettings::from_json(r#"{"rendering":{"msaa":"2x","anti_aliasing":"8x"}}"#).unwrap();
+
+        assert_eq!(settings.rendering.msaa, AntiAliasingPreference::X2);
     }
 
     #[test]
@@ -698,14 +777,44 @@ mod tests {
 
     #[test]
     fn invalid_aa_preference_falls_back_but_valid_aliases_are_accepted() {
-        let invalid = AppSettings::from_json(r#"{"rendering":{"anti_aliasing":"32x"}}"#).unwrap();
-        assert_eq!(invalid.rendering.anti_aliasing, AntiAliasingPreference::Off);
+        let invalid = AppSettings::from_json(r#"{"rendering":{"msaa":"32x"}}"#).unwrap();
+        assert_eq!(invalid.rendering.msaa, AntiAliasingPreference::Off);
 
         let numeric = AppSettings::from_json(r#"{"rendering":{"anti_aliasing":4}}"#).unwrap();
-        assert_eq!(numeric.rendering.anti_aliasing, AntiAliasingPreference::X4);
+        assert_eq!(numeric.rendering.msaa, AntiAliasingPreference::X4);
 
         let off = AppSettings::from_json(r#"{"rendering":{"anti_aliasing":1}}"#).unwrap();
-        assert_eq!(off.rendering.anti_aliasing, AntiAliasingPreference::Off);
+        assert_eq!(off.rendering.msaa, AntiAliasingPreference::Off);
+
+        let off_canonical = AppSettings::from_json(r#"{"rendering":{"msaa":"off"}}"#).unwrap();
+        assert_eq!(off_canonical.rendering.msaa.samples().unwrap_or(1), 1);
+
+        let canonical_numeric = AppSettings::from_json(r#"{"rendering":{"msaa":4}}"#).unwrap();
+        assert_eq!(canonical_numeric.rendering.msaa, AntiAliasingPreference::X4);
+
+        let invalid_smaa =
+            AppSettings::from_json(r#"{"rendering":{"smaa_enabled":"enabled"}}"#).unwrap();
+        assert!(!invalid_smaa.rendering.smaa_enabled);
+    }
+
+    #[test]
+    fn requested_msaa_stays_8x_when_capability_negotiation_falls_back_to_4x() {
+        let settings = AppSettings {
+            rendering: RenderSettings {
+                msaa: AntiAliasingPreference::X8,
+                ..RenderSettings::default()
+            },
+            ..AppSettings::default()
+        };
+        let effective = pocket3d::renderer::select_effective_sample_count(
+            settings.rendering.msaa.samples().unwrap_or(1),
+            &[1, 2, 4],
+        );
+
+        assert_eq!(effective, 4);
+        assert_eq!(settings.rendering.msaa, AntiAliasingPreference::X8);
+        let reloaded = AppSettings::from_json(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(reloaded.rendering.msaa, AntiAliasingPreference::X8);
     }
 
     #[test]
@@ -729,8 +838,9 @@ mod tests {
                 ..WindowSettings::default()
             },
             rendering: RenderSettings {
-                anti_aliasing: AntiAliasingPreference::X2,
+                msaa: AntiAliasingPreference::X2,
                 max_fps: 30.0,
+                smaa_enabled: false,
             },
             ..AppSettings::default()
         };

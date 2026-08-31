@@ -25,7 +25,7 @@ use pocket3d::scene::Scene;
 use pocket3d::winit::keyboard::KeyCode;
 
 use crate::guest::{CharacterGuest, Command, TickEvent, TickState};
-use crate::settings::CameraSettings;
+use crate::settings::{AntiAliasingPreference, AppSettings, CameraSettings};
 
 pub struct WidgetConfig {
     pub model_path: PathBuf,
@@ -155,6 +155,8 @@ pub struct Widget {
     hud: Hud,
     anchor: Vec3,
     camera_settings: CameraSettings,
+    settings: AppSettings,
+    settings_path: Option<PathBuf>,
 
     stats: FrameStats,
     render_fps: RenderFps,
@@ -181,6 +183,35 @@ impl Widget {
     }
 
     pub fn new_with_camera_settings(cfg: WidgetConfig, camera_settings: CameraSettings) -> Self {
+        Self::new_internal(cfg, camera_settings, AppSettings::default(), None, 1, false)
+    }
+
+    pub fn new_with_settings_path(
+        cfg: WidgetConfig,
+        settings: AppSettings,
+        settings_path: Option<PathBuf>,
+    ) -> Self {
+        let settings = settings.sanitized();
+        let requested_msaa = settings.rendering.msaa.samples().unwrap_or(1);
+        let requested_smaa = settings.rendering.smaa_enabled;
+        Self::new_internal(
+            cfg,
+            settings.camera,
+            settings,
+            settings_path,
+            requested_msaa,
+            requested_smaa,
+        )
+    }
+
+    fn new_internal(
+        cfg: WidgetConfig,
+        camera_settings: CameraSettings,
+        settings: AppSettings,
+        settings_path: Option<PathBuf>,
+        requested_msaa: u32,
+        requested_smaa: bool,
+    ) -> Self {
         // Seed fixed for reproducible measurement runs; behavior parity is
         // distributional, not per-run.
         let sim = CharacterSim::new(0x0c9a_11e0, Vec3::ZERO);
@@ -203,17 +234,19 @@ impl Widget {
             hud: Hud::default(),
             anchor: Vec3::ZERO,
             camera_settings: camera_settings.sanitized(),
+            settings,
+            settings_path,
             stats: FrameStats::new(),
             render_fps: RenderFps::new(),
             debug_hud_enabled: false,
             debug_gpu_name: "unknown".into(),
             debug_backend: "unknown".into(),
-            debug_requested_msaa: 1,
+            debug_requested_msaa: requested_msaa,
             debug_effective_msaa: 1,
-            debug_smaa_enabled: false,
-            requested_msaa: 1,
+            debug_smaa_enabled: requested_smaa,
+            requested_msaa,
             pending_msaa_request: None,
-            requested_smaa: false,
+            requested_smaa,
             pending_smaa_request: None,
             tick_count: 0,
             hovered: false,
@@ -306,8 +339,9 @@ impl Game for Widget {
         self.requested_msaa = renderer.requested_sample_count();
         self.debug_requested_msaa = self.requested_msaa;
         self.debug_effective_msaa = renderer.effective_sample_count();
-        self.requested_smaa = renderer.smaa_enabled();
-        self.debug_smaa_enabled = self.requested_smaa;
+        renderer.set_smaa_enabled(gpu, self.settings.rendering.smaa_enabled);
+        self.requested_smaa = self.settings.rendering.smaa_enabled;
+        self.debug_smaa_enabled = renderer.smaa_enabled();
 
         // 2048 halves the 4096² authoring textures: invisible at 450×600,
         // and GPU texture memory is the widget's dominant footprint.
@@ -514,11 +548,29 @@ impl Game for Widget {
             return;
         }
 
+        let mut accepted_msaa = None;
         if let Some(requested) = requested_msaa {
             renderer.set_requested_sample_count(gpu, requested);
+            if renderer.requested_sample_count() == requested {
+                accepted_msaa = Some(requested);
+            } else {
+                log::warn!(
+                    "renderer rejected requested MSAA {}; keeping persisted preference",
+                    format_msaa_count(requested)
+                );
+            }
         }
+        let mut accepted_smaa = None;
         if let Some(enabled) = requested_smaa {
             renderer.set_smaa_enabled(gpu, enabled);
+            if renderer.smaa_enabled() == enabled {
+                accepted_smaa = Some(enabled);
+            } else {
+                log::warn!(
+                    "renderer rejected requested SMAA {}; keeping persisted preference",
+                    if enabled { "on" } else { "off" }
+                );
+            }
         }
 
         self.requested_msaa = renderer.requested_sample_count();
@@ -526,10 +578,11 @@ impl Game for Widget {
         self.debug_effective_msaa = renderer.effective_sample_count();
         self.requested_smaa = renderer.smaa_enabled();
         self.debug_smaa_enabled = self.requested_smaa;
+        self.commit_accepted_aa_preferences(accepted_msaa, accepted_smaa);
         log::info!(
-            "AA: requested {}x, effective MSAA {}x, SMAA {}",
-            self.debug_requested_msaa,
-            self.debug_effective_msaa,
+            "AA: requested {}, effective MSAA {}, SMAA {}",
+            format_msaa_count(self.debug_requested_msaa),
+            format_msaa_count(self.debug_effective_msaa),
             if self.debug_smaa_enabled { "on" } else { "off" }
         );
     }
@@ -551,6 +604,40 @@ impl Game for Widget {
 
     fn wants_exit(&self) -> bool {
         self.exit
+    }
+}
+
+impl Widget {
+    fn commit_accepted_aa_preferences(
+        &mut self,
+        requested_msaa: Option<u32>,
+        smaa_enabled: Option<bool>,
+    ) {
+        let mut changed = false;
+        if let Some(requested) = requested_msaa {
+            if let Some(preference) = AntiAliasingPreference::from_samples(requested)
+                && self.settings.rendering.msaa != preference
+            {
+                self.settings.rendering.msaa = preference;
+                changed = true;
+            }
+        }
+        if let Some(enabled) = smaa_enabled
+            && self.settings.rendering.smaa_enabled != enabled
+        {
+            self.settings.rendering.smaa_enabled = enabled;
+            changed = true;
+        }
+
+        if changed
+            && let Some(path) = self.settings_path.as_deref()
+            && let Err(error) = self.settings.save_to_path(path)
+        {
+            log::warn!(
+                "unable to persist AA settings to {}: {error:#}",
+                path.display()
+            );
+        }
     }
 }
 
@@ -579,8 +666,8 @@ impl Widget {
         let gpu = format!("GPU: {}", self.debug_gpu_name);
         let backend = format!("Backend: {}", self.debug_backend);
         let msaa = format!(
-            "MSAA: requested {}x / effective {}x",
-            self.debug_requested_msaa, self.debug_effective_msaa
+            "MSAA: {}",
+            format_msaa_status(self.debug_requested_msaa, self.debug_effective_msaa)
         );
         let smaa = format!(
             "SMAA: {}",
@@ -633,18 +720,43 @@ impl Widget {
     }
 }
 
+fn format_msaa_count(sample_count: u32) -> String {
+    match sample_count {
+        1 => "off".into(),
+        sample_count => format!("{sample_count}x"),
+    }
+}
+
+fn format_msaa_status(requested: u32, effective: u32) -> String {
+    if requested == effective {
+        format_msaa_count(requested)
+    } else {
+        format!(
+            "requested {} / effective {}",
+            format_msaa_count(requested),
+            format_msaa_count(effective)
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::{AntiAliasingPreference, AppSettings, RenderSettings};
+    use tempfile::tempdir;
 
     fn test_widget() -> Widget {
-        Widget::new(WidgetConfig {
+        Widget::new(test_config())
+    }
+
+    fn test_config() -> WidgetConfig {
+        WidgetConfig {
             model_path: PathBuf::new(),
             vrma_path: PathBuf::new(),
             bundle_path: PathBuf::new(),
             size: (450, 600),
             frames: None,
-        })
+        }
     }
 
     fn approx_eq(actual: f32, expected: f32) {
@@ -813,6 +925,107 @@ mod tests {
         assert_eq!(widget.pending_smaa_request, Some(false));
     }
 
+    #[test]
+    fn persisted_preferences_seed_runtime_requests_without_a_gpu() {
+        let settings = AppSettings {
+            rendering: RenderSettings {
+                msaa: AntiAliasingPreference::X8,
+                smaa_enabled: true,
+                ..RenderSettings::default()
+            },
+            ..AppSettings::default()
+        };
+        let widget = Widget::new_with_settings_path(test_config(), settings, None);
+
+        assert_eq!(widget.requested_msaa, 8);
+        assert!(widget.requested_smaa);
+        assert_eq!(widget.pending_msaa_request, None);
+        assert_eq!(widget.pending_smaa_request, None);
+    }
+
+    #[test]
+    fn headless_widget_does_not_use_desktop_settings_path() {
+        let widget = test_widget();
+
+        assert!(widget.settings_path.is_none());
+        assert_eq!(widget.requested_msaa, 1);
+        assert!(!widget.requested_smaa);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn f4_persists_requested_msaa_without_rewriting_effective_or_smaa() {
+        let Ok(gpu) = Gpu::new_headless() else {
+            return;
+        };
+        let mut renderer = Renderer::new_with_config(
+            &gpu,
+            pocket3d::gpu::OFFSCREEN_FORMAT,
+            pocket3d::renderer::RendererConfig {
+                requested_sample_count: 4,
+            },
+        )
+        .unwrap();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let settings = AppSettings {
+            rendering: RenderSettings {
+                msaa: AntiAliasingPreference::X4,
+                smaa_enabled: true,
+                ..RenderSettings::default()
+            },
+            ..AppSettings::default()
+        };
+        let mut widget =
+            Widget::new_with_settings_path(test_config(), settings, Some(path.clone()));
+        let mut input = Input::default();
+        input.inject_key(KeyCode::F4, true);
+        widget.frame(0.0, &input);
+        widget.prepare_render(&gpu, &mut renderer);
+
+        let persisted = AppSettings::load_from_path(&path);
+        assert_eq!(persisted.rendering.msaa, AntiAliasingPreference::X8);
+        assert!(persisted.rendering.smaa_enabled);
+        assert_eq!(renderer.requested_sample_count(), 8);
+        assert!(renderer.effective_sample_count() <= 8);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn f5_persists_smaa_without_rewriting_msaa() {
+        let Ok(gpu) = Gpu::new_headless() else {
+            return;
+        };
+        let mut renderer = Renderer::new_with_config(
+            &gpu,
+            pocket3d::gpu::OFFSCREEN_FORMAT,
+            pocket3d::renderer::RendererConfig {
+                requested_sample_count: 2,
+            },
+        )
+        .unwrap();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let settings = AppSettings {
+            rendering: RenderSettings {
+                msaa: AntiAliasingPreference::X8,
+                ..RenderSettings::default()
+            },
+            ..AppSettings::default()
+        };
+        let mut widget =
+            Widget::new_with_settings_path(test_config(), settings, Some(path.clone()));
+        let mut input = Input::default();
+        input.inject_key(KeyCode::F5, true);
+        widget.frame(0.0, &input);
+        widget.prepare_render(&gpu, &mut renderer);
+
+        let persisted = AppSettings::load_from_path(&path);
+        assert_eq!(persisted.rendering.msaa, AntiAliasingPreference::X8);
+        assert!(persisted.rendering.smaa_enabled);
+        assert!(renderer.smaa_enabled());
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn prepare_render_applies_smaa_without_changing_msaa() {
@@ -858,6 +1071,17 @@ mod tests {
         assert_eq!(next_msaa_sample_count(4), 8);
         assert_eq!(next_msaa_sample_count(8), 1);
         assert_eq!(next_msaa_sample_count(16), 2);
+    }
+
+    #[test]
+    fn msaa_hud_formats_single_sample_as_off() {
+        assert_eq!(format_msaa_status(1, 1), "off");
+        assert_eq!(format_msaa_status(4, 4), "4x");
+    }
+
+    #[test]
+    fn msaa_hud_preserves_requested_effective_fallback() {
+        assert_eq!(format_msaa_status(8, 4), "requested 8x / effective 4x");
     }
 
     #[test]

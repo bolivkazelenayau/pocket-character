@@ -48,10 +48,6 @@ fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let args: Vec<String> = std::env::args().collect();
-    // Headless paths intentionally load no interactive settings into their
-    // Widget or renderer. Loading here keeps startup policy centralized while
-    // preserving deterministic 1x headless behavior.
-    let settings = apply_cli_overrides(AppSettings::load(), &args);
     let root = std::env::var("POCKET_CHARACTER_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."));
@@ -86,8 +82,13 @@ fn main() -> Result<()> {
         return headless_seq(cfg, ticks, skip, PathBuf::from(dir));
     }
 
+    // Desktop settings are deliberately resolved only after headless exits.
+    // Headless verification has a fixed 1x renderer and must not inherit a
+    // user's interactive AA preferences from %APPDATA%.
+    let settings_path = AppSettings::path();
+    let settings = apply_cli_overrides(AppSettings::load(), &args);
     cfg.size = (settings.window.width, settings.window.height);
-    let widget = Widget::new_with_camera_settings(cfg, settings.camera);
+    let widget = Widget::new_with_settings_path(cfg, settings.clone(), settings_path);
     pocket3d::app::run(
         AppConfig {
             title: "pocket-character".into(),
@@ -100,7 +101,7 @@ fn main() -> Result<()> {
             resizable: settings.window.resizable,
             max_fps: Some(settings.rendering.max_fps),
             drag_window: true,
-            requested_sample_count: settings.rendering.anti_aliasing.samples().unwrap_or(1),
+            requested_sample_count: settings.rendering.msaa.samples().unwrap_or(1),
         },
         widget,
     )
