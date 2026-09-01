@@ -432,8 +432,18 @@ fn resolve_camera_parameters_with_aspect(
     adjustments: CameraRuntimeAdjustments,
     viewport_aspect: f32,
 ) -> CameraParameters {
+    let base_settings = base_settings.sanitized();
     let effective = adjustments.effective(base_settings);
-    let baseline_frame = resolve_camera_frame(aabb, effective.settings);
+    let authored_frame = resolve_camera_frame(aabb, base_settings);
+    let effective_distance = authored_frame.distance
+        * (effective.settings.distance_scale / base_settings.distance_scale);
+    let effective_fov_y = effective.settings.fov_deg.to_radians();
+    let baseline_frame = CameraFrame {
+        target: authored_frame.target,
+        distance: effective_distance,
+        fov_y: effective_fov_y,
+        view_height: 2.0 * effective_distance * (effective_fov_y * 0.5).tan(),
+    };
     let baseline_target = baseline_frame.target;
     let base_position = baseline_target + Vec3::new(0.0, 0.0, -baseline_frame.distance);
     let mut base_camera = Camera::default();
@@ -1638,6 +1648,204 @@ mod tests {
     }
 
     #[test]
+    fn runtime_fov_changes_only_effective_lens_at_zero_pan() {
+        let aabb = standard_pan_aabb();
+        let settings = in_range_pan_test_settings();
+        let pose = CameraRuntimeAdjustments {
+            yaw_deg: 31.0,
+            roll_deg: 17.0,
+            pitch_deg: -12.0,
+            ..Default::default()
+        };
+        let baseline =
+            resolve_camera_parameters_with_aspect(aabb, settings, pose, DEFAULT_VIEWPORT_ASPECT);
+        let changed = resolve_camera_parameters_with_aspect(
+            aabb,
+            settings,
+            CameraRuntimeAdjustments {
+                fov_delta_deg: 12.0,
+                ..pose
+            },
+            DEFAULT_VIEWPORT_ASPECT,
+        );
+
+        assert_ne!(changed.frame.fov_y, baseline.frame.fov_y);
+        approx_vec3(changed.baseline_target, baseline.baseline_target);
+        approx_vec3(changed.frame.target, baseline.frame.target);
+        approx_vec3(changed.position, baseline.position);
+        approx_eq(changed.frame.distance, baseline.frame.distance);
+        approx_eq(changed.yaw_deg, baseline.yaw_deg);
+        approx_eq(changed.roll_deg, baseline.roll_deg);
+        approx_eq(changed.pitch_deg, baseline.pitch_deg);
+    }
+
+    #[test]
+    fn runtime_distance_changes_only_orbit_radius_at_zero_pan() {
+        let aabb = standard_pan_aabb();
+        let settings = in_range_pan_test_settings();
+        let pose = CameraRuntimeAdjustments {
+            yaw_deg: 31.0,
+            roll_deg: 17.0,
+            pitch_deg: -12.0,
+            ..Default::default()
+        };
+        let baseline =
+            resolve_camera_parameters_with_aspect(aabb, settings, pose, DEFAULT_VIEWPORT_ASPECT);
+        let changed = resolve_camera_parameters_with_aspect(
+            aabb,
+            settings,
+            CameraRuntimeAdjustments {
+                distance_scale_delta: 0.25,
+                ..pose
+            },
+            DEFAULT_VIEWPORT_ASPECT,
+        );
+
+        assert_ne!(changed.frame.distance, baseline.frame.distance);
+        approx_vec3(changed.baseline_target, baseline.baseline_target);
+        approx_vec3(changed.frame.target, baseline.frame.target);
+        approx_eq(changed.frame.fov_y, baseline.frame.fov_y);
+        approx_eq(changed.yaw_deg, baseline.yaw_deg);
+        approx_eq(changed.roll_deg, baseline.roll_deg);
+        approx_eq(changed.pitch_deg, baseline.pitch_deg);
+
+        let forward = camera_for_parameters(baseline).forward();
+        approx_vec3(
+            changed.position,
+            changed.baseline_target - forward * changed.frame.distance,
+        );
+        approx_vec3(
+            changed.position - baseline.position,
+            -forward * (changed.frame.distance - baseline.frame.distance),
+        );
+    }
+
+    #[test]
+    fn combined_runtime_optics_preserve_authored_baseline_target() {
+        let aabb = standard_pan_aabb();
+        let settings = in_range_pan_test_settings();
+        let baseline = resolve_camera_parameters_with_aspect(
+            aabb,
+            settings,
+            CameraRuntimeAdjustments::default(),
+            DEFAULT_VIEWPORT_ASPECT,
+        );
+        let changed = resolve_camera_parameters_with_aspect(
+            aabb,
+            settings,
+            CameraRuntimeAdjustments {
+                fov_delta_deg: 18.0,
+                distance_scale_delta: 0.35,
+                ..Default::default()
+            },
+            DEFAULT_VIEWPORT_ASPECT,
+        );
+
+        approx_vec3(changed.baseline_target, baseline.baseline_target);
+        approx_vec3(changed.frame.target, baseline.frame.target);
+        assert_ne!(changed.frame.fov_y, baseline.frame.fov_y);
+        assert_ne!(changed.frame.distance, baseline.frame.distance);
+    }
+
+    #[test]
+    fn persisted_camera_optics_and_headroom_recompute_authored_target() {
+        let aabb = standard_pan_aabb();
+        let base_settings = in_range_pan_test_settings();
+        let baseline = resolve_camera_parameters_with_aspect(
+            aabb,
+            base_settings,
+            CameraRuntimeAdjustments::default(),
+            DEFAULT_VIEWPORT_ASPECT,
+        );
+        let variants = [
+            CameraSettings {
+                fov_deg: base_settings.fov_deg + 10.0,
+                ..base_settings
+            },
+            CameraSettings {
+                distance_scale: base_settings.distance_scale + 0.2,
+                ..base_settings
+            },
+            CameraSettings {
+                headroom: base_settings.headroom + 0.08,
+                ..base_settings
+            },
+        ];
+
+        for settings in variants {
+            let authored = resolve_camera_frame(aabb, settings);
+            let resolved = resolve_camera_parameters_with_aspect(
+                aabb,
+                settings,
+                CameraRuntimeAdjustments::default(),
+                DEFAULT_VIEWPORT_ASPECT,
+            );
+
+            approx_vec3(resolved.baseline_target, authored.target);
+            approx_vec3(resolved.frame.target, authored.target);
+            approx_eq(resolved.frame.distance, authored.distance);
+            approx_eq(resolved.frame.fov_y, authored.fov_y);
+            assert!((resolved.baseline_target - baseline.baseline_target).length() > 1.0e-4);
+        }
+    }
+
+    #[test]
+    fn runtime_optics_preserve_stored_pan_and_projected_ndc_displacement() {
+        let aabb = standard_pan_aabb();
+        let settings = in_range_pan_test_settings();
+        let aspect = 1.37;
+        let requested_pan = Vec2::new(0.37, -0.61);
+        let pose = CameraRuntimeAdjustments {
+            yaw_deg: 31.0,
+            roll_deg: 17.0,
+            pitch_deg: -12.0,
+            ..Default::default()
+        };
+        let baseline_zero = resolve_camera_parameters_with_aspect(aabb, settings, pose, aspect);
+        let baseline_panned = resolve_camera_parameters_with_aspect(
+            aabb,
+            settings,
+            CameraRuntimeAdjustments {
+                pan_ndc: requested_pan,
+                ..pose
+            },
+            aspect,
+        );
+        let changed_pose = CameraRuntimeAdjustments {
+            fov_delta_deg: 18.0,
+            distance_scale_delta: 0.35,
+            ..pose
+        };
+        let changed_zero =
+            resolve_camera_parameters_with_aspect(aabb, settings, changed_pose, aspect);
+        let changed_panned = resolve_camera_parameters_with_aspect(
+            aabb,
+            settings,
+            CameraRuntimeAdjustments {
+                pan_ndc: requested_pan,
+                ..changed_pose
+            },
+            aspect,
+        );
+
+        assert_eq!(baseline_panned.pan_ndc, requested_pan);
+        assert_eq!(changed_panned.pan_ndc, requested_pan);
+        approx_vec2(
+            projected_baseline_delta(baseline_zero, baseline_panned, aspect),
+            requested_pan,
+        );
+        approx_vec2(
+            projected_baseline_delta(changed_zero, changed_panned, aspect),
+            requested_pan,
+        );
+        approx_vec3(changed_zero.baseline_target, baseline_zero.baseline_target);
+
+        let baseline_world_pan = baseline_panned.position - baseline_zero.position;
+        let changed_world_pan = changed_panned.position - changed_zero.position;
+        assert!((changed_world_pan - baseline_world_pan).length() > 1.0e-4);
+    }
+
+    #[test]
     fn invalid_live_settings_are_sanitized() {
         let settings = CameraSettings {
             fov_deg: f32::NAN,
@@ -1717,8 +1925,13 @@ mod tests {
         orientation.yaw = parameters.yaw_deg.to_radians();
         orientation.roll = parameters.roll_deg.to_radians();
         orientation.pitch = parameters.pitch_deg.to_radians();
-        let expected_target = resolve_camera_frame(aabb, effective.settings).target;
+        let authored_frame = resolve_camera_frame(aabb, settings);
+        let expected_target = authored_frame.target;
         approx_vec3(parameters.baseline_target, expected_target);
+        approx_eq(
+            parameters.frame.distance,
+            authored_frame.distance * (effective.settings.distance_scale / settings.distance_scale),
+        );
         let world_pan_y =
             parameters.pan_ndc.y * parameters.frame.distance * (parameters.frame.fov_y * 0.5).tan();
         approx_vec3(
@@ -2556,7 +2769,10 @@ mod tests {
         let dt = 1.0 / 60.0;
         let mut input = Input::default();
         input.inject_key(KeyCode::ArrowLeft, true);
-        assert_eq!(horizontal_camera_action(&input), HorizontalCameraAction::Pan);
+        assert_eq!(
+            horizontal_camera_action(&input),
+            HorizontalCameraAction::Pan
+        );
         let left_delta = pan_witness_delta_after_keys(&[KeyCode::ArrowLeft], dt);
         assert!(left_delta.x < 0.0);
         assert_eq!(left_delta.y, 0.0);
@@ -2567,7 +2783,10 @@ mod tests {
 
         let mut input = Input::default();
         input.inject_key(KeyCode::ArrowRight, true);
-        assert_eq!(horizontal_camera_action(&input), HorizontalCameraAction::Pan);
+        assert_eq!(
+            horizontal_camera_action(&input),
+            HorizontalCameraAction::Pan
+        );
         let right_delta = pan_witness_delta_after_keys(&[KeyCode::ArrowRight], dt);
         assert!(right_delta.x > 0.0);
         assert_eq!(right_delta.y, 0.0);
@@ -2608,11 +2827,11 @@ mod tests {
         let mut input = Input::default();
         input.inject_key(KeyCode::ShiftLeft, true);
         input.inject_key(KeyCode::ArrowLeft, true);
-        assert_eq!(horizontal_camera_action(&input), HorizontalCameraAction::Yaw);
-        let shift_left = camera_adjustments_after_keys(&[
-            KeyCode::ShiftLeft,
-            KeyCode::ArrowLeft,
-        ]);
+        assert_eq!(
+            horizontal_camera_action(&input),
+            HorizontalCameraAction::Yaw
+        );
+        let shift_left = camera_adjustments_after_keys(&[KeyCode::ShiftLeft, KeyCode::ArrowLeft]);
         assert!(shift_left.yaw_deg < 0.0);
         assert_eq!(shift_left.roll_deg, 0.0);
         assert_eq!(shift_left.pitch_deg, 0.0);
@@ -2623,20 +2842,14 @@ mod tests {
         input.inject_key(KeyCode::ShiftLeft, true);
         input.inject_key(KeyCode::ArrowUp, true);
         assert_eq!(vertical_camera_action(&input), VerticalCameraAction::Zoom);
-        let shift_up = camera_adjustments_after_keys(&[
-            KeyCode::ShiftLeft,
-            KeyCode::ArrowUp,
-        ]);
+        let shift_up = camera_adjustments_after_keys(&[KeyCode::ShiftLeft, KeyCode::ArrowUp]);
         assert!(shift_up.distance_scale_delta < 0.0);
         assert_eq!(shift_up.yaw_deg, 0.0);
         assert_eq!(shift_up.roll_deg, 0.0);
         assert_eq!(shift_up.pitch_deg, 0.0);
         assert_eq!(shift_up.pan_ndc, Vec2::ZERO);
 
-        let shift_down = camera_adjustments_after_keys(&[
-            KeyCode::ShiftLeft,
-            KeyCode::ArrowDown,
-        ]);
+        let shift_down = camera_adjustments_after_keys(&[KeyCode::ShiftLeft, KeyCode::ArrowDown]);
         assert!(shift_down.distance_scale_delta > 0.0);
         assert_eq!(shift_down.yaw_deg, 0.0);
         assert_eq!(shift_down.pan_ndc, Vec2::ZERO);
@@ -2647,11 +2860,11 @@ mod tests {
         let mut input = Input::default();
         input.inject_key(KeyCode::ControlLeft, true);
         input.inject_key(KeyCode::ArrowLeft, true);
-        assert_eq!(horizontal_camera_action(&input), HorizontalCameraAction::Roll);
-        let ctrl_left = camera_adjustments_after_keys(&[
-            KeyCode::ControlLeft,
-            KeyCode::ArrowLeft,
-        ]);
+        assert_eq!(
+            horizontal_camera_action(&input),
+            HorizontalCameraAction::Roll
+        );
+        let ctrl_left = camera_adjustments_after_keys(&[KeyCode::ControlLeft, KeyCode::ArrowLeft]);
         assert!(ctrl_left.roll_deg < 0.0);
         assert_eq!(ctrl_left.yaw_deg, 0.0);
         assert_eq!(ctrl_left.pitch_deg, 0.0);
@@ -2662,20 +2875,14 @@ mod tests {
         input.inject_key(KeyCode::ControlLeft, true);
         input.inject_key(KeyCode::ArrowUp, true);
         assert_eq!(vertical_camera_action(&input), VerticalCameraAction::Pitch);
-        let ctrl_up = camera_adjustments_after_keys(&[
-            KeyCode::ControlLeft,
-            KeyCode::ArrowUp,
-        ]);
+        let ctrl_up = camera_adjustments_after_keys(&[KeyCode::ControlLeft, KeyCode::ArrowUp]);
         assert!(ctrl_up.pitch_deg > 0.0);
         assert_eq!(ctrl_up.yaw_deg, 0.0);
         assert_eq!(ctrl_up.roll_deg, 0.0);
         assert_eq!(ctrl_up.distance_scale_delta, 0.0);
         assert_eq!(ctrl_up.pan_ndc, Vec2::ZERO);
 
-        let ctrl_down = camera_adjustments_after_keys(&[
-            KeyCode::ControlLeft,
-            KeyCode::ArrowDown,
-        ]);
+        let ctrl_down = camera_adjustments_after_keys(&[KeyCode::ControlLeft, KeyCode::ArrowDown]);
         assert!(ctrl_down.pitch_deg < 0.0);
         assert_eq!(ctrl_down.yaw_deg, 0.0);
         assert_eq!(ctrl_down.distance_scale_delta, 0.0);
