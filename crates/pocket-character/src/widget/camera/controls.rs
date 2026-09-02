@@ -196,7 +196,8 @@ impl CameraControls {
         self.camera_controls_enabled
     }
 
-    pub(crate) fn set_adjustments(&mut self, adjustments: CameraRuntimeAdjustments) {
+    #[cfg(test)]
+    pub(in crate::widget) fn set_adjustments(&mut self, adjustments: CameraRuntimeAdjustments) {
         self.camera_adjustments = adjustments.sanitized();
     }
 

@@ -29,10 +29,11 @@ use crate::settings::{AntiAliasingPreference, AppSettings, CameraSettings};
 
 mod camera;
 
+#[cfg(test)]
+use camera::CameraRuntimeAdjustments;
 use camera::controls::{CAMERA_CONTROL_HELP, CameraControls};
 use camera::{
-    CameraRuntimeAdjustments, DEFAULT_VIEWPORT_ASPECT, EffectiveCameraValues,
-    resolve_camera_parameters_with_aspect,
+    DEFAULT_VIEWPORT_ASPECT, EffectiveCameraValues, resolve_camera_parameters_with_aspect,
 };
 
 pub struct WidgetConfig {
@@ -276,6 +277,7 @@ impl Widget {
         self.sim.mouse_target = self.camera.pos;
     }
 
+    #[cfg(test)]
     fn set_camera_adjustments(&mut self, adjustments: CameraRuntimeAdjustments) {
         self.camera_controls.set_adjustments(adjustments);
         self.reapply_camera();
