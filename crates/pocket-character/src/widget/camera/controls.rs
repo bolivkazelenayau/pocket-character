@@ -14,19 +14,34 @@ const CAMERA_DISTANCE_RATE_PER_SEC: f32 = 0.75;
 const CAMERA_PAN_WITNESS_NDC_RATE_PER_SEC: f32 = 0.75;
 const CAMERA_YAW_RATE_DEG_PER_SEC: f32 = 90.0;
 const CAMERA_ROLL_RATE_DEG_PER_SEC: f32 = 90.0;
-const ROLL_SNAP_DEG: f32 = 15.0;
-const ROLL_SNAP_REPEAT_DELAY_SEC: f32 = 0.30;
-const ROLL_SNAP_REPEAT_INTERVAL_SEC: f32 = 0.10;
+const HORIZONTAL_SNAP_DEG: f32 = 15.0;
+const ROLL_SNAP_DEG: f32 = HORIZONTAL_SNAP_DEG;
+const YAW_SNAP_DEG: f32 = HORIZONTAL_SNAP_DEG;
+const PITCH_SNAP_DEG: f32 = HORIZONTAL_SNAP_DEG;
+const SNAP_REPEAT_DELAY_SEC: f32 = 0.30;
+const SNAP_REPEAT_INTERVAL_SEC: f32 = 0.10;
+#[cfg(test)]
+const ROLL_SNAP_REPEAT_DELAY_SEC: f32 = SNAP_REPEAT_DELAY_SEC;
+#[cfg(test)]
+const ROLL_SNAP_REPEAT_INTERVAL_SEC: f32 = SNAP_REPEAT_INTERVAL_SEC;
+#[cfg(test)]
+const HORIZONTAL_SNAP_REPEAT_DELAY_SEC: f32 = SNAP_REPEAT_DELAY_SEC;
+#[cfg(test)]
+const HORIZONTAL_SNAP_REPEAT_INTERVAL_SEC: f32 = SNAP_REPEAT_INTERVAL_SEC;
+#[cfg(test)]
+const VERTICAL_SNAP_REPEAT_DELAY_SEC: f32 = SNAP_REPEAT_DELAY_SEC;
+#[cfg(test)]
+const VERTICAL_SNAP_REPEAT_INTERVAL_SEC: f32 = SNAP_REPEAT_INTERVAL_SEC;
 const CAMERA_PITCH_RATE_DEG_PER_SEC: f32 = 60.0;
 pub(crate) const CAMERA_CONTROL_HELP: [&str; 10] = [
     "Up / Down              Pan Y up / down",
     "Left / Right           Pan X left / right",
     "Shift + Up / Down      Zoom in / out",
     "Shift + Left / Right   Yaw left / right",
-    "Ctrl + Up / Down       Pitch up / down",
+    "Ctrl + Up / Down       Pitch up / down; Alt + Ctrl + Up / Down Snap pitch 15°",
     "Ctrl + Left/Right        Roll",
-    "Ctrl + Shift + Left/Right Snap roll 15°",
-    "Q / E                  Decrease / increase FOV",
+    "Alt + Ctrl + Left/Right Snap roll 15°; Alt + Shift + Left/Right Snap yaw 15°",
+    "Q / E, [ / ]           Decrease / increase FOV",
     "R                      Reset runtime camera adjustments",
     "F8                     Toggle camera controls",
 ];
@@ -39,15 +54,26 @@ fn modifier_down(input: &Input, left: KeyCode, right: KeyCode) -> bool {
     input.key_down(left) || input.key_down(right)
 }
 
+fn fov_axis(input: &Input) -> f32 {
+    let increase = input.key_down(KeyCode::KeyE) || input.key_down(KeyCode::BracketRight);
+    let decrease = input.key_down(KeyCode::KeyQ) || input.key_down(KeyCode::BracketLeft);
+    (increase as i8 - decrease as i8) as f32
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VerticalCameraAction {
     Pan,
     Zoom,
     Pitch,
+    SnapPitch,
 }
 
 fn vertical_camera_action(input: &Input) -> VerticalCameraAction {
-    if modifier_down(input, KeyCode::ControlLeft, KeyCode::ControlRight) {
+    let ctrl = modifier_down(input, KeyCode::ControlLeft, KeyCode::ControlRight);
+    let alt = modifier_down(input, KeyCode::AltLeft, KeyCode::AltRight);
+    if alt && ctrl {
+        VerticalCameraAction::SnapPitch
+    } else if ctrl {
         VerticalCameraAction::Pitch
     } else if modifier_down(input, KeyCode::ShiftLeft, KeyCode::ShiftRight) {
         VerticalCameraAction::Zoom
@@ -62,15 +88,19 @@ enum HorizontalCameraAction {
     Yaw,
     Pan,
     Roll,
+    SnapYaw,
 }
 
 fn horizontal_camera_action(input: &Input) -> HorizontalCameraAction {
     let ctrl = modifier_down(input, KeyCode::ControlLeft, KeyCode::ControlRight);
+    let alt = modifier_down(input, KeyCode::AltLeft, KeyCode::AltRight);
     let shift = modifier_down(input, KeyCode::ShiftLeft, KeyCode::ShiftRight);
-    if ctrl && shift {
+    if alt && ctrl {
         HorizontalCameraAction::SnapRoll
     } else if ctrl {
         HorizontalCameraAction::Roll
+    } else if alt && shift {
+        HorizontalCameraAction::SnapYaw
     } else if shift {
         HorizontalCameraAction::Yaw
     } else {
@@ -78,78 +108,197 @@ fn horizontal_camera_action(input: &Input) -> HorizontalCameraAction {
     }
 }
 
-fn snap_roll_degrees(current_deg: f32, direction: i8) -> f32 {
+fn snap_degrees(current_deg: f32, direction: i8, snap_deg: f32) -> f32 {
     let current_deg = super::normalize_degrees(current_deg);
     let snapped = match direction.cmp(&0) {
-        std::cmp::Ordering::Greater => (current_deg / ROLL_SNAP_DEG).floor() + 1.0,
-        std::cmp::Ordering::Less => (current_deg / ROLL_SNAP_DEG).ceil() - 1.0,
+        std::cmp::Ordering::Greater => (current_deg / snap_deg).floor() + 1.0,
+        std::cmp::Ordering::Less => (current_deg / snap_deg).ceil() - 1.0,
         std::cmp::Ordering::Equal => return current_deg,
-    } * ROLL_SNAP_DEG;
+    } * snap_deg;
     super::normalize_degrees(snapped)
 }
 
-fn apply_roll_snap_steps(current_deg: f32, direction: i8, steps: u32) -> f32 {
+#[cfg(test)]
+fn snap_roll_degrees(current_deg: f32, direction: i8) -> f32 {
+    snap_degrees(current_deg, direction, ROLL_SNAP_DEG)
+}
+
+#[cfg(test)]
+fn snap_yaw_degrees(current_deg: f32, direction: i8) -> f32 {
+    snap_degrees(current_deg, direction, YAW_SNAP_DEG)
+}
+
+fn apply_snap_steps(current_deg: f32, direction: i8, steps: u32, snap_deg: f32) -> f32 {
     if steps == 0 {
         return super::normalize_degrees(current_deg);
     }
 
-    let first_step = snap_roll_degrees(current_deg, direction);
-    let steps_per_turn = (360.0 / ROLL_SNAP_DEG).round() as u32;
+    let first_step = snap_degrees(current_deg, direction, snap_deg);
+    let steps_per_turn = (360.0 / snap_deg).round() as u32;
     let additional_steps = (steps - 1) % steps_per_turn;
-    super::normalize_degrees(
-        first_step + direction as f32 * additional_steps as f32 * ROLL_SNAP_DEG,
-    )
+    super::normalize_degrees(first_step + direction as f32 * additional_steps as f32 * snap_deg)
+}
+
+fn apply_roll_snap_steps(current_deg: f32, direction: i8, steps: u32) -> f32 {
+    apply_snap_steps(current_deg, direction, steps, ROLL_SNAP_DEG)
+}
+
+fn apply_yaw_snap_steps(current_deg: f32, direction: i8, steps: u32) -> f32 {
+    apply_snap_steps(current_deg, direction, steps, YAW_SNAP_DEG)
+}
+
+fn sanitize_pitch_degrees(pitch_deg: f32) -> f32 {
+    CameraRuntimeAdjustments {
+        pitch_deg,
+        ..CameraRuntimeAdjustments::default()
+    }
+    .sanitized()
+    .pitch_deg
+}
+
+fn snap_pitch_degrees(current_deg: f32, direction: i8) -> f32 {
+    let current_deg = sanitize_pitch_degrees(current_deg);
+    let snapped = match direction.cmp(&0) {
+        std::cmp::Ordering::Greater => (current_deg / PITCH_SNAP_DEG).floor() + 1.0,
+        std::cmp::Ordering::Less => (current_deg / PITCH_SNAP_DEG).ceil() - 1.0,
+        std::cmp::Ordering::Equal => return current_deg,
+    } * PITCH_SNAP_DEG;
+    sanitize_pitch_degrees(snapped)
+}
+
+fn apply_pitch_snap_steps(current_deg: f32, direction: i8, steps: u32) -> f32 {
+    if steps == 0 {
+        return sanitize_pitch_degrees(current_deg);
+    }
+
+    let first_step = snap_pitch_degrees(current_deg, direction);
+    let additional_steps = steps.saturating_sub(1) as f32;
+    sanitize_pitch_degrees(first_step + direction as f32 * additional_steps * PITCH_SNAP_DEG)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum HorizontalSnapMode {
+    #[default]
+    None,
+    Roll,
+    Yaw,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct RollSnapRepeatState {
+struct SnapRepeatState<M> {
+    active_mode: M,
     active_direction: i8,
     held_duration_sec: f32,
     repeat_steps_emitted: u32,
 }
 
-fn scheduled_roll_snap_repeats(held_duration_sec: f32) -> u32 {
+type HorizontalSnapRepeatState = SnapRepeatState<HorizontalSnapMode>;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum VerticalSnapMode {
+    #[default]
+    None,
+    Pitch,
+}
+
+type VerticalSnapRepeatState = SnapRepeatState<VerticalSnapMode>;
+
+fn horizontal_snap_mode(action: HorizontalCameraAction) -> HorizontalSnapMode {
+    match action {
+        HorizontalCameraAction::SnapRoll => HorizontalSnapMode::Roll,
+        HorizontalCameraAction::SnapYaw => HorizontalSnapMode::Yaw,
+        _ => HorizontalSnapMode::None,
+    }
+}
+
+fn scheduled_snap_repeats(held_duration_sec: f32) -> u32 {
     const TIME_EPSILON_SEC: f32 = 1.0e-6;
 
-    if held_duration_sec + TIME_EPSILON_SEC < ROLL_SNAP_REPEAT_DELAY_SEC {
+    if held_duration_sec + TIME_EPSILON_SEC < SNAP_REPEAT_DELAY_SEC {
         return 0;
     }
 
-    (((held_duration_sec + TIME_EPSILON_SEC - ROLL_SNAP_REPEAT_DELAY_SEC)
-        / ROLL_SNAP_REPEAT_INTERVAL_SEC)
+    (((held_duration_sec + TIME_EPSILON_SEC - SNAP_REPEAT_DELAY_SEC) / SNAP_REPEAT_INTERVAL_SEC)
         .floor() as u32)
         .saturating_add(1)
 }
 
-fn requested_roll_snap_steps(
-    state: &mut RollSnapRepeatState,
-    input: &Input,
-    horizontal_action: HorizontalCameraAction,
+fn requested_snap_steps<M>(
+    state: &mut SnapRepeatState<M>,
+    snap_mode: M,
+    snap_selected: bool,
+    held_direction: i8,
     dt: f32,
-) -> (i8, u32) {
-    if horizontal_action != HorizontalCameraAction::SnapRoll {
-        *state = RollSnapRepeatState::default();
+) -> (i8, u32)
+where
+    M: Copy + Default + PartialEq,
+{
+    if !snap_selected || held_direction == 0 {
+        *state = SnapRepeatState::default();
         return (0, 0);
     }
 
-    let held_direction = axis(input, KeyCode::ArrowRight, KeyCode::ArrowLeft) as i8;
-    if held_direction == 0 {
-        *state = RollSnapRepeatState::default();
-        return (0, 0);
-    }
-
-    if state.active_direction != held_direction {
-        *state = RollSnapRepeatState::default();
+    if state.active_mode != snap_mode || state.active_direction != held_direction {
+        *state = SnapRepeatState::default();
+        state.active_mode = snap_mode;
         state.active_direction = held_direction;
         return (held_direction, 1);
     }
 
     state.held_duration_sec += dt;
-    let scheduled_repeats = scheduled_roll_snap_repeats(state.held_duration_sec);
+    let scheduled_repeats = scheduled_snap_repeats(state.held_duration_sec);
     let due_repeats = scheduled_repeats.saturating_sub(state.repeat_steps_emitted);
     state.repeat_steps_emitted = scheduled_repeats;
 
     (held_direction, due_repeats)
+}
+
+fn requested_horizontal_snap_steps(
+    state: &mut HorizontalSnapRepeatState,
+    input: &Input,
+    horizontal_action: HorizontalCameraAction,
+    dt: f32,
+) -> (i8, u32) {
+    let snap_mode = horizontal_snap_mode(horizontal_action);
+    let held_direction = match snap_mode {
+        HorizontalSnapMode::Roll => axis(input, KeyCode::ArrowRight, KeyCode::ArrowLeft) as i8,
+        HorizontalSnapMode::Yaw => axis(input, KeyCode::ArrowLeft, KeyCode::ArrowRight) as i8,
+        HorizontalSnapMode::None => 0,
+    };
+    requested_snap_steps(
+        state,
+        snap_mode,
+        snap_mode != HorizontalSnapMode::None,
+        held_direction,
+        dt,
+    )
+}
+
+fn vertical_snap_mode(action: VerticalCameraAction) -> VerticalSnapMode {
+    match action {
+        VerticalCameraAction::SnapPitch => VerticalSnapMode::Pitch,
+        _ => VerticalSnapMode::None,
+    }
+}
+
+fn requested_vertical_snap_steps(
+    state: &mut VerticalSnapRepeatState,
+    input: &Input,
+    vertical_action: VerticalCameraAction,
+    dt: f32,
+) -> (i8, u32) {
+    let snap_mode = vertical_snap_mode(vertical_action);
+    let held_direction = match snap_mode {
+        VerticalSnapMode::Pitch => axis(input, KeyCode::ArrowUp, KeyCode::ArrowDown) as i8,
+        VerticalSnapMode::None => 0,
+    };
+    requested_snap_steps(
+        state,
+        snap_mode,
+        snap_mode != VerticalSnapMode::None,
+        held_direction,
+        dt,
+    )
 }
 
 fn requested_pan_witness_delta(
@@ -177,7 +326,8 @@ fn requested_pan_witness_delta(
 pub(crate) struct CameraControls {
     camera_controls_enabled: bool,
     camera_adjustments: CameraRuntimeAdjustments,
-    roll_snap_repeat: RollSnapRepeatState,
+    horizontal_snap_repeat: HorizontalSnapRepeatState,
+    vertical_snap_repeat: VerticalSnapRepeatState,
 }
 
 impl CameraControls {
@@ -202,7 +352,8 @@ impl CameraControls {
     }
 
     pub(crate) fn reset_adjustments(&mut self) {
-        self.roll_snap_repeat = RollSnapRepeatState::default();
+        self.horizontal_snap_repeat = HorizontalSnapRepeatState::default();
+        self.vertical_snap_repeat = VerticalSnapRepeatState::default();
         self.camera_adjustments = CameraRuntimeAdjustments::default();
     }
 
@@ -217,7 +368,8 @@ impl CameraControls {
         if input.key_pressed(KeyCode::F8) {
             self.camera_controls_enabled = !self.camera_controls_enabled;
             if !self.camera_controls_enabled {
-                self.roll_snap_repeat = RollSnapRepeatState::default();
+                self.horizontal_snap_repeat = HorizontalSnapRepeatState::default();
+                self.vertical_snap_repeat = VerticalSnapRepeatState::default();
             }
         }
 
@@ -242,37 +394,39 @@ impl CameraControls {
         let repeat_dt = finite_value(dt, 0.0).max(0.0);
         let dt = super::finite_clamped(dt, 0.0, 0.25, 0.0);
         let horizontal_action = horizontal_camera_action(input);
-        let (roll_snap_direction, roll_snap_steps) = requested_roll_snap_steps(
-            &mut self.roll_snap_repeat,
+        let (snap_direction, snap_steps) = requested_horizontal_snap_steps(
+            &mut self.horizontal_snap_repeat,
             input,
             horizontal_action,
             repeat_dt,
         );
-        if dt == 0.0 && roll_snap_steps == 0 {
+        let action = vertical_camera_action(input);
+        let (pitch_snap_direction, pitch_snap_steps) =
+            requested_vertical_snap_steps(&mut self.vertical_snap_repeat, input, action, repeat_dt);
+        if dt == 0.0 && snap_steps == 0 && pitch_snap_steps == 0 {
             return false;
         }
 
         let previous_adjustments = self.camera_adjustments;
         let mut adjustments = self.camera_adjustments;
-        let action = vertical_camera_action(input);
         let requested_pitch_delta = if action == VerticalCameraAction::Pitch {
             axis(input, KeyCode::ArrowUp, KeyCode::ArrowDown) * CAMERA_PITCH_RATE_DEG_PER_SEC * dt
         } else {
             0.0
         };
         let requested_pan = requested_pan_witness_delta(input, dt, horizontal_action, action);
-        adjustments.fov_delta_deg +=
-            axis(input, KeyCode::KeyE, KeyCode::KeyQ) * CAMERA_FOV_RATE_DEG_PER_SEC * dt;
+        adjustments.fov_delta_deg += fov_axis(input) * CAMERA_FOV_RATE_DEG_PER_SEC * dt;
         match horizontal_action {
             HorizontalCameraAction::SnapRoll => {
-                adjustments.roll_deg = apply_roll_snap_steps(
-                    adjustments.roll_deg,
-                    roll_snap_direction,
-                    roll_snap_steps,
-                );
+                adjustments.roll_deg =
+                    apply_roll_snap_steps(adjustments.roll_deg, snap_direction, snap_steps);
+            }
+            HorizontalCameraAction::SnapYaw => {
+                adjustments.yaw_deg =
+                    apply_yaw_snap_steps(adjustments.yaw_deg, snap_direction, snap_steps);
             }
             HorizontalCameraAction::Yaw => {
-                adjustments.yaw_deg += axis(input, KeyCode::ArrowRight, KeyCode::ArrowLeft)
+                adjustments.yaw_deg += axis(input, KeyCode::ArrowLeft, KeyCode::ArrowRight)
                     * CAMERA_YAW_RATE_DEG_PER_SEC
                     * dt;
             }
@@ -300,6 +454,13 @@ impl CameraControls {
             VerticalCameraAction::Pitch => {
                 adjustments.pitch_deg += requested_pitch_delta;
             }
+            VerticalCameraAction::SnapPitch => {
+                adjustments.pitch_deg = apply_pitch_snap_steps(
+                    adjustments.pitch_deg,
+                    pitch_snap_direction,
+                    pitch_snap_steps,
+                );
+            }
         }
 
         if requested_pan != Vec2::ZERO {
@@ -326,7 +487,7 @@ impl CameraControls {
 #[cfg(test)]
 impl CameraControls {
     pub(in crate::widget) fn roll_snap_repeat_is_active(&self) -> bool {
-        self.roll_snap_repeat.active_direction != 0
+        self.horizontal_snap_repeat.active_direction != 0
     }
 
     fn set_camera_adjustments(&mut self, adjustments: CameraRuntimeAdjustments) {
