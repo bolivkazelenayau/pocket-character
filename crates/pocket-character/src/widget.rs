@@ -896,7 +896,7 @@ mod tests {
         widget.frame(0.0, &input);
         input.inject_key(KeyCode::F8, false);
         input.inject_key(KeyCode::ControlLeft, true);
-        input.inject_key(KeyCode::ShiftLeft, true);
+        input.inject_key(KeyCode::AltLeft, true);
         input.inject_key(KeyCode::ArrowRight, true);
         input.end_frame();
         widget.frame(0.0, &input);
@@ -925,7 +925,7 @@ mod tests {
         widget.frame(0.0, &input);
         input.inject_key(KeyCode::F8, false);
         input.inject_key(KeyCode::ControlLeft, true);
-        input.inject_key(KeyCode::ShiftLeft, true);
+        input.inject_key(KeyCode::AltLeft, true);
         input.inject_key(KeyCode::ArrowRight, true);
         input.end_frame();
         widget.frame(0.0, &input);
