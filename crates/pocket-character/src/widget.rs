@@ -28,13 +28,15 @@ use crate::guest::{CharacterGuest, Command, TickEvent, TickState};
 use crate::settings::{AntiAliasingPreference, AppSettings, CameraSettings};
 
 mod camera;
+mod diagnostics;
 
 #[cfg(test)]
 use camera::CameraRuntimeAdjustments;
-use camera::controls::{CAMERA_CONTROL_HELP, CameraControls};
+use camera::controls::CameraControls;
 use camera::{
     DEFAULT_VIEWPORT_ASPECT, EffectiveCameraValues, resolve_camera_parameters_with_aspect,
 };
+use diagnostics::{FrameStats, RenderFps};
 
 pub struct WidgetConfig {
     pub model_path: PathBuf,
@@ -43,67 +45,6 @@ pub struct WidgetConfig {
     pub size: (u32, u32),
     /// Render N frames then exit (verification runs).
     pub frames: Option<u32>,
-}
-
-/// Rolling frame stats fed to the guest and to the measurement harness.
-struct FrameStats {
-    frames: u32,
-    cpu_ms_acc: f32,
-    window_start: Instant,
-    pub fps: f32,
-    pub frame_ms: f32,
-}
-
-impl FrameStats {
-    fn new() -> Self {
-        Self {
-            frames: 0,
-            cpu_ms_acc: 0.0,
-            window_start: Instant::now(),
-            fps: 0.0,
-            frame_ms: 0.0,
-        }
-    }
-
-    fn record(&mut self, cpu_ms: f32) {
-        self.frames += 1;
-        self.cpu_ms_acc += cpu_ms;
-        let elapsed = self.window_start.elapsed().as_secs_f32();
-        if elapsed >= 1.0 {
-            self.fps = self.frames as f32 / elapsed;
-            self.frame_ms = self.cpu_ms_acc / self.frames.max(1) as f32;
-            self.frames = 0;
-            self.cpu_ms_acc = 0.0;
-            self.window_start = Instant::now();
-        }
-    }
-}
-
-/// Rolling FPS measured at the rendered-frame cadence (`Widget::frame`).
-struct RenderFps {
-    frames: u32,
-    elapsed: f32,
-    fps: f32,
-}
-
-impl RenderFps {
-    fn new() -> Self {
-        Self {
-            frames: 0,
-            elapsed: 0.0,
-            fps: 0.0,
-        }
-    }
-
-    fn record(&mut self, dt: f32) {
-        self.frames += 1;
-        self.elapsed += if dt.is_finite() && dt >= 0.0 { dt } else { 0.0 };
-        if self.elapsed >= 1.0 {
-            self.fps = self.frames as f32 / self.elapsed;
-            self.frames = 0;
-            self.elapsed = 0.0;
-        }
-    }
 }
 
 pub struct Widget {
@@ -562,8 +503,8 @@ impl Game for Widget {
                 TrackingMode::None => "none",
                 TrackingMode::Mouse => "mouse",
             },
-            fps: self.stats.fps,
-            frame_ms: self.stats.frame_ms,
+            fps: self.stats.fps(),
+            frame_ms: self.stats.frame_ms(),
         };
         if let Some(guest) = &self.guest {
             match guest.turn(&state, &events) {
@@ -590,7 +531,7 @@ impl Game for Widget {
             } else {
                 log::warn!(
                     "renderer rejected requested MSAA {}; keeping persisted preference",
-                    format_msaa_count(requested)
+                    diagnostics::format_msaa_count(requested)
                 );
             }
         }
@@ -615,8 +556,8 @@ impl Game for Widget {
         self.commit_accepted_aa_preferences(accepted_msaa, accepted_smaa);
         log::info!(
             "AA: requested {}, effective MSAA {}, SMAA {}",
-            format_msaa_count(self.debug_requested_msaa),
-            format_msaa_count(self.debug_effective_msaa),
+            diagnostics::format_msaa_count(self.debug_requested_msaa),
+            diagnostics::format_msaa_count(self.debug_effective_msaa),
             if self.debug_smaa_enabled { "on" } else { "off" }
         );
     }
@@ -695,66 +636,26 @@ impl Widget {
         const PANEL_TOP: f32 = 8.0;
         const PANEL_PADDING: f32 = 8.0;
 
-        let title = "Pocket3D HUD";
-        let fps = format!("FPS: {:.1}", self.render_fps.fps);
-        let tick_cpu = format!("Tick CPU: {:.2} ms", self.stats.frame_ms);
-        let gpu = format!("GPU: {}", self.debug_gpu_name);
-        let backend = format!("Backend: {}", self.debug_backend);
-        let msaa = format_msaa_hud_line(self.debug_requested_msaa, self.debug_effective_msaa);
-        let smaa = format_smaa_hud_line(self.debug_smaa_enabled);
-        let camera = self.effective_camera_values();
-        let camera_fov = format!("Cam FOV: {:.1} deg", camera.settings.fov_deg);
-        let camera_distance = format!(
-            "Cam distance: {:.3}x height",
-            camera.settings.distance_scale
+        let text = diagnostics::format_debug_hud(
+            size,
+            &self.stats,
+            &self.render_fps,
+            &self.debug_gpu_name,
+            &self.debug_backend,
+            self.debug_requested_msaa,
+            self.debug_effective_msaa,
+            self.debug_smaa_enabled,
+            self.effective_camera_values(),
+            self.camera_controls.camera_controls_enabled(),
         );
-        let camera_headroom = format!("Cam headroom: {:.3}", camera.settings.headroom);
-        let camera_framing_x = format!("Cam pan X: {:.3} NDC", camera.pan_ndc.x);
-        let camera_framing_y = format!("Cam pan Y: {:.3} NDC", camera.pan_ndc.y);
-        let camera_yaw = format!("Cam yaw: {:.1} deg", camera.yaw_deg);
-        let camera_roll = format!("Cam roll: {:.1} deg", camera.roll_deg);
-        let camera_pitch = format!("Cam pitch: {:.1} deg", camera.pitch_deg);
-        let camera_controls = if self.camera_controls.camera_controls_enabled() {
-            "Camera controls: on"
-        } else {
-            "Camera controls: off"
-        };
-        let frame = format!("Frame: {}x{}", size.0, size.1);
-        let body = [
-            fps.as_str(),
-            tick_cpu.as_str(),
-            gpu.as_str(),
-            backend.as_str(),
-            msaa.as_str(),
-            smaa.as_str(),
-            camera_fov.as_str(),
-            camera_distance.as_str(),
-            camera_headroom.as_str(),
-            camera_framing_x.as_str(),
-            camera_framing_y.as_str(),
-            camera_yaw.as_str(),
-            camera_roll.as_str(),
-            camera_pitch.as_str(),
-            camera_controls,
-            CAMERA_CONTROL_HELP[0],
-            CAMERA_CONTROL_HELP[1],
-            CAMERA_CONTROL_HELP[2],
-            CAMERA_CONTROL_HELP[3],
-            CAMERA_CONTROL_HELP[4],
-            CAMERA_CONTROL_HELP[5],
-            CAMERA_CONTROL_HELP[6],
-            CAMERA_CONTROL_HELP[7],
-            CAMERA_CONTROL_HELP[8],
-            CAMERA_CONTROL_HELP[9],
-            frame.as_str(),
-        ];
 
-        let body_width = body
+        let body_width = text
+            .lines
             .iter()
             .map(|line| Hud::text_width(line, 1.0))
             .fold(0.0, f32::max);
-        let panel_width = Hud::text_width(title, 2.0).max(body_width) + PANEL_PADDING * 2.0;
-        let panel_bottom = BODY_Y + (body.len() - 1) as f32 * LINE_HEIGHT + 8.0;
+        let panel_width = Hud::text_width(text.title, 2.0).max(body_width) + PANEL_PADDING * 2.0;
+        let panel_bottom = BODY_Y + (text.lines.len() - 1) as f32 * LINE_HEIGHT + 8.0;
         let panel_height = panel_bottom - PANEL_TOP + PANEL_PADDING;
 
         self.hud.rect(
@@ -772,8 +673,8 @@ impl Widget {
             [0.20, 0.72, 1.0, 0.95],
         );
         self.hud
-            .text(X, TITLE_Y, 2.0, [0.86, 0.96, 1.0, 1.0], title);
-        for (index, line) in body.iter().enumerate() {
+            .text(X, TITLE_Y, 2.0, [0.86, 0.96, 1.0, 1.0], text.title);
+        for (index, line) in text.lines.iter().enumerate() {
             self.hud.text(
                 X,
                 BODY_Y + index as f32 * LINE_HEIGHT,
@@ -783,25 +684,6 @@ impl Widget {
             );
         }
     }
-}
-
-fn format_msaa_count(sample_count: u32) -> String {
-    match sample_count {
-        1 => "off".into(),
-        sample_count => format!("{sample_count}x"),
-    }
-}
-
-fn format_msaa_hud_line(requested: u32, effective: u32) -> String {
-    format!(
-        "MSAA: requested {} / effective {}",
-        format_msaa_count(requested),
-        format_msaa_count(effective)
-    )
-}
-
-fn format_smaa_hud_line(enabled: bool) -> String {
-    (if enabled { "SMAA: on" } else { "SMAA: off" }).into()
 }
 
 #[cfg(test)]
@@ -1260,48 +1142,5 @@ mod tests {
         assert_eq!(next_msaa_sample_count(4), 8);
         assert_eq!(next_msaa_sample_count(8), 1);
         assert_eq!(next_msaa_sample_count(16), 2);
-    }
-
-    #[test]
-    fn msaa_hud_explicitly_formats_requested_and_effective_modes() {
-        assert_eq!(
-            format_msaa_hud_line(1, 1),
-            "MSAA: requested off / effective off"
-        );
-        assert_eq!(
-            format_msaa_hud_line(4, 4),
-            "MSAA: requested 4x / effective 4x"
-        );
-    }
-
-    #[test]
-    fn msaa_hud_preserves_requested_effective_fallback() {
-        assert_eq!(
-            format_msaa_hud_line(8, 4),
-            "MSAA: requested 8x / effective 4x"
-        );
-    }
-
-    #[test]
-    fn smaa_hud_status_remains_independent_on_or_off() {
-        assert_eq!(format_smaa_hud_line(true), "SMAA: on");
-        assert_eq!(format_smaa_hud_line(false), "SMAA: off");
-
-        assert_eq!(
-            format_msaa_hud_line(8, 4),
-            "MSAA: requested 8x / effective 4x"
-        );
-    }
-
-    #[test]
-    fn render_fps_uses_render_frame_delta() {
-        let mut widget = test_widget();
-        let input = Input::default();
-
-        for _ in 0..4 {
-            widget.frame(0.25, &input);
-        }
-
-        approx_eq(widget.render_fps.fps, 4.0);
     }
 }
