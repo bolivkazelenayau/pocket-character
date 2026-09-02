@@ -71,7 +71,7 @@ impl RenderFps {
         }
     }
 
-    fn fps(&self) -> f32 {
+    pub(super) fn fps(&self) -> f32 {
         self.fps
     }
 }

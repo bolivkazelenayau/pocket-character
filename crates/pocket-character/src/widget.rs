@@ -1143,4 +1143,16 @@ mod tests {
         assert_eq!(next_msaa_sample_count(8), 1);
         assert_eq!(next_msaa_sample_count(16), 2);
     }
+
+    #[test]
+    fn widget_frame_records_render_fps() {
+        let mut widget = test_widget();
+        let input = Input::default();
+
+        for _ in 0..4 {
+            widget.frame(0.25, &input);
+        }
+
+        approx_eq(widget.render_fps.fps(), 4.0);
+    }
 }
