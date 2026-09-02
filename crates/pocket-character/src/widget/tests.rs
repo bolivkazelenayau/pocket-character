@@ -27,6 +27,7 @@ fn invalid_live_settings_are_sanitized() {
         fov_deg: f32::NAN,
         distance_scale: -1.0,
         headroom: 1.0,
+        ..CameraSettings::default()
     };
     assert_eq!(
         settings.sanitized(),
@@ -34,6 +35,7 @@ fn invalid_live_settings_are_sanitized() {
             fov_deg: 40.0,
             distance_scale: 0.1,
             headroom: 0.49,
+            ..CameraSettings::default()
         }
     );
 
@@ -55,6 +57,7 @@ fn live_settings_are_available_before_model_load() {
         fov_deg: 35.0,
         distance_scale: 0.75,
         headroom: 0.08,
+        ..CameraSettings::default()
     });
 
     assert_eq!(widget.camera_settings.fov_deg, 35.0);

@@ -29,6 +29,7 @@ fn in_range_pan_test_settings() -> CameraSettings {
         fov_deg: 55.0,
         distance_scale: 0.8,
         headroom: 0.17,
+        ..CameraSettings::default()
     }
 }
 
@@ -37,6 +38,7 @@ fn outside_pan_test_settings() -> CameraSettings {
         fov_deg: 40.0,
         distance_scale: 0.3,
         headroom: 0.49,
+        ..CameraSettings::default()
     }
 }
 
@@ -808,6 +810,7 @@ fn orientation_fov_distance_and_aspect_changes_never_correct_stored_pan() {
                 fov_deg: 22.0,
                 distance_scale: 0.2,
                 headroom: 0.31,
+                ..CameraSettings::default()
             },
             CameraRuntimeAdjustments {
                 pan_ndc: stored_pan,

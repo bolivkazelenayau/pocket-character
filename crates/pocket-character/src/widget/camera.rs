@@ -89,6 +89,9 @@ impl CameraRuntimeAdjustments {
             fov_deg: base.fov_deg + adjustments.fov_delta_deg,
             distance_scale: base.distance_scale + adjustments.distance_scale_delta,
             headroom: base.headroom,
+            yaw_snap_deg: base.yaw_snap_deg,
+            roll_snap_deg: base.roll_snap_deg,
+            pitch_snap_deg: base.pitch_snap_deg,
         }
         .sanitized();
 

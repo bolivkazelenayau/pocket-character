@@ -27,6 +27,7 @@ const DEFAULT_WINDOW_HEIGHT: u32 = 600;
 const DEFAULT_FOV_DEG: f32 = 40.0;
 const DEFAULT_DISTANCE_SCALE: f32 = 0.6;
 const DEFAULT_HEADROOM: f32 = 0.05;
+const DEFAULT_SNAP_DEG: f32 = 15.0;
 const DEFAULT_MAX_FPS: f32 = 60.0;
 
 const MIN_WINDOW_WIDTH: u32 = 160;
@@ -35,6 +36,8 @@ const MIN_WINDOW_HEIGHT: u32 = 160;
 const MAX_WINDOW_HEIGHT: u32 = 4320;
 const MIN_MAX_FPS: f32 = 1.0;
 const MAX_MAX_FPS: f32 = 240.0;
+const MIN_SNAP_DEG: f32 = 0.1;
+const MAX_SNAP_DEG: f32 = 90.0;
 
 #[allow(dead_code)]
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -130,6 +133,21 @@ pub struct CameraSettings {
         deserialize_with = "deserialize_headroom"
     )]
     pub headroom: f32,
+    #[serde(
+        default = "default_snap_deg",
+        deserialize_with = "deserialize_snap_deg"
+    )]
+    pub yaw_snap_deg: f32,
+    #[serde(
+        default = "default_snap_deg",
+        deserialize_with = "deserialize_snap_deg"
+    )]
+    pub roll_snap_deg: f32,
+    #[serde(
+        default = "default_snap_deg",
+        deserialize_with = "deserialize_snap_deg"
+    )]
+    pub pitch_snap_deg: f32,
 }
 
 impl Default for CameraSettings {
@@ -138,6 +156,9 @@ impl Default for CameraSettings {
             fov_deg: DEFAULT_FOV_DEG,
             distance_scale: DEFAULT_DISTANCE_SCALE,
             headroom: DEFAULT_HEADROOM,
+            yaw_snap_deg: DEFAULT_SNAP_DEG,
+            roll_snap_deg: DEFAULT_SNAP_DEG,
+            pitch_snap_deg: DEFAULT_SNAP_DEG,
         }
     }
 }
@@ -165,6 +186,9 @@ impl CameraSettings {
             } else {
                 defaults.headroom
             },
+            yaw_snap_deg: sanitize_snap_deg(self.yaw_snap_deg, defaults.yaw_snap_deg),
+            roll_snap_deg: sanitize_snap_deg(self.roll_snap_deg, defaults.roll_snap_deg),
+            pitch_snap_deg: sanitize_snap_deg(self.pitch_snap_deg, defaults.pitch_snap_deg),
         }
     }
 }
@@ -539,6 +563,10 @@ fn default_headroom() -> f32 {
     DEFAULT_HEADROOM
 }
 
+fn default_snap_deg() -> f32 {
+    DEFAULT_SNAP_DEG
+}
+
 fn default_max_fps() -> f32 {
     DEFAULT_MAX_FPS
 }
@@ -641,6 +669,21 @@ where
     deserialize_f32_or(deserializer, DEFAULT_HEADROOM)
 }
 
+fn deserialize_snap_deg<'de, D>(deserializer: D) -> std::result::Result<f32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_f32_or(deserializer, DEFAULT_SNAP_DEG)
+}
+
+fn sanitize_snap_deg(value: f32, default: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(MIN_SNAP_DEG, MAX_SNAP_DEG)
+    } else {
+        default
+    }
+}
+
 fn deserialize_max_fps<'de, D>(deserializer: D) -> std::result::Result<f32, D::Error>
 where
     D: Deserializer<'de>,
@@ -670,6 +713,9 @@ mod tests {
         assert!(!settings.window.resizable);
         assert!(settings.window.always_on_top);
         assert_eq!(settings.camera, CameraSettings::default());
+        assert_eq!(settings.camera.yaw_snap_deg, 15.0);
+        assert_eq!(settings.camera.roll_snap_deg, 15.0);
+        assert_eq!(settings.camera.pitch_snap_deg, 15.0);
         assert_eq!(settings.rendering.msaa, AntiAliasingPreference::X4);
         assert_eq!(settings.rendering.max_fps, 60.0);
         assert!(!settings.rendering.smaa_enabled);
@@ -688,6 +734,9 @@ mod tests {
                 fov_deg: 35.0,
                 distance_scale: 0.75,
                 headroom: 0.08,
+                yaw_snap_deg: 7.5,
+                roll_snap_deg: 22.5,
+                pitch_snap_deg: 60.0,
             },
             rendering: RenderSettings {
                 msaa: AntiAliasingPreference::X8,
@@ -714,6 +763,62 @@ mod tests {
         assert_eq!(settings.window.resizable, false);
         assert_eq!(settings.camera, CameraSettings::default());
         assert_eq!(settings.rendering, RenderSettings::default());
+    }
+
+    #[test]
+    fn old_camera_settings_json_defaults_missing_snap_steps() {
+        let settings = AppSettings::from_json(
+            r#"{
+                "window":{"width":720,"height":480,"resizable":true,"always_on_top":false},
+                "camera":{"fov_deg":35.0,"distance_scale":0.75,"headroom":0.08},
+                "rendering":{"msaa":"8x","max_fps":144.0,"smaa_enabled":true}
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            settings.camera,
+            CameraSettings {
+                fov_deg: 35.0,
+                distance_scale: 0.75,
+                headroom: 0.08,
+                ..CameraSettings::default()
+            }
+        );
+        assert_eq!(settings.window.width, 720);
+        assert_eq!(settings.window.height, 480);
+        assert!(settings.window.resizable);
+        assert!(!settings.window.always_on_top);
+        assert_eq!(settings.rendering.msaa, AntiAliasingPreference::X8);
+        assert_eq!(settings.rendering.max_fps, 144.0);
+        assert!(settings.rendering.smaa_enabled);
+    }
+
+    #[test]
+    fn camera_snap_steps_sanitize_each_field_independently() {
+        let sanitized = AppSettings::from_json(
+            r#"{
+                "camera":{"yaw_snap_deg":0.0,"roll_snap_deg":42.0,"pitch_snap_deg":120.0}
+            }"#,
+        )
+        .unwrap()
+        .camera;
+
+        assert_eq!(sanitized.yaw_snap_deg, MIN_SNAP_DEG);
+        assert_eq!(sanitized.roll_snap_deg, 42.0);
+        assert_eq!(sanitized.pitch_snap_deg, MAX_SNAP_DEG);
+
+        let sanitized = CameraSettings {
+            yaw_snap_deg: f32::INFINITY,
+            roll_snap_deg: 42.0,
+            pitch_snap_deg: -f32::INFINITY,
+            ..CameraSettings::default()
+        }
+        .sanitized();
+
+        assert_eq!(sanitized.yaw_snap_deg, 15.0);
+        assert_eq!(sanitized.roll_snap_deg, 42.0);
+        assert_eq!(sanitized.pitch_snap_deg, 15.0);
     }
 
     #[test]
