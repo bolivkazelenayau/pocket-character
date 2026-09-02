@@ -102,10 +102,10 @@ fn apply_roll_snap_steps(current_deg: f32, direction: i8, steps: u32) -> f32 {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(crate) struct RollSnapRepeatState {
-    pub(crate) active_direction: i8,
-    pub(crate) held_duration_sec: f32,
-    pub(crate) repeat_steps_emitted: u32,
+struct RollSnapRepeatState {
+    active_direction: i8,
+    held_duration_sec: f32,
+    repeat_steps_emitted: u32,
 }
 
 fn scheduled_roll_snap_repeats(held_duration_sec: f32) -> u32 {
@@ -194,10 +194,6 @@ impl CameraControls {
 
     pub(crate) fn camera_controls_enabled(&self) -> bool {
         self.camera_controls_enabled
-    }
-
-    pub(crate) fn roll_snap_repeat(&self) -> RollSnapRepeatState {
-        self.roll_snap_repeat
     }
 
     pub(crate) fn set_adjustments(&mut self, adjustments: CameraRuntimeAdjustments) {
@@ -328,6 +324,10 @@ impl CameraControls {
 
 #[cfg(test)]
 impl CameraControls {
+    pub(in crate::widget) fn roll_snap_repeat_is_active(&self) -> bool {
+        self.roll_snap_repeat.active_direction != 0
+    }
+
     fn set_camera_adjustments(&mut self, adjustments: CameraRuntimeAdjustments) {
         self.set_adjustments(adjustments);
     }

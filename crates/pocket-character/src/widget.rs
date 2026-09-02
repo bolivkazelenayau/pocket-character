@@ -806,7 +806,6 @@ fn format_smaa_hud_line(enabled: bool) -> String {
 mod tests {
     use super::*;
     use crate::settings::{AntiAliasingPreference, AppSettings, RenderSettings};
-    use crate::widget::camera::controls::RollSnapRepeatState;
     use glam::Vec2;
     use tempfile::tempdir;
 
@@ -899,19 +898,13 @@ mod tests {
         input.inject_key(KeyCode::ArrowRight, true);
         input.end_frame();
         widget.frame(0.0, &input);
-        assert_eq!(
-            widget.camera_controls.roll_snap_repeat().active_direction,
-            1
-        );
+        assert!(widget.camera_controls.roll_snap_repeat_is_active());
         input.end_frame();
         input.inject_key(KeyCode::F8, true);
         widget.frame(0.0, &input);
 
         assert!(!widget.camera_controls.camera_controls_enabled());
-        assert_eq!(
-            widget.camera_controls.roll_snap_repeat(),
-            RollSnapRepeatState::default()
-        );
+        assert!(!widget.camera_controls.roll_snap_repeat_is_active());
     }
 
     #[test]
@@ -934,10 +927,7 @@ mod tests {
         input.inject_key(KeyCode::ArrowRight, true);
         input.end_frame();
         widget.frame(0.0, &input);
-        assert_eq!(
-            widget.camera_controls.roll_snap_repeat().active_direction,
-            1
-        );
+        assert!(widget.camera_controls.roll_snap_repeat_is_active());
         input.end_frame();
         input.inject_key(KeyCode::KeyR, true);
         widget.frame(1.0 / 60.0, &input);
@@ -946,10 +936,7 @@ mod tests {
             widget.camera_controls.adjustments(),
             CameraRuntimeAdjustments::default()
         );
-        assert_eq!(
-            widget.camera_controls.roll_snap_repeat(),
-            RollSnapRepeatState::default()
-        );
+        assert!(!widget.camera_controls.roll_snap_repeat_is_active());
     }
 
     #[test]
