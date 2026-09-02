@@ -3,6 +3,8 @@ use pocket3d::camera::Camera;
 
 use crate::settings::CameraSettings;
 
+pub(super) mod controls;
+
 const MIN_MODEL_HEIGHT: f32 = 0.001;
 const MAX_MODEL_BOUND: f32 = 100_000.0;
 /// Rest-pose AABBs can omit a small animated excursion from hair/accessories.
