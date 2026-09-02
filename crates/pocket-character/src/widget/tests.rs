@@ -66,6 +66,71 @@ fn live_settings_are_available_before_model_load() {
 }
 
 #[test]
+fn live_snap_steps_update_controls_without_resetting_runtime_adjustments() {
+    let mut widget = test_widget();
+    let existing_adjustments = CameraRuntimeAdjustments {
+        fov_delta_deg: 4.0,
+        distance_scale_delta: -0.1,
+        pan_ndc: Vec2::new(0.03, 0.02),
+        yaw_deg: 4.0,
+        roll_deg: 6.0,
+        pitch_deg: -8.0,
+    };
+    widget.set_camera_adjustments(existing_adjustments);
+    widget.set_camera_settings(CameraSettings {
+        yaw_snap_deg: 5.0,
+        roll_snap_deg: 17.5,
+        pitch_snap_deg: 30.0,
+        ..CameraSettings::default()
+    });
+
+    assert_eq!(widget.camera_controls.adjustments(), existing_adjustments);
+
+    let mut input = Input::default();
+    input.inject_key(KeyCode::F8, true);
+    widget.frame(0.0, &input);
+    input.inject_key(KeyCode::F8, false);
+    input.inject_key(KeyCode::AltLeft, true);
+    input.inject_key(KeyCode::ShiftLeft, true);
+    input.inject_key(KeyCode::ArrowLeft, true);
+    input.end_frame();
+    widget.frame(0.0, &input);
+
+    let after_first_snap = CameraRuntimeAdjustments {
+        yaw_deg: 5.0,
+        ..existing_adjustments
+    };
+    assert_eq!(widget.camera_controls.adjustments(), after_first_snap);
+    assert_eq!(widget.camera_settings.yaw_snap_deg, 5.0);
+    assert_eq!(widget.camera_settings.roll_snap_deg, 17.5);
+    assert_eq!(widget.camera_settings.pitch_snap_deg, 30.0);
+
+    input.end_frame();
+    input.inject_key(KeyCode::ArrowLeft, false);
+    widget.frame(0.0, &input);
+    widget.set_camera_settings(CameraSettings {
+        yaw_snap_deg: 10.0,
+        roll_snap_deg: 17.5,
+        pitch_snap_deg: 30.0,
+        ..CameraSettings::default()
+    });
+    assert_eq!(widget.camera_controls.adjustments(), after_first_snap);
+
+    input.end_frame();
+    input.inject_key(KeyCode::ArrowLeft, true);
+    widget.frame(0.0, &input);
+
+    let after_second_snap = CameraRuntimeAdjustments {
+        yaw_deg: 10.0,
+        ..after_first_snap
+    };
+    assert_eq!(widget.camera_controls.adjustments(), after_second_snap);
+    assert_eq!(widget.camera_settings.yaw_snap_deg, 10.0);
+    assert_eq!(widget.camera_settings.roll_snap_deg, 17.5);
+    assert_eq!(widget.camera_settings.pitch_snap_deg, 30.0);
+}
+
+#[test]
 fn f8_toggles_live_camera_controls_without_touching_base_settings() {
     let mut widget = test_widget();
     let mut input = Input::default();

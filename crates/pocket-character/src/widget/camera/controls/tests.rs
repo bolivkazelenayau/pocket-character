@@ -8,13 +8,28 @@ fn test_widget() -> CameraControls {
     CameraControls::default()
 }
 
+fn configured_snap_steps() -> CameraSnapSteps {
+    CameraSnapSteps {
+        yaw_deg: 5.0,
+        roll_deg: 17.5,
+        pitch_deg: 30.0,
+    }
+}
+
 fn camera_adjustments_after_keys(keys: &[KeyCode]) -> CameraRuntimeAdjustments {
+    camera_adjustments_after_keys_with_steps(keys, DEFAULT_SNAP_STEPS)
+}
+
+fn camera_adjustments_after_keys_with_steps(
+    keys: &[KeyCode],
+    snap_steps: CameraSnapSteps,
+) -> CameraRuntimeAdjustments {
     let mut widget = test_widget();
     let mut input = Input::default();
     for &key in keys {
         input.inject_key(key, true);
     }
-    widget.apply_camera_keyboard_controls(1.0 / 60.0, &input);
+    widget.apply_camera_keyboard_controls_with_steps(1.0 / 60.0, &input, snap_steps);
     widget.camera_adjustments
 }
 
@@ -350,7 +365,7 @@ fn f8_vertical_modifier_precedence_selects_snap_pitch_first() {
         KeyCode::ShiftLeft,
         KeyCode::ArrowUp,
     ]);
-    approx_eq(adjustments.pitch_deg, HORIZONTAL_SNAP_DEG);
+    approx_eq(adjustments.pitch_deg, DEFAULT_SNAP_STEPS.pitch_deg);
     assert_eq!(adjustments.distance_scale_delta, 0.0);
     assert_eq!(adjustments.pan_ndc, Vec2::ZERO);
 }
@@ -392,6 +407,127 @@ fn f8_pitch_snap_exact_grid_values_always_advance_one_detent() {
         approx_eq(snap_pitch_degrees(current, 1), expected_up);
         approx_eq(snap_pitch_degrees(current, -1), expected_down);
     }
+}
+
+#[test]
+fn configured_snap_steps_are_axis_specific() {
+    let steps = configured_snap_steps();
+
+    let yaw = camera_adjustments_after_keys_with_steps(
+        &[KeyCode::AltLeft, KeyCode::ShiftLeft, KeyCode::ArrowLeft],
+        steps,
+    );
+    assert_eq!(yaw.yaw_deg, steps.yaw_deg);
+    assert_eq!(yaw.roll_deg, 0.0);
+    assert_eq!(yaw.pitch_deg, 0.0);
+
+    let roll = camera_adjustments_after_keys_with_steps(
+        &[KeyCode::AltLeft, KeyCode::ControlLeft, KeyCode::ArrowRight],
+        steps,
+    );
+    assert_eq!(roll.yaw_deg, 0.0);
+    assert_eq!(roll.roll_deg, steps.roll_deg);
+    assert_eq!(roll.pitch_deg, 0.0);
+
+    let pitch = camera_adjustments_after_keys_with_steps(
+        &[KeyCode::AltLeft, KeyCode::ControlLeft, KeyCode::ArrowUp],
+        steps,
+    );
+    assert_eq!(pitch.yaw_deg, 0.0);
+    assert_eq!(pitch.roll_deg, 0.0);
+    assert_eq!(pitch.pitch_deg, steps.pitch_deg);
+}
+
+#[test]
+fn changing_one_snap_step_does_not_affect_the_other_axes() {
+    let original = configured_snap_steps();
+    let changed_yaw = CameraSnapSteps {
+        yaw_deg: 11.0,
+        ..original
+    };
+
+    let original_roll = camera_adjustments_after_keys_with_steps(
+        &[KeyCode::AltLeft, KeyCode::ControlLeft, KeyCode::ArrowRight],
+        original,
+    );
+    let changed_roll = camera_adjustments_after_keys_with_steps(
+        &[KeyCode::AltLeft, KeyCode::ControlLeft, KeyCode::ArrowRight],
+        changed_yaw,
+    );
+    assert_eq!(original_roll.roll_deg, original.roll_deg);
+    assert_eq!(changed_roll.roll_deg, original_roll.roll_deg);
+
+    let original_pitch = camera_adjustments_after_keys_with_steps(
+        &[KeyCode::AltLeft, KeyCode::ControlLeft, KeyCode::ArrowUp],
+        original,
+    );
+    let changed_pitch = camera_adjustments_after_keys_with_steps(
+        &[KeyCode::AltLeft, KeyCode::ControlLeft, KeyCode::ArrowUp],
+        changed_yaw,
+    );
+    assert_eq!(original_pitch.pitch_deg, original.pitch_deg);
+    assert_eq!(changed_pitch.pitch_deg, original_pitch.pitch_deg);
+
+    let original_yaw = camera_adjustments_after_keys_with_steps(
+        &[KeyCode::AltLeft, KeyCode::ShiftLeft, KeyCode::ArrowLeft],
+        original,
+    );
+    let changed_yaw_result = camera_adjustments_after_keys_with_steps(
+        &[KeyCode::AltLeft, KeyCode::ShiftLeft, KeyCode::ArrowLeft],
+        changed_yaw,
+    );
+    assert_eq!(original_yaw.yaw_deg, original.yaw_deg);
+    assert_eq!(changed_yaw_result.yaw_deg, changed_yaw.yaw_deg);
+}
+
+#[test]
+fn configured_snap_steps_preserve_off_grid_and_exact_grid_behavior() {
+    let steps = configured_snap_steps();
+
+    assert_eq!(snap_degrees(7.0, 1, steps.yaw_deg), 10.0);
+    assert_eq!(snap_degrees(7.0, -1, steps.yaw_deg), 5.0);
+    assert_eq!(snap_degrees(5.0, 1, steps.yaw_deg), 10.0);
+    assert_eq!(snap_degrees(5.0, -1, steps.yaw_deg), 0.0);
+
+    assert_eq!(snap_degrees(8.0, 1, steps.roll_deg), 17.5);
+    assert_eq!(snap_degrees(17.5, -1, steps.roll_deg), 0.0);
+
+    assert_eq!(snap_pitch_degrees_with_step(7.0, 1, steps.pitch_deg), 30.0);
+    assert_eq!(snap_pitch_degrees_with_step(7.0, -1, steps.pitch_deg), 0.0);
+    assert_eq!(snap_pitch_degrees_with_step(30.0, 1, steps.pitch_deg), 60.0);
+    assert_eq!(snap_pitch_degrees_with_step(30.0, -1, steps.pitch_deg), 0.0);
+}
+
+#[test]
+fn configured_yaw_and_roll_snap_steps_wrap_across_180_degrees() {
+    let step = configured_snap_steps().roll_deg;
+
+    assert_eq!(apply_snap_steps(179.0, 1, 1, step), -167.5);
+    assert_eq!(apply_snap_steps(-179.0, -1, 1, step), 167.5);
+    assert_eq!(apply_snap_steps(0.0, 1, 21, step), 7.5);
+    assert_eq!(apply_snap_steps(0.0, -1, 21, step), -7.5);
+}
+
+#[test]
+fn configured_pitch_snap_step_respects_non_wrapping_bounds() {
+    let step = configured_snap_steps().pitch_deg;
+
+    assert_eq!(apply_pitch_snap_steps(89.0, 1, 1, step), 89.0);
+    assert_eq!(apply_pitch_snap_steps(-89.0, -1, 1, step), -89.0);
+    assert_eq!(apply_pitch_snap_steps(89.0, -1, 1, step), 60.0);
+    assert_eq!(apply_pitch_snap_steps(-89.0, 1, 1, step), -60.0);
+}
+
+#[test]
+fn default_snap_steps_remain_15_degrees() {
+    let steps = DEFAULT_SNAP_STEPS;
+
+    assert_eq!(steps.yaw_deg, 15.0);
+    assert_eq!(steps.roll_deg, 15.0);
+    assert_eq!(steps.pitch_deg, 15.0);
+    assert_eq!(apply_snap_steps(0.0, 1, 1, steps.yaw_deg), 15.0);
+    assert_eq!(apply_snap_steps(0.0, 1, 1, steps.roll_deg), 15.0);
+    assert_eq!(apply_pitch_snap_steps(0.0, 1, 1, steps.pitch_deg), 15.0);
 }
 
 #[test]
@@ -581,7 +717,7 @@ fn f8_snap_pitch_has_no_pan_or_zoom_leakage() {
         KeyCode::ShiftLeft,
         KeyCode::ArrowUp,
     ]);
-    approx_eq(adjustments.pitch_deg, HORIZONTAL_SNAP_DEG);
+    approx_eq(adjustments.pitch_deg, DEFAULT_SNAP_STEPS.pitch_deg);
     assert_eq!(adjustments.distance_scale_delta, 0.0);
     assert_eq!(adjustments.pan_ndc, Vec2::ZERO);
     assert_eq!(adjustments.yaw_deg, 0.0);
@@ -646,14 +782,14 @@ fn f8_disabling_controls_clears_pitch_snap_repeat() {
     let mut controls = CameraControls::default();
     let mut input = Input::default();
     input.inject_key(KeyCode::F8, true);
-    controls.apply_frame(0.0, &input, None, CameraSettings::default(), 1.0);
+    controls.apply_frame(0.0, &input, None, DEFAULT_SNAP_STEPS, 1.0);
 
     input.inject_key(KeyCode::F8, false);
     input.inject_key(KeyCode::AltLeft, true);
     input.inject_key(KeyCode::ControlLeft, true);
     input.inject_key(KeyCode::ArrowUp, true);
     input.end_frame();
-    controls.apply_frame(0.0, &input, None, CameraSettings::default(), 1.0);
+    controls.apply_frame(0.0, &input, None, DEFAULT_SNAP_STEPS, 1.0);
     assert_eq!(
         controls.vertical_snap_repeat.active_mode,
         VerticalSnapMode::Pitch
@@ -661,7 +797,7 @@ fn f8_disabling_controls_clears_pitch_snap_repeat() {
 
     input.end_frame();
     input.inject_key(KeyCode::F8, true);
-    controls.apply_frame(0.0, &input, None, CameraSettings::default(), 1.0);
+    controls.apply_frame(0.0, &input, None, DEFAULT_SNAP_STEPS, 1.0);
     assert!(!controls.camera_controls_enabled());
     assert_eq!(
         controls.vertical_snap_repeat,
@@ -674,14 +810,14 @@ fn f8_reset_clears_pitch_snap_repeat() {
     let mut controls = CameraControls::default();
     let mut input = Input::default();
     input.inject_key(KeyCode::F8, true);
-    controls.apply_frame(0.0, &input, None, CameraSettings::default(), 1.0);
+    controls.apply_frame(0.0, &input, None, DEFAULT_SNAP_STEPS, 1.0);
 
     input.inject_key(KeyCode::F8, false);
     input.inject_key(KeyCode::AltLeft, true);
     input.inject_key(KeyCode::ControlLeft, true);
     input.inject_key(KeyCode::ArrowUp, true);
     input.end_frame();
-    controls.apply_frame(0.0, &input, None, CameraSettings::default(), 1.0);
+    controls.apply_frame(0.0, &input, None, DEFAULT_SNAP_STEPS, 1.0);
     assert_eq!(
         controls.vertical_snap_repeat.active_mode,
         VerticalSnapMode::Pitch
@@ -689,7 +825,7 @@ fn f8_reset_clears_pitch_snap_repeat() {
 
     input.end_frame();
     input.inject_key(KeyCode::KeyR, true);
-    controls.apply_frame(0.0, &input, None, CameraSettings::default(), 1.0);
+    controls.apply_frame(0.0, &input, None, DEFAULT_SNAP_STEPS, 1.0);
     assert_eq!(
         controls.vertical_snap_repeat,
         VerticalSnapRepeatState::default()
@@ -758,12 +894,12 @@ fn f8_horizontal_modifier_precedence_uses_alt_for_snaps() {
         KeyCode::ControlLeft,
         KeyCode::ArrowLeft,
     ]);
-    assert_eq!(alt_and_ctrl_left.roll_deg, -ROLL_SNAP_DEG);
+    assert_eq!(alt_and_ctrl_left.roll_deg, -DEFAULT_SNAP_STEPS.roll_deg);
     assert_eq!(alt_and_ctrl_left.yaw_deg, 0.0);
 
     let alt_and_shift_left =
         camera_adjustments_after_keys(&[KeyCode::AltLeft, KeyCode::ShiftLeft, KeyCode::ArrowLeft]);
-    assert_eq!(alt_and_shift_left.yaw_deg, ROLL_SNAP_DEG);
+    assert_eq!(alt_and_shift_left.yaw_deg, DEFAULT_SNAP_STEPS.yaw_deg);
     assert_eq!(alt_and_shift_left.roll_deg, 0.0);
 }
 
@@ -830,7 +966,7 @@ fn f8_alt_shift_selects_yaw_snap_without_horizontal_leakage() {
 
     let visual_right =
         camera_adjustments_after_keys(&[KeyCode::AltLeft, KeyCode::ShiftLeft, KeyCode::ArrowRight]);
-    approx_eq(visual_right.yaw_deg, -YAW_SNAP_DEG);
+    approx_eq(visual_right.yaw_deg, -DEFAULT_SNAP_STEPS.yaw_deg);
     assert_eq!(visual_right.roll_deg, 0.0);
     assert_eq!(visual_right.pitch_deg, 0.0);
     assert_eq!(visual_right.distance_scale_delta, 0.0);
@@ -838,7 +974,7 @@ fn f8_alt_shift_selects_yaw_snap_without_horizontal_leakage() {
 
     let visual_left =
         camera_adjustments_after_keys(&[KeyCode::AltLeft, KeyCode::ShiftLeft, KeyCode::ArrowLeft]);
-    approx_eq(visual_left.yaw_deg, YAW_SNAP_DEG);
+    approx_eq(visual_left.yaw_deg, DEFAULT_SNAP_STEPS.yaw_deg);
     assert_eq!(visual_left.roll_deg, 0.0);
     assert_eq!(visual_left.pitch_deg, 0.0);
     assert_eq!(visual_left.distance_scale_delta, 0.0);
@@ -1038,7 +1174,7 @@ fn f8_alt_ctrl_roll_snap_takes_precedence_over_alt_shift() {
         KeyCode::ControlLeft,
         KeyCode::ArrowRight,
     ]);
-    approx_eq(adjustments.roll_deg, ROLL_SNAP_DEG);
+    approx_eq(adjustments.roll_deg, DEFAULT_SNAP_STEPS.roll_deg);
     assert_eq!(adjustments.yaw_deg, 0.0);
     assert_eq!(adjustments.pan_ndc, Vec2::ZERO);
 }
@@ -1093,7 +1229,7 @@ fn f8_disabling_controls_clears_yaw_snap_repeat() {
     let mut controls = CameraControls::default();
     let mut input = Input::default();
     input.inject_key(KeyCode::F8, true);
-    controls.apply_frame(0.0, &input, None, CameraSettings::default(), 1.0);
+    controls.apply_frame(0.0, &input, None, DEFAULT_SNAP_STEPS, 1.0);
     assert!(controls.camera_controls_enabled());
 
     input.inject_key(KeyCode::F8, false);
@@ -1101,7 +1237,7 @@ fn f8_disabling_controls_clears_yaw_snap_repeat() {
     input.inject_key(KeyCode::ShiftLeft, true);
     input.inject_key(KeyCode::ArrowRight, true);
     input.end_frame();
-    controls.apply_frame(0.0, &input, None, CameraSettings::default(), 1.0);
+    controls.apply_frame(0.0, &input, None, DEFAULT_SNAP_STEPS, 1.0);
     assert_eq!(
         controls.horizontal_snap_repeat.active_mode,
         HorizontalSnapMode::Yaw
@@ -1109,7 +1245,7 @@ fn f8_disabling_controls_clears_yaw_snap_repeat() {
 
     input.end_frame();
     input.inject_key(KeyCode::F8, true);
-    controls.apply_frame(0.0, &input, None, CameraSettings::default(), 1.0);
+    controls.apply_frame(0.0, &input, None, DEFAULT_SNAP_STEPS, 1.0);
     assert!(!controls.camera_controls_enabled());
     assert_eq!(
         controls.horizontal_snap_repeat,
@@ -1122,14 +1258,14 @@ fn f8_reset_clears_yaw_snap_repeat() {
     let mut controls = CameraControls::default();
     let mut input = Input::default();
     input.inject_key(KeyCode::F8, true);
-    controls.apply_frame(0.0, &input, None, CameraSettings::default(), 1.0);
+    controls.apply_frame(0.0, &input, None, DEFAULT_SNAP_STEPS, 1.0);
 
     input.inject_key(KeyCode::F8, false);
     input.inject_key(KeyCode::AltLeft, true);
     input.inject_key(KeyCode::ShiftLeft, true);
     input.inject_key(KeyCode::ArrowRight, true);
     input.end_frame();
-    controls.apply_frame(0.0, &input, None, CameraSettings::default(), 1.0);
+    controls.apply_frame(0.0, &input, None, DEFAULT_SNAP_STEPS, 1.0);
     assert_eq!(
         controls.horizontal_snap_repeat.active_mode,
         HorizontalSnapMode::Yaw
@@ -1137,7 +1273,7 @@ fn f8_reset_clears_yaw_snap_repeat() {
 
     input.end_frame();
     input.inject_key(KeyCode::KeyR, true);
-    controls.apply_frame(0.0, &input, None, CameraSettings::default(), 1.0);
+    controls.apply_frame(0.0, &input, None, DEFAULT_SNAP_STEPS, 1.0);
     assert_eq!(
         controls.horizontal_snap_repeat,
         HorizontalSnapRepeatState::default()

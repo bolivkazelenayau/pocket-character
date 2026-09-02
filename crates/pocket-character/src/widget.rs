@@ -34,9 +34,10 @@ mod diagnostics;
 use aa::AaRuntime;
 #[cfg(test)]
 use camera::CameraRuntimeAdjustments;
-use camera::controls::CameraControls;
+use camera::controls::{CameraControls, CameraSnapSteps};
 use camera::{
-    DEFAULT_VIEWPORT_ASPECT, EffectiveCameraValues, resolve_camera_parameters_with_aspect,
+    CameraPanContext, DEFAULT_VIEWPORT_ASPECT, EffectiveCameraValues,
+    resolve_camera_parameters_with_aspect,
 };
 use diagnostics::{FrameStats, RenderFps};
 
@@ -216,7 +217,16 @@ impl Widget {
 
     fn effective_camera_values(&self) -> EffectiveCameraValues {
         self.camera_controls
-            .effective_camera_values(self.camera_settings)
+            .adjustments()
+            .effective(self.camera_settings)
+    }
+
+    fn camera_snap_steps(&self) -> CameraSnapSteps {
+        CameraSnapSteps {
+            yaw_deg: self.camera_settings.yaw_snap_deg,
+            roll_deg: self.camera_settings.roll_snap_deg,
+            pitch_deg: self.camera_settings.pitch_snap_deg,
+        }
     }
 
     fn update_viewport(&mut self, size: (u32, u32)) {
@@ -393,11 +403,15 @@ impl Game for Widget {
             self.aa.request_smaa_toggle();
         }
         // Temporary F8 validation controls are never written to AppSettings.
+        let pan_context = self
+            .model
+            .as_ref()
+            .map(|model| CameraPanContext::new(model.aabb, self.camera_settings));
         let camera_changed = self.camera_controls.apply_frame(
             dt,
             input,
-            self.model.as_ref().map(|model| model.aabb),
-            self.camera_settings,
+            pan_context,
+            self.camera_snap_steps(),
             self.camera_viewport_aspect(),
         );
         if camera_changed {

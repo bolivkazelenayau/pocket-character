@@ -1,10 +1,8 @@
-use glam::{Vec2, Vec3};
+use glam::Vec2;
 use pocket3d::input::Input;
 use pocket3d::winit::keyboard::KeyCode;
 
-use crate::settings::CameraSettings;
-
-use super::{CameraRuntimeAdjustments, EffectiveCameraValues, admit_pan_input, finite_value};
+use super::{CameraPanContext, CameraRuntimeAdjustments, finite_value};
 
 const CAMERA_FOV_RATE_DEG_PER_SEC: f32 = 45.0;
 const CAMERA_DISTANCE_RATE_PER_SEC: f32 = 0.75;
@@ -14,10 +12,6 @@ const CAMERA_DISTANCE_RATE_PER_SEC: f32 = 0.75;
 const CAMERA_PAN_WITNESS_NDC_RATE_PER_SEC: f32 = 0.75;
 const CAMERA_YAW_RATE_DEG_PER_SEC: f32 = 90.0;
 const CAMERA_ROLL_RATE_DEG_PER_SEC: f32 = 90.0;
-const HORIZONTAL_SNAP_DEG: f32 = 15.0;
-const ROLL_SNAP_DEG: f32 = HORIZONTAL_SNAP_DEG;
-const YAW_SNAP_DEG: f32 = HORIZONTAL_SNAP_DEG;
-const PITCH_SNAP_DEG: f32 = HORIZONTAL_SNAP_DEG;
 const SNAP_REPEAT_DELAY_SEC: f32 = 0.30;
 const SNAP_REPEAT_INTERVAL_SEC: f32 = 0.10;
 #[cfg(test)]
@@ -108,6 +102,20 @@ fn horizontal_camera_action(input: &Input) -> HorizontalCameraAction {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(in crate::widget) struct CameraSnapSteps {
+    pub(in crate::widget) yaw_deg: f32,
+    pub(in crate::widget) roll_deg: f32,
+    pub(in crate::widget) pitch_deg: f32,
+}
+
+#[cfg(test)]
+const DEFAULT_SNAP_STEPS: CameraSnapSteps = CameraSnapSteps {
+    yaw_deg: 15.0,
+    roll_deg: 15.0,
+    pitch_deg: 15.0,
+};
+
 fn snap_degrees(current_deg: f32, direction: i8, snap_deg: f32) -> f32 {
     let current_deg = super::normalize_degrees(current_deg);
     let snapped = match direction.cmp(&0) {
@@ -120,12 +128,12 @@ fn snap_degrees(current_deg: f32, direction: i8, snap_deg: f32) -> f32 {
 
 #[cfg(test)]
 fn snap_roll_degrees(current_deg: f32, direction: i8) -> f32 {
-    snap_degrees(current_deg, direction, ROLL_SNAP_DEG)
+    snap_degrees(current_deg, direction, DEFAULT_SNAP_STEPS.roll_deg)
 }
 
 #[cfg(test)]
 fn snap_yaw_degrees(current_deg: f32, direction: i8) -> f32 {
-    snap_degrees(current_deg, direction, YAW_SNAP_DEG)
+    snap_degrees(current_deg, direction, DEFAULT_SNAP_STEPS.yaw_deg)
 }
 
 fn apply_snap_steps(current_deg: f32, direction: i8, steps: u32, snap_deg: f32) -> f32 {
@@ -134,17 +142,8 @@ fn apply_snap_steps(current_deg: f32, direction: i8, steps: u32, snap_deg: f32) 
     }
 
     let first_step = snap_degrees(current_deg, direction, snap_deg);
-    let steps_per_turn = (360.0 / snap_deg).round() as u32;
-    let additional_steps = (steps - 1) % steps_per_turn;
-    super::normalize_degrees(first_step + direction as f32 * additional_steps as f32 * snap_deg)
-}
-
-fn apply_roll_snap_steps(current_deg: f32, direction: i8, steps: u32) -> f32 {
-    apply_snap_steps(current_deg, direction, steps, ROLL_SNAP_DEG)
-}
-
-fn apply_yaw_snap_steps(current_deg: f32, direction: i8, steps: u32) -> f32 {
-    apply_snap_steps(current_deg, direction, steps, YAW_SNAP_DEG)
+    let additional_steps = steps.saturating_sub(1) as f32;
+    super::normalize_degrees(first_step + direction as f32 * additional_steps * snap_deg)
 }
 
 fn sanitize_pitch_degrees(pitch_deg: f32) -> f32 {
@@ -156,24 +155,29 @@ fn sanitize_pitch_degrees(pitch_deg: f32) -> f32 {
     .pitch_deg
 }
 
-fn snap_pitch_degrees(current_deg: f32, direction: i8) -> f32 {
+fn snap_pitch_degrees_with_step(current_deg: f32, direction: i8, snap_deg: f32) -> f32 {
     let current_deg = sanitize_pitch_degrees(current_deg);
     let snapped = match direction.cmp(&0) {
-        std::cmp::Ordering::Greater => (current_deg / PITCH_SNAP_DEG).floor() + 1.0,
-        std::cmp::Ordering::Less => (current_deg / PITCH_SNAP_DEG).ceil() - 1.0,
+        std::cmp::Ordering::Greater => (current_deg / snap_deg).floor() + 1.0,
+        std::cmp::Ordering::Less => (current_deg / snap_deg).ceil() - 1.0,
         std::cmp::Ordering::Equal => return current_deg,
-    } * PITCH_SNAP_DEG;
+    } * snap_deg;
     sanitize_pitch_degrees(snapped)
 }
 
-fn apply_pitch_snap_steps(current_deg: f32, direction: i8, steps: u32) -> f32 {
+#[cfg(test)]
+fn snap_pitch_degrees(current_deg: f32, direction: i8) -> f32 {
+    snap_pitch_degrees_with_step(current_deg, direction, DEFAULT_SNAP_STEPS.pitch_deg)
+}
+
+fn apply_pitch_snap_steps(current_deg: f32, direction: i8, steps: u32, snap_deg: f32) -> f32 {
     if steps == 0 {
         return sanitize_pitch_degrees(current_deg);
     }
 
-    let first_step = snap_pitch_degrees(current_deg, direction);
+    let first_step = snap_pitch_degrees_with_step(current_deg, direction, snap_deg);
     let additional_steps = steps.saturating_sub(1) as f32;
-    sanitize_pitch_degrees(first_step + direction as f32 * additional_steps * PITCH_SNAP_DEG)
+    sanitize_pitch_degrees(first_step + direction as f32 * additional_steps * snap_deg)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -335,13 +339,6 @@ impl CameraControls {
         self.camera_adjustments
     }
 
-    pub(crate) fn effective_camera_values(
-        &self,
-        camera_settings: CameraSettings,
-    ) -> EffectiveCameraValues {
-        self.camera_adjustments.effective(camera_settings)
-    }
-
     pub(crate) fn camera_controls_enabled(&self) -> bool {
         self.camera_controls_enabled
     }
@@ -361,8 +358,8 @@ impl CameraControls {
         &mut self,
         dt: f32,
         input: &Input,
-        aabb: Option<(Vec3, Vec3)>,
-        camera_settings: CameraSettings,
+        pan_context: Option<CameraPanContext>,
+        snap_steps: CameraSnapSteps,
         viewport_aspect: f32,
     ) -> bool {
         if input.key_pressed(KeyCode::F8) {
@@ -377,7 +374,7 @@ impl CameraControls {
             self.reset_adjustments();
             true
         } else if self.camera_controls_enabled {
-            self.apply_keyboard_controls(dt, input, aabb, camera_settings, viewport_aspect)
+            self.apply_keyboard_controls(dt, input, pan_context, snap_steps, viewport_aspect)
         } else {
             false
         }
@@ -387,23 +384,23 @@ impl CameraControls {
         &mut self,
         dt: f32,
         input: &Input,
-        aabb: Option<(Vec3, Vec3)>,
-        camera_settings: CameraSettings,
+        pan_context: Option<CameraPanContext>,
+        snap_steps: CameraSnapSteps,
         viewport_aspect: f32,
     ) -> bool {
         let repeat_dt = finite_value(dt, 0.0).max(0.0);
         let dt = super::finite_clamped(dt, 0.0, 0.25, 0.0);
         let horizontal_action = horizontal_camera_action(input);
-        let (snap_direction, snap_steps) = requested_horizontal_snap_steps(
+        let (snap_direction, snap_step_count) = requested_horizontal_snap_steps(
             &mut self.horizontal_snap_repeat,
             input,
             horizontal_action,
             repeat_dt,
         );
         let action = vertical_camera_action(input);
-        let (pitch_snap_direction, pitch_snap_steps) =
+        let (pitch_snap_direction, pitch_snap_step_count) =
             requested_vertical_snap_steps(&mut self.vertical_snap_repeat, input, action, repeat_dt);
-        if dt == 0.0 && snap_steps == 0 && pitch_snap_steps == 0 {
+        if dt == 0.0 && snap_step_count == 0 && pitch_snap_step_count == 0 {
             return false;
         }
 
@@ -418,12 +415,20 @@ impl CameraControls {
         adjustments.fov_delta_deg += fov_axis(input) * CAMERA_FOV_RATE_DEG_PER_SEC * dt;
         match horizontal_action {
             HorizontalCameraAction::SnapRoll => {
-                adjustments.roll_deg =
-                    apply_roll_snap_steps(adjustments.roll_deg, snap_direction, snap_steps);
+                adjustments.roll_deg = apply_snap_steps(
+                    adjustments.roll_deg,
+                    snap_direction,
+                    snap_step_count,
+                    snap_steps.roll_deg,
+                );
             }
             HorizontalCameraAction::SnapYaw => {
-                adjustments.yaw_deg =
-                    apply_yaw_snap_steps(adjustments.yaw_deg, snap_direction, snap_steps);
+                adjustments.yaw_deg = apply_snap_steps(
+                    adjustments.yaw_deg,
+                    snap_direction,
+                    snap_step_count,
+                    snap_steps.yaw_deg,
+                );
             }
             HorizontalCameraAction::Yaw => {
                 adjustments.yaw_deg += axis(input, KeyCode::ArrowLeft, KeyCode::ArrowRight)
@@ -458,20 +463,16 @@ impl CameraControls {
                 adjustments.pitch_deg = apply_pitch_snap_steps(
                     adjustments.pitch_deg,
                     pitch_snap_direction,
-                    pitch_snap_steps,
+                    pitch_snap_step_count,
+                    snap_steps.pitch_deg,
                 );
             }
         }
 
         if requested_pan != Vec2::ZERO {
-            if let Some(aabb) = aabb {
-                adjustments.pan_ndc = admit_pan_input(
-                    aabb,
-                    camera_settings,
-                    adjustments,
-                    viewport_aspect,
-                    requested_pan,
-                );
+            if let Some(pan_context) = pan_context {
+                adjustments.pan_ndc =
+                    pan_context.admit(adjustments, viewport_aspect, requested_pan);
             }
         }
 
@@ -495,13 +496,16 @@ impl CameraControls {
     }
 
     fn apply_camera_keyboard_controls(&mut self, dt: f32, input: &Input) {
-        self.apply_keyboard_controls(
-            dt,
-            input,
-            None,
-            CameraSettings::default(),
-            super::DEFAULT_VIEWPORT_ASPECT,
-        );
+        self.apply_camera_keyboard_controls_with_steps(dt, input, DEFAULT_SNAP_STEPS);
+    }
+
+    fn apply_camera_keyboard_controls_with_steps(
+        &mut self,
+        dt: f32,
+        input: &Input,
+        snap_steps: CameraSnapSteps,
+    ) {
+        self.apply_keyboard_controls(dt, input, None, snap_steps, super::DEFAULT_VIEWPORT_ASPECT);
     }
 }
 

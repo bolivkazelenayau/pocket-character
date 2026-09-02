@@ -33,6 +33,38 @@ pub(super) struct CameraFrame {
     view_height: f32,
 }
 
+/// Camera inputs needed for admitting new pan movement. The persisted camera
+/// settings remain encapsulated in the camera module rather than in controls.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct CameraPanContext {
+    aabb: (Vec3, Vec3),
+    base_settings: CameraSettings,
+}
+
+impl CameraPanContext {
+    pub(super) fn new(aabb: (Vec3, Vec3), base_settings: CameraSettings) -> Self {
+        Self {
+            aabb,
+            base_settings,
+        }
+    }
+
+    pub(super) fn admit(
+        self,
+        adjustments: CameraRuntimeAdjustments,
+        viewport_aspect: f32,
+        desired_witness_delta_ndc: Vec2,
+    ) -> Vec2 {
+        admit_pan_input(
+            self.aabb,
+            self.base_settings,
+            adjustments,
+            viewport_aspect,
+            desired_witness_delta_ndc,
+        )
+    }
+}
+
 /// Runtime-only camera deltas used by the temporary F8 validation controls.
 ///
 /// These deliberately live outside [`CameraSettings`]. Persisted settings
