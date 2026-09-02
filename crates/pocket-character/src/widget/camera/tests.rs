@@ -1,4 +1,7 @@
+use super::controls::{CameraControls, CameraSnapSteps};
 use super::*;
+use pocket3d::input::Input;
+use pocket3d::winit::keyboard::KeyCode;
 
 fn approx_eq(actual: f32, expected: f32) {
     assert!((actual - expected).abs() < 1.0e-5, "{actual} != {expected}");
@@ -441,6 +444,37 @@ fn projected_rest_center(parameters: CameraParameters, aabb: (Vec3, Vec3), aspec
     projected_point(parameters, rest_bounds_center(aabb), aspect).truncate()
 }
 
+fn projected_rest_bounds_y(
+    parameters: CameraParameters,
+    aabb: (Vec3, Vec3),
+    aspect: f32,
+) -> (f32, f32) {
+    projected_rest_bounds_axis(parameters, aabb, aspect, 1)
+}
+
+fn projected_rest_bounds_x(
+    parameters: CameraParameters,
+    aabb: (Vec3, Vec3),
+    aspect: f32,
+) -> (f32, f32) {
+    projected_rest_bounds_axis(parameters, aabb, aspect, 0)
+}
+
+fn projected_rest_bounds_axis(
+    parameters: CameraParameters,
+    aabb: (Vec3, Vec3),
+    aspect: f32,
+    axis: usize,
+) -> (f32, f32) {
+    rest_bounds_corners(sanitize_model_aabb(aabb))
+        .into_iter()
+        .map(|corner| projected_point(parameters, corner, aspect)[axis])
+        .fold(
+            (f32::INFINITY, f32::NEG_INFINITY),
+            |(min_value, max_value), value| (min_value.min(value), max_value.max(value)),
+        )
+}
+
 fn projected_baseline_delta(
     zero_pan: CameraParameters,
     panned: CameraParameters,
@@ -520,7 +554,57 @@ fn resolver_preserves_stored_pan_and_exact_target_projection() {
 }
 
 #[test]
-fn baseline_inside_region_has_configured_rest_center_stoppers() {
+fn plain_vertical_pan_moves_resolved_camera_along_requested_screen_axis() {
+    fn resolved_after(key: KeyCode) -> CameraParameters {
+        let aabb = standard_pan_aabb();
+        let settings = in_range_pan_test_settings();
+        let aspect = DEFAULT_VIEWPORT_ASPECT;
+        let snap_steps = CameraSnapSteps {
+            yaw_deg: settings.yaw_snap_deg,
+            roll_deg: settings.roll_snap_deg,
+            pitch_deg: settings.pitch_snap_deg,
+        };
+        let context = CameraPanContext::new(aabb, settings);
+        let mut controls = CameraControls::default();
+
+        let mut toggle = Input::default();
+        toggle.inject_key(KeyCode::F8, true);
+        controls.apply_frame(0.0, &toggle, Some(context), snap_steps, aspect);
+
+        let mut input = Input::default();
+        input.inject_key(key, true);
+        controls.apply_frame(1.0 / 60.0, &input, Some(context), snap_steps, aspect);
+
+        resolve_camera_parameters_with_aspect(aabb, settings, controls.adjustments(), aspect)
+    }
+
+    let aabb = standard_pan_aabb();
+    let settings = in_range_pan_test_settings();
+    let aspect = DEFAULT_VIEWPORT_ASPECT;
+    let baseline = resolve_camera_parameters_with_aspect(
+        aabb,
+        settings,
+        CameraRuntimeAdjustments::default(),
+        aspect,
+    );
+    let screen_up = camera_for_parameters(baseline).screen_up();
+    let up = resolved_after(KeyCode::ArrowUp);
+    let down = resolved_after(KeyCode::ArrowDown);
+    let up_delta = up.position - baseline.position;
+    let down_delta = down.position - baseline.position;
+
+    assert!(
+        up_delta.dot(screen_up) > 0.0,
+        "ArrowUp camera delta {up_delta:?} did not move along screen-up {screen_up:?}"
+    );
+    assert!(
+        down_delta.dot(screen_up) < 0.0,
+        "ArrowDown camera delta {down_delta:?} did not move along screen-down {screen_up:?}"
+    );
+}
+
+#[test]
+fn baseline_inside_region_has_projected_bounds_stoppers() {
     let aabb = standard_pan_aabb();
     let settings = in_range_pan_test_settings();
     let aspect = 1.2;
@@ -530,31 +614,44 @@ fn baseline_inside_region_has_configured_rest_center_stoppers() {
         CameraRuntimeAdjustments::default(),
         aspect,
     );
-    let baseline = projected_rest_center(zero, aabb, aspect);
-    let safe_limits = pan_witness_safe_limits(baseline);
-    assert!(baseline.abs().cmplt(Vec2::ONE).all(), "{baseline:?}");
-    approx_eq(safe_limits.y, PAN_WITNESS_SAFE_Y_NDC);
+    let intervals = pan_intervals(aabb, settings, CameraRuntimeAdjustments::default(), aspect);
+    assert!(intervals.iter().all(|interval| interval.is_valid()));
+    assert!(
+        intervals
+            .iter()
+            .all(|interval| interval.min < 0.0 && interval.max > 0.0)
+    );
 
-    for (request, expected) in [
-        (Vec2::new(10.0, 0.0), Vec2::new(safe_limits.x, baseline.y)),
-        (Vec2::new(-10.0, 0.0), Vec2::new(-safe_limits.x, baseline.y)),
-        (Vec2::new(0.0, 10.0), Vec2::new(baseline.x, safe_limits.y)),
-        (Vec2::new(0.0, -10.0), Vec2::new(baseline.x, -safe_limits.y)),
-    ] {
-        let admitted = adjustments_after_pan_input(
-            aabb,
-            settings,
-            CameraRuntimeAdjustments::default(),
-            aspect,
-            request,
-        );
-        let final_camera = resolve_camera_parameters_with_aspect(aabb, settings, admitted, aspect);
-        approx_vec2(projected_rest_center(final_camera, aabb, aspect), expected);
+    for axis in 0..2 {
+        let zero_bounds = projected_rest_bounds_axis(zero, aabb, aspect, axis);
+        let required = required_visible_overlap(zero_bounds.1 - zero_bounds.0);
+        for direction in [-1.0, 1.0] {
+            let mut request = Vec2::ZERO;
+            request[axis] = direction * 10.0;
+            let admitted = adjustments_after_pan_input(
+                aabb,
+                settings,
+                CameraRuntimeAdjustments::default(),
+                aspect,
+                request,
+            );
+            let expected = if direction < 0.0 {
+                intervals[axis].min
+            } else {
+                intervals[axis].max
+            };
+            approx_eq(admitted.pan_ndc[axis], expected);
+            let final_camera =
+                resolve_camera_parameters_with_aspect(aabb, settings, admitted, aspect);
+            let final_bounds = projected_rest_bounds_axis(final_camera, aabb, aspect, axis);
+            let visible = (final_bounds.1.min(1.0) - final_bounds.0.max(-1.0)).max(0.0);
+            assert!(visible >= required.min(final_bounds.1 - final_bounds.0) - 1.0e-4);
+        }
     }
 }
 
 #[test]
-fn widened_vertical_envelope_allows_default_baseline_to_move_toward_top() {
+fn default_baseline_vertical_bounds_allow_inward_motion() {
     let aabb = standard_pan_aabb();
     let settings = CameraSettings::default();
     let aspect = DEFAULT_VIEWPORT_ASPECT;
@@ -566,7 +663,6 @@ fn widened_vertical_envelope_allows_default_baseline_to_move_toward_top() {
     );
     let baseline = projected_rest_center(baseline_camera, aabb, aspect);
     assert!(baseline.y < -1.0, "{baseline:?}");
-    assert!(baseline.y - 0.25 > -PAN_WITNESS_SAFE_Y_NDC);
 
     let admitted = adjustments_after_pan_input(
         aabb,
@@ -583,8 +679,232 @@ fn widened_vertical_envelope_allows_default_baseline_to_move_toward_top() {
     );
 }
 
+fn visible_vertical_overlap((min_y, max_y): (f32, f32)) -> f32 {
+    (max_y.min(1.0) - min_y.max(-1.0)).max(0.0)
+}
+
+fn existing_hybrid_visible_overlap(projected_extent: f32) -> f32 {
+    projected_extent.min(
+        (projected_extent * PAN_VISIBLE_FRACTION)
+            .clamp(PAN_MIN_VISIBLE_OVERLAP_NDC, PAN_MAX_VISIBLE_OVERLAP_NDC),
+    )
+}
+
+fn vertical_interval(
+    aabb: (Vec3, Vec3),
+    settings: CameraSettings,
+    adjustments: CameraRuntimeAdjustments,
+    aspect: f32,
+) -> PanInterval {
+    pan_intervals(aabb, settings, adjustments, aspect)[1]
+}
+
+fn horizontal_interval(
+    aabb: (Vec3, Vec3),
+    settings: CameraSettings,
+    adjustments: CameraRuntimeAdjustments,
+    aspect: f32,
+) -> PanInterval {
+    pan_intervals(aabb, settings, adjustments, aspect)[0]
+}
+
+fn pan_intervals(
+    aabb: (Vec3, Vec3),
+    settings: CameraSettings,
+    adjustments: CameraRuntimeAdjustments,
+    aspect: f32,
+) -> [PanInterval; 2] {
+    resolve_pan_witness_projection(aabb, settings, adjustments, aspect)
+        .unwrap()
+        .pan_intervals
+}
+
+fn legacy_vertical_interval(
+    aabb: (Vec3, Vec3),
+    settings: CameraSettings,
+    adjustments: CameraRuntimeAdjustments,
+    aspect: f32,
+) -> PanInterval {
+    let orientation = resolve_camera_orientation(aabb, settings, adjustments.sanitized());
+    let corners = rest_bounds_corners(sanitize_model_aabb(aabb));
+    let view_proj = orientation.camera.view_proj(valid_viewport_aspect(aspect));
+    let forward = orientation.camera.forward();
+    let mut projected_y = [0.0; 8];
+    let mut responses = [0.0; 8];
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+
+    for (index, corner) in corners.iter().enumerate() {
+        let depth = (*corner - orientation.camera.pos).dot(forward);
+        projected_y[index] = view_proj.project_point3(*corner).y;
+        responses[index] = orientation.distance / depth;
+        min_y = min_y.min(projected_y[index]);
+        max_y = max_y.max(projected_y[index]);
+    }
+
+    let required_overlap = existing_hybrid_visible_overlap(max_y - min_y);
+    let viewport_min = -1.0 + required_overlap;
+    let viewport_max = 1.0 - required_overlap;
+    let mut min_pan = f32::INFINITY;
+    let mut max_pan = f32::NEG_INFINITY;
+
+    for index in 0..corners.len() {
+        min_pan = min_pan.min((viewport_min - projected_y[index]) / responses[index]);
+        max_pan = max_pan.max((viewport_max - projected_y[index]) / responses[index]);
+    }
+
+    PanInterval {
+        min: min_pan,
+        max: max_pan,
+    }
+}
+
 #[test]
-fn portrait_zero_roll_keeps_nominal_horizontal_stopper() {
+fn close_zoom_expands_vertical_outward_travel_from_projected_bounds() {
+    let aabb = standard_pan_aabb();
+    let settings = CameraSettings::default();
+    let aspect = DEFAULT_VIEWPORT_ASPECT;
+    let baseline_interval =
+        vertical_interval(aabb, settings, CameraRuntimeAdjustments::default(), aspect);
+    let close_pose = CameraRuntimeAdjustments {
+        distance_scale_delta: 0.279 - settings.distance_scale,
+        ..Default::default()
+    };
+    let close_interval = vertical_interval(aabb, settings, close_pose, aspect);
+
+    assert!(baseline_interval.is_valid());
+    assert!(close_interval.is_valid());
+    let baseline_outward_down = -baseline_interval.min;
+    let close_outward_down = -close_interval.min;
+    assert!(baseline_outward_down.is_finite() && close_outward_down.is_finite());
+    assert!(close_outward_down > 0.5, "{close_interval:?}");
+    assert!(
+        close_outward_down >= baseline_outward_down,
+        "baseline={baseline_interval:?}, close={close_interval:?}"
+    );
+
+    let admitted =
+        adjustments_after_pan_input(aabb, settings, close_pose, aspect, Vec2::new(0.0, -10.0));
+    assert_eq!(admitted.pan_ndc.y, close_interval.min);
+    let stopped = resolve_camera_parameters_with_aspect(aabb, settings, admitted, aspect);
+    assert!(
+        visible_vertical_overlap(projected_rest_bounds_y(stopped, aabb, aspect))
+            >= PAN_MIN_VISIBLE_OVERLAP_NDC - 1.0e-4
+    );
+}
+
+#[test]
+fn runtime_fov_changes_vertical_envelope_consistently() {
+    let aabb = standard_pan_aabb();
+    let settings = CameraSettings::default();
+    let aspect = DEFAULT_VIEWPORT_ASPECT;
+    let baseline = vertical_interval(aabb, settings, CameraRuntimeAdjustments::default(), aspect);
+    let narrow = vertical_interval(
+        aabb,
+        settings,
+        CameraRuntimeAdjustments {
+            fov_delta_deg: -10.0,
+            ..Default::default()
+        },
+        aspect,
+    );
+    let wide = vertical_interval(
+        aabb,
+        settings,
+        CameraRuntimeAdjustments {
+            fov_delta_deg: 20.0,
+            ..Default::default()
+        },
+        aspect,
+    );
+
+    assert!(narrow.is_valid() && baseline.is_valid() && wide.is_valid());
+    assert!(-narrow.min >= -baseline.min);
+    assert!(-baseline.min >= -wide.min);
+    assert_ne!(narrow, wide);
+}
+
+#[test]
+fn orientation_changes_keep_vertical_limits_finite_and_ordered() {
+    let aabb = standard_pan_aabb();
+    let settings = CameraSettings::default();
+    let aspect = 0.83;
+
+    for yaw_deg in [-179.0, -73.0, 0.0, 91.0, 179.0] {
+        for pitch_deg in [-80.0, -35.0, 0.0, 35.0, 80.0] {
+            for roll_deg in [-179.0, -47.0, 0.0, 89.0, 179.0] {
+                let adjustments = CameraRuntimeAdjustments {
+                    yaw_deg,
+                    pitch_deg,
+                    roll_deg,
+                    ..Default::default()
+                };
+                if let Some(projection) =
+                    resolve_pan_witness_projection(aabb, settings, adjustments, aspect)
+                {
+                    assert!(
+                        projection
+                            .pan_intervals
+                            .iter()
+                            .all(|interval| interval.is_valid())
+                    );
+                }
+                let admitted =
+                    admit_pan_input(aabb, settings, adjustments, aspect, Vec2::new(0.0, 10.0));
+                assert!(admitted.is_finite(), "{adjustments:?} -> {admitted:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn vertical_stoppers_keep_a_minimum_projected_rest_bounds_visible() {
+    let aabb = standard_pan_aabb();
+    let settings = CameraSettings::default();
+    let aspect = DEFAULT_VIEWPORT_ASPECT;
+    let poses = [
+        CameraRuntimeAdjustments::default(),
+        CameraRuntimeAdjustments {
+            distance_scale_delta: 0.279 - settings.distance_scale,
+            yaw_deg: 47.0,
+            pitch_deg: -12.0,
+            roll_deg: 31.0,
+            ..Default::default()
+        },
+    ];
+
+    for pose in poses {
+        let Some(projection) = resolve_pan_witness_projection(aabb, settings, pose, aspect) else {
+            continue;
+        };
+        let zero_camera = resolve_camera_parameters_with_aspect(aabb, settings, pose, aspect);
+        let zero_bounds = projected_rest_bounds_y(zero_camera, aabb, aspect);
+        let required_overlap = required_visible_overlap(zero_bounds.1 - zero_bounds.0);
+        for desired_y in [-10.0, 10.0] {
+            let admitted = adjustments_after_pan_input(
+                aabb,
+                settings,
+                pose,
+                aspect,
+                Vec2::new(0.0, desired_y),
+            );
+            let final_camera =
+                resolve_camera_parameters_with_aspect(aabb, settings, admitted, aspect);
+            let final_bounds = projected_rest_bounds_y(final_camera, aabb, aspect);
+            let final_projected_extent = final_bounds.1 - final_bounds.0;
+            let guaranteed_overlap = required_overlap.min(final_projected_extent);
+            assert!(
+                visible_vertical_overlap(final_bounds) >= guaranteed_overlap - 1.0e-4,
+                "pose={pose:?}, desired={desired_y}, interval={:?}, pan={:?}",
+                projection.pan_intervals[1],
+                admitted.pan_ndc
+            );
+        }
+    }
+}
+
+#[test]
+fn portrait_zero_roll_horizontal_stopper_preserves_projected_overlap() {
     let aabb = standard_pan_aabb();
     let settings = CameraSettings::default();
     let aspect = 540.0 / 960.0;
@@ -594,68 +914,125 @@ fn portrait_zero_roll_keeps_nominal_horizontal_stopper() {
         CameraRuntimeAdjustments::default(),
         aspect,
     );
-    let baseline = projected_rest_center(zero, aabb, aspect);
-    let safe_limits = pan_witness_safe_limits(baseline);
-    approx_eq(safe_limits.x, PAN_WITNESS_SAFE_X_NDC);
+    let interval = horizontal_interval(aabb, settings, CameraRuntimeAdjustments::default(), aspect);
+    let zero_bounds = projected_rest_bounds_x(zero, aabb, aspect);
+    let required = required_visible_overlap(zero_bounds.1 - zero_bounds.0);
+    assert!(interval.is_valid());
 
-    for desired_x in [-10.0, 10.0] {
+    for direction in [-1.0, 1.0] {
         let admitted = adjustments_after_pan_input(
             aabb,
             settings,
             CameraRuntimeAdjustments::default(),
             aspect,
-            Vec2::new(desired_x, 0.0),
+            Vec2::new(direction * 10.0, 0.0),
         );
+        let expected = if direction < 0.0 {
+            interval.min
+        } else {
+            interval.max
+        };
+        approx_eq(admitted.pan_ndc.x, expected);
         let final_camera = resolve_camera_parameters_with_aspect(aabb, settings, admitted, aspect);
-        approx_eq(
-            projected_rest_center(final_camera, aabb, aspect).x,
-            desired_x.signum() * PAN_WITNESS_SAFE_X_NDC,
+        let (min_x, max_x) = projected_rest_bounds_x(final_camera, aabb, aspect);
+        assert!(
+            (max_x.min(1.0) - min_x.max(-1.0)).max(0.0) >= required.min(max_x - min_x) - 1.0e-4
         );
     }
+
+    assert!(projected_rest_center(zero, aabb, aspect).is_finite());
 }
 
 #[test]
-fn portrait_roll_90_keeps_both_horizontal_pan_directions_available() {
+fn portrait_roll_plus_and_minus_90_horizontal_intervals_mirror() {
     let aabb = standard_pan_aabb();
     let settings = CameraSettings::default();
     let aspect = 540.0 / 960.0;
 
-    for roll_deg in [-90.0, 90.0] {
+    let intervals = [-90.0_f32, 90.0_f32].map(|roll_deg| {
         let pose = CameraRuntimeAdjustments {
             roll_deg,
             ..Default::default()
         };
-        let baseline_camera = resolve_camera_parameters_with_aspect(aabb, settings, pose, aspect);
-        let baseline = projected_rest_center(baseline_camera, aabb, aspect);
-        let safe_limits = pan_witness_safe_limits(baseline);
-        approx_eq(
-            safe_limits.x,
-            baseline.x.abs() + PAN_X_BASELINE_OUTWARD_SLACK_NDC,
-        );
-        assert!(safe_limits.x > 3.0);
-        assert!(baseline.x.abs() < safe_limits.x, "{baseline:?}");
+        horizontal_interval(aabb, settings, pose, aspect)
+    });
 
-        for desired_x in [-1.25, 1.25] {
-            let admitted = adjustments_after_pan_input(
-                aabb,
-                settings,
-                pose,
-                aspect,
-                Vec2::new(desired_x, 0.0),
-            );
-            assert_eq!(admitted.pan_ndc.x.signum(), desired_x.signum());
-            let final_camera =
-                resolve_camera_parameters_with_aspect(aabb, settings, admitted, aspect);
-            approx_eq(
-                projected_rest_center(final_camera, aabb, aspect).x,
-                baseline.x + desired_x,
-            );
-        }
+    assert!(intervals.iter().all(|interval| interval.is_valid()));
+    approx_eq(intervals[0].min, -intervals[1].max);
+    approx_eq(intervals[0].max, -intervals[1].min);
+    assert!(
+        intervals
+            .iter()
+            .all(|interval| interval.min < 0.0 && interval.max > 0.0)
+    );
+}
+
+#[test]
+fn close_zoom_expands_horizontal_traversal_from_projected_bounds() {
+    let aabb = standard_pan_aabb();
+    let settings = CameraSettings::default();
+    let aspect = DEFAULT_VIEWPORT_ASPECT;
+    let baseline = horizontal_interval(aabb, settings, CameraRuntimeAdjustments::default(), aspect);
+    let close_pose = CameraRuntimeAdjustments {
+        distance_scale_delta: 0.279 - settings.distance_scale,
+        ..Default::default()
+    };
+    let close = horizontal_interval(aabb, settings, close_pose, aspect);
+
+    assert!(baseline.is_valid() && close.is_valid());
+    assert!(
+        close.min < baseline.min,
+        "baseline={baseline:?}, close={close:?}"
+    );
+    assert!(
+        close.max > baseline.max,
+        "baseline={baseline:?}, close={close:?}"
+    );
+}
+
+#[test]
+fn small_far_projected_model_keeps_horizontal_overlap_at_both_stoppers() {
+    let aabb = (Vec3::new(-0.02, 0.0, -0.02), Vec3::new(0.02, 2.0, 0.02));
+    let settings = CameraSettings {
+        distance_scale: 2.0,
+        ..CameraSettings::default()
+    };
+    let aspect = 1.6;
+    let zero = resolve_camera_parameters_with_aspect(
+        aabb,
+        settings,
+        CameraRuntimeAdjustments::default(),
+        aspect,
+    );
+    let interval = horizontal_interval(aabb, settings, CameraRuntimeAdjustments::default(), aspect);
+    let zero_bounds = projected_rest_bounds_x(zero, aabb, aspect);
+    let required = required_visible_overlap(zero_bounds.1 - zero_bounds.0);
+
+    for direction in [-1.0, 1.0] {
+        let admitted = adjustments_after_pan_input(
+            aabb,
+            settings,
+            CameraRuntimeAdjustments::default(),
+            aspect,
+            Vec2::new(direction * 100.0, 0.0),
+        );
+        let stopped = resolve_camera_parameters_with_aspect(aabb, settings, admitted, aspect);
+        let bounds = projected_rest_bounds_x(stopped, aabb, aspect);
+        let overlap = (bounds.1.min(1.0) - bounds.0.max(-1.0)).max(0.0);
+        assert!(overlap >= required.min(bounds.1 - bounds.0) - 1.0e-4);
+        assert_eq!(
+            admitted.pan_ndc.x,
+            if direction < 0.0 {
+                interval.min
+            } else {
+                interval.max
+            }
+        );
     }
 }
 
 #[test]
-fn outside_positive_baseline_has_bounded_outward_slack() {
+fn outside_positive_baseline_has_projected_bounds_stopper() {
     let aabb = standard_pan_aabb();
     let settings = outside_pan_test_settings();
     let aspect = DEFAULT_VIEWPORT_ASPECT;
@@ -665,168 +1042,369 @@ fn outside_positive_baseline_has_bounded_outward_slack() {
     };
     let baseline_camera = resolve_camera_parameters_with_aspect(aabb, settings, pose, aspect);
     let baseline = projected_rest_center(baseline_camera, aabb, aspect);
-    let safe_limits = pan_witness_safe_limits(baseline);
-    assert!(baseline.y > PAN_WITNESS_SAFE_Y_NDC, "{baseline:?}");
-    approx_eq(safe_limits.y, baseline.y + PAN_Y_BASELINE_OUTWARD_SLACK_NDC);
+    let projection = resolve_pan_witness_projection(aabb, settings, pose, aspect).unwrap();
+    let interval = projection.pan_intervals[1];
+    assert!(baseline.y > 1.0, "{baseline:?}");
+    assert!(interval.is_valid());
 
     let unchanged = adjustments_after_pan_input(aabb, settings, pose, aspect, Vec2::ZERO);
     assert_eq!(unchanged.pan_ndc, Vec2::ZERO);
     let outward = adjustments_after_pan_input(aabb, settings, pose, aspect, Vec2::new(0.0, 0.25));
     let outward_camera = resolve_camera_parameters_with_aspect(aabb, settings, outward, aspect);
-    approx_eq(
-        projected_rest_center(outward_camera, aabb, aspect).y,
-        baseline.y + 0.25,
-    );
+    assert_eq!(outward.pan_ndc.y, 0.25_f32.min(interval.max));
+    assert!(projected_rest_bounds_y(outward_camera, aabb, aspect).1 >= -1.0);
     let stopped = adjustments_after_pan_input(aabb, settings, pose, aspect, Vec2::new(0.0, 10.0));
-    let stopped_camera = resolve_camera_parameters_with_aspect(aabb, settings, stopped, aspect);
-    approx_eq(
-        projected_rest_center(stopped_camera, aabb, aspect).y,
-        safe_limits.y,
-    );
+    assert_eq!(stopped.pan_ndc.y, interval.max);
     let inward = adjustments_after_pan_input(aabb, settings, pose, aspect, Vec2::new(0.0, -0.25));
     let inward_camera = resolve_camera_parameters_with_aspect(aabb, settings, inward, aspect);
-    approx_eq(
-        projected_rest_center(inward_camera, aabb, aspect).y,
-        baseline.y - 0.25,
-    );
+    assert_eq!(inward.pan_ndc.y, (-0.25_f32).max(interval.min));
+    assert!(projected_rest_bounds_y(inward_camera, aabb, aspect).0 <= 1.0);
     assert!(inward.pan_ndc.y < 0.0);
 }
 
 #[test]
-fn outside_negative_baseline_mirrors_bounded_slack_policy() {
+fn outside_negative_baseline_mirrors_projected_bounds_policy() {
     let aabb = standard_pan_aabb();
     let settings = outside_pan_test_settings();
     let aspect = DEFAULT_VIEWPORT_ASPECT;
     let pose = CameraRuntimeAdjustments::default();
     let baseline_camera = resolve_camera_parameters_with_aspect(aabb, settings, pose, aspect);
     let baseline = projected_rest_center(baseline_camera, aabb, aspect);
-    let safe_limits = pan_witness_safe_limits(baseline);
-    assert!(baseline.y < -PAN_WITNESS_SAFE_Y_NDC, "{baseline:?}");
-    approx_eq(
-        safe_limits.y,
-        -baseline.y + PAN_Y_BASELINE_OUTWARD_SLACK_NDC,
-    );
+    let projection = resolve_pan_witness_projection(aabb, settings, pose, aspect).unwrap();
+    let interval = projection.pan_intervals[1];
+    assert!(baseline.y < -1.0, "{baseline:?}");
+    assert!(interval.is_valid());
 
     let outward = adjustments_after_pan_input(aabb, settings, pose, aspect, Vec2::new(0.0, -0.25));
     let outward_camera = resolve_camera_parameters_with_aspect(aabb, settings, outward, aspect);
-    approx_eq(
-        projected_rest_center(outward_camera, aabb, aspect).y,
-        baseline.y - 0.25,
-    );
+    assert_eq!(outward.pan_ndc.y, (-0.25_f32).max(interval.min));
+    assert!(projected_rest_bounds_y(outward_camera, aabb, aspect).0 <= 1.0);
     let stopped = adjustments_after_pan_input(aabb, settings, pose, aspect, Vec2::new(0.0, -10.0));
-    let stopped_camera = resolve_camera_parameters_with_aspect(aabb, settings, stopped, aspect);
-    approx_eq(
-        projected_rest_center(stopped_camera, aabb, aspect).y,
-        -safe_limits.y,
-    );
+    assert_eq!(stopped.pan_ndc.y, interval.min);
     let inward = adjustments_after_pan_input(aabb, settings, pose, aspect, Vec2::new(0.0, 0.25));
     let inward_camera = resolve_camera_parameters_with_aspect(aabb, settings, inward, aspect);
-    approx_eq(
-        projected_rest_center(inward_camera, aabb, aspect).y,
-        baseline.y + 0.25,
-    );
+    assert_eq!(inward.pan_ndc.y, 0.25_f32.min(interval.max));
+    assert!(projected_rest_bounds_y(inward_camera, aabb, aspect).1 >= -1.0);
     assert!(inward.pan_ndc.y > 0.0);
 }
 
 #[test]
-fn orientation_change_can_make_witness_outside_without_mutating_pan() {
+fn close_pan_zoom_out_clamps_both_pan_axes() {
     let aabb = standard_pan_aabb();
-    let settings = CameraSettings {
-        distance_scale: 0.4,
-        ..CameraSettings::default()
-    };
-    let aspect = 1.0;
-    let stored_pan = Vec2::new(0.0, -0.8);
-    let before_pose = CameraRuntimeAdjustments {
-        pan_ndc: stored_pan,
-        roll_deg: 90.0,
+    let settings = CameraSettings::default();
+    let aspect = DEFAULT_VIEWPORT_ASPECT;
+    let close_pose = CameraRuntimeAdjustments {
+        distance_scale_delta: 0.30 - settings.distance_scale,
         ..Default::default()
     };
-    let after_pose = CameraRuntimeAdjustments {
-        pan_ndc: stored_pan,
-        roll_deg: 0.0,
-        ..Default::default()
-    };
-    let before = resolve_camera_parameters_with_aspect(aabb, settings, before_pose, aspect);
-    let after = resolve_camera_parameters_with_aspect(aabb, settings, after_pose, aspect);
-    let zero_before = resolve_camera_parameters_with_aspect(
-        aabb,
-        settings,
-        CameraRuntimeAdjustments {
-            pan_ndc: Vec2::ZERO,
-            ..before_pose
-        },
-        aspect,
-    );
+    let close_intervals = pan_intervals(aabb, settings, close_pose, aspect);
+    for axis in 0..2 {
+        for stored_value in [close_intervals[axis].min, close_intervals[axis].max] {
+            let mut stored_pan = Vec2::ZERO;
+            stored_pan[axis] = stored_value;
+            let far_pose = CameraRuntimeAdjustments {
+                distance_scale_delta: 2.00 - settings.distance_scale,
+                pan_ndc: stored_pan,
+                ..Default::default()
+            };
+            let far_intervals = pan_intervals(aabb, settings, far_pose, aspect);
+            assert!(
+                stored_pan[axis] < far_intervals[axis].min
+                    || stored_pan[axis] > far_intervals[axis].max,
+                "close boundary {stored_value} unexpectedly remained valid in {far_intervals:?}"
+            );
 
-    let before_projection = projected_rest_center(before, aabb, aspect);
-    let safe_limits = pan_witness_safe_limits(projected_rest_center(zero_before, aabb, aspect));
-    assert!(
-        before_projection.x.abs() < safe_limits.x && before_projection.y.abs() < safe_limits.y,
-        "{before_projection:?}"
-    );
-    let zero_after = resolve_camera_parameters_with_aspect(
-        aabb,
-        settings,
-        CameraRuntimeAdjustments {
-            pan_ndc: Vec2::ZERO,
-            ..after_pose
-        },
-        aspect,
-    );
-    let after_limits = pan_witness_safe_limits(projected_rest_center(zero_after, aabb, aspect));
-    assert!(projected_rest_center(after, aabb, aspect).y < -after_limits.y);
-    assert_eq!(before.pan_ndc, stored_pan);
-    assert_eq!(after.pan_ndc, stored_pan);
+            let mut controls = CameraControls::default();
+            controls.set_adjustments(far_pose);
+            assert!(controls.validate_pan(CameraPanContext::new(aabb, settings), aspect,));
+            let corrected = controls.adjustments();
+            let mut expected = stored_pan;
+            expected[0] = expected[0].clamp(far_intervals[0].min, far_intervals[0].max);
+            expected[1] = expected[1].clamp(far_intervals[1].min, far_intervals[1].max);
+            assert_eq!(corrected.pan_ndc, expected);
+
+            let resolved = resolve_camera_parameters_with_aspect(aabb, settings, far_pose, aspect);
+            assert_eq!(resolved.pan_ndc, expected);
+        }
+    }
 }
 
 #[test]
-fn orientation_fov_distance_and_aspect_changes_never_correct_stored_pan() {
+fn zoom_input_is_not_blocked_by_vertical_pan_revalidation() {
     let aabb = standard_pan_aabb();
-    let stored_pan = Vec2::new(0.73, -0.61);
+    let settings = CameraSettings::default();
+    let aspect = DEFAULT_VIEWPORT_ASPECT;
+    let close_pose = CameraRuntimeAdjustments {
+        distance_scale_delta: 0.30 - settings.distance_scale,
+        ..Default::default()
+    };
+    let close_interval = vertical_interval(aabb, settings, close_pose, aspect);
+    let stored_pan = Vec2::new(0.37, close_interval.min);
+    let initial = CameraRuntimeAdjustments {
+        pan_ndc: stored_pan,
+        ..close_pose
+    };
+    let mut controls = CameraControls::default();
+    controls.set_adjustments(initial);
+    let snap_steps = CameraSnapSteps {
+        yaw_deg: settings.yaw_snap_deg,
+        roll_deg: settings.roll_snap_deg,
+        pitch_deg: settings.pitch_snap_deg,
+    };
+    let context = CameraPanContext::new(aabb, settings);
+
+    let mut toggle = Input::default();
+    toggle.inject_key(KeyCode::F8, true);
+    controls.apply_frame(0.0, &toggle, Some(context), snap_steps, aspect);
+
+    let mut input = Input::default();
+    input.inject_key(KeyCode::ShiftLeft, true);
+    input.inject_key(KeyCode::ArrowDown, true);
+    assert!(controls.apply_frame(0.25, &input, Some(context), snap_steps, aspect));
+
+    let changed = controls.adjustments();
+    let expected_distance_delta = close_pose.distance_scale_delta + 0.75 * 0.25;
+    let expected_pose = CameraRuntimeAdjustments {
+        distance_scale_delta: expected_distance_delta,
+        pan_ndc: stored_pan,
+        ..Default::default()
+    };
+    let changed_interval = vertical_interval(aabb, settings, expected_pose, aspect);
+    assert_eq!(changed.distance_scale_delta, expected_distance_delta);
+    assert_eq!(changed.pan_ndc.x, stored_pan.x);
+    assert_eq!(changed.pan_ndc.y, changed_interval.min);
+}
+
+#[test]
+fn zoom_out_while_vertical_pan_is_valid_does_not_move_it() {
+    let aabb = standard_pan_aabb();
+    let settings = CameraSettings::default();
+    let aspect = DEFAULT_VIEWPORT_ASPECT;
+    let stored_pan = Vec2::new(0.73, 0.0);
+    let far_pose = CameraRuntimeAdjustments {
+        distance_scale_delta: 2.00 - settings.distance_scale,
+        pan_ndc: stored_pan,
+        ..Default::default()
+    };
+    let far_interval = vertical_interval(aabb, settings, far_pose, aspect);
+    assert!(far_interval.min < stored_pan.y && stored_pan.y < far_interval.max);
+
+    let mut controls = CameraControls::default();
+    controls.set_adjustments(far_pose);
+    assert!(!controls.validate_pan(CameraPanContext::new(aabb, settings), aspect,));
+    assert_eq!(controls.adjustments().pan_ndc, stored_pan);
+}
+
+#[test]
+fn fov_change_revalidates_and_clamps_both_pan_axes() {
+    let aabb = standard_pan_aabb();
+    let settings = CameraSettings::default();
+    let aspect = DEFAULT_VIEWPORT_ASPECT;
+    let close_pose = CameraRuntimeAdjustments {
+        distance_scale_delta: 0.30 - settings.distance_scale,
+        ..Default::default()
+    };
+    let close_intervals = pan_intervals(aabb, settings, close_pose, aspect);
+    let stored_pan = Vec2::new(close_intervals[0].min, close_intervals[1].min);
+    let changed = CameraRuntimeAdjustments {
+        fov_delta_deg: 60.0,
+        pan_ndc: stored_pan,
+        ..close_pose
+    };
+    let changed_intervals = pan_intervals(aabb, settings, changed, aspect);
+    assert!(stored_pan.x < changed_intervals[0].min);
+    assert!(stored_pan.y < changed_intervals[1].min);
+
+    let mut controls = CameraControls::default();
+    controls.set_adjustments(changed);
+    assert!(controls.validate_pan(CameraPanContext::new(aabb, settings), aspect,));
+    assert_eq!(
+        controls.adjustments().pan_ndc,
+        Vec2::new(changed_intervals[0].min, changed_intervals[1].min)
+    );
+}
+
+#[test]
+fn yaw_pitch_and_roll_changes_revalidate_pan() {
+    let aabb = standard_pan_aabb();
+    let settings = CameraSettings::default();
+    let aspect = DEFAULT_VIEWPORT_ASPECT;
     let cases = [
         (
-            CameraSettings::default(),
+            "yaw",
             CameraRuntimeAdjustments {
-                pan_ndc: stored_pan,
+                yaw_deg: 45.0,
                 ..Default::default()
             },
-            0.75,
+            CameraRuntimeAdjustments::default(),
         ),
         (
-            CameraSettings::default(),
+            "pitch",
             CameraRuntimeAdjustments {
-                fov_delta_deg: 65.0,
-                distance_scale_delta: 4.0,
-                pan_ndc: stored_pan,
-                yaw_deg: 137.0,
-                pitch_deg: -63.0,
-                roll_deg: 91.0,
-            },
-            2.4,
-        ),
-        (
-            CameraSettings {
-                fov_deg: 22.0,
-                distance_scale: 0.2,
-                headroom: 0.31,
-                ..CameraSettings::default()
-            },
-            CameraRuntimeAdjustments {
-                pan_ndc: stored_pan,
-                yaw_deg: -179.9,
-                pitch_deg: 71.0,
-                roll_deg: -179.9,
+                pitch_deg: -20.0,
                 ..Default::default()
             },
-            0.31,
+            CameraRuntimeAdjustments::default(),
+        ),
+        (
+            "roll",
+            CameraRuntimeAdjustments {
+                roll_deg: 90.0,
+                ..Default::default()
+            },
+            CameraRuntimeAdjustments::default(),
         ),
     ];
 
-    for (settings, adjustments, aspect) in cases {
-        let parameters = resolve_camera_parameters_with_aspect(aabb, settings, adjustments, aspect);
-        assert_eq!(parameters.pan_ndc, stored_pan);
+    for (axis, before_pose, after_pose) in cases {
+        let before_interval = vertical_interval(aabb, settings, before_pose, aspect);
+        let stored_pan = Vec2::new(0.19, before_interval.min);
+        let before = CameraRuntimeAdjustments {
+            pan_ndc: stored_pan,
+            ..before_pose
+        };
+        let after = CameraRuntimeAdjustments {
+            pan_ndc: stored_pan,
+            ..after_pose
+        };
+        let after_interval = vertical_interval(aabb, settings, after, aspect);
+        assert!(
+            stored_pan.y < after_interval.min,
+            "{axis} did not make the lower boundary tighter: before={before_interval:?}, after={after_interval:?}"
+        );
+        assert_eq!(
+            resolve_camera_parameters_with_aspect(aabb, settings, before, aspect).pan_ndc,
+            stored_pan
+        );
+
+        let mut controls = CameraControls::default();
+        controls.set_adjustments(after);
+        assert!(controls.validate_pan(CameraPanContext::new(aabb, settings), aspect,));
+        assert_eq!(controls.adjustments().pan_ndc.x, stored_pan.x);
+        assert_eq!(controls.adjustments().pan_ndc.y, after_interval.min);
     }
+}
+
+#[test]
+fn aspect_change_revalidates_horizontal_pan_without_moving_valid_y() {
+    let aabb = standard_pan_aabb();
+    let settings = CameraSettings::default();
+    let old_aspect = 540.0 / 960.0;
+    let new_aspect = 1920.0 / 1080.0;
+    let old_interval = horizontal_interval(
+        aabb,
+        settings,
+        CameraRuntimeAdjustments::default(),
+        old_aspect,
+    );
+    let new_intervals = pan_intervals(
+        aabb,
+        settings,
+        CameraRuntimeAdjustments::default(),
+        new_aspect,
+    );
+    assert!(old_interval.max > new_intervals[0].max);
+    let stored_pan = Vec2::new(old_interval.max, 0.2);
+    assert!(stored_pan.x > new_intervals[0].max);
+
+    let mut controls = CameraControls::default();
+    controls.set_adjustments(CameraRuntimeAdjustments {
+        pan_ndc: stored_pan,
+        ..Default::default()
+    });
+    assert!(controls.validate_pan(CameraPanContext::new(aabb, settings), new_aspect));
+    assert_eq!(controls.adjustments().pan_ndc.x, new_intervals[0].max);
+    assert_eq!(controls.adjustments().pan_ndc.y, stored_pan.y);
+}
+
+#[test]
+fn roll_change_revalidates_horizontal_pan_without_moving_valid_y() {
+    let aabb = standard_pan_aabb();
+    let settings = CameraSettings::default();
+    let aspect = 540.0 / 960.0;
+    let before_pose = CameraRuntimeAdjustments {
+        roll_deg: 90.0,
+        ..Default::default()
+    };
+    let before_interval = horizontal_interval(aabb, settings, before_pose, aspect);
+    let after_pose = CameraRuntimeAdjustments {
+        roll_deg: 0.0,
+        pan_ndc: Vec2::new(before_interval.min, 0.2),
+        ..Default::default()
+    };
+    let after_interval = horizontal_interval(aabb, settings, after_pose, aspect);
+    assert!(after_pose.pan_ndc.x < after_interval.min);
+
+    let mut controls = CameraControls::default();
+    controls.set_adjustments(after_pose);
+    assert!(controls.validate_pan(CameraPanContext::new(aabb, settings), aspect));
+    assert_eq!(controls.adjustments().pan_ndc.x, after_interval.min);
+    assert_eq!(controls.adjustments().pan_ndc.y, 0.2);
+}
+
+#[test]
+fn runtime_orientation_revalidation_clamps_both_axes_independently() {
+    let aabb = standard_pan_aabb();
+    let settings = CameraSettings::default();
+    let aspect = DEFAULT_VIEWPORT_ASPECT;
+    for pose in [
+        CameraRuntimeAdjustments {
+            yaw_deg: 45.0,
+            ..Default::default()
+        },
+        CameraRuntimeAdjustments {
+            pitch_deg: -20.0,
+            ..Default::default()
+        },
+        CameraRuntimeAdjustments {
+            roll_deg: 45.0,
+            ..Default::default()
+        },
+    ] {
+        let intervals = pan_intervals(aabb, settings, pose, aspect);
+        let mut controls = CameraControls::default();
+        controls.set_adjustments(CameraRuntimeAdjustments {
+            pan_ndc: Vec2::new(100.0, -100.0),
+            ..pose
+        });
+        assert!(controls.validate_pan(CameraPanContext::new(aabb, settings), aspect));
+        assert_eq!(
+            controls.adjustments().pan_ndc,
+            Vec2::new(intervals[0].max, intervals[1].min)
+        );
+    }
+}
+
+#[test]
+fn returning_to_close_zoom_does_not_restore_clamped_pan() {
+    let aabb = standard_pan_aabb();
+    let settings = CameraSettings::default();
+    let aspect = DEFAULT_VIEWPORT_ASPECT;
+    let close_pose = CameraRuntimeAdjustments {
+        distance_scale_delta: 0.30 - settings.distance_scale,
+        ..Default::default()
+    };
+    let close_interval = vertical_interval(aabb, settings, close_pose, aspect);
+    let stored_pan = Vec2::new(0.27, close_interval.min);
+    let far_pose = CameraRuntimeAdjustments {
+        distance_scale_delta: 2.00 - settings.distance_scale,
+        pan_ndc: stored_pan,
+        ..Default::default()
+    };
+    let far_interval = vertical_interval(aabb, settings, far_pose, aspect);
+    let mut controls = CameraControls::default();
+    controls.set_adjustments(far_pose);
+    assert!(controls.validate_pan(CameraPanContext::new(aabb, settings), aspect,));
+    let clamped_pan = controls.adjustments().pan_ndc;
+    assert_eq!(clamped_pan.y, far_interval.min);
+
+    controls.set_adjustments(CameraRuntimeAdjustments {
+        distance_scale_delta: 0.30 - settings.distance_scale,
+        pan_ndc: clamped_pan,
+        ..Default::default()
+    });
+    assert!(!controls.validate_pan(CameraPanContext::new(aabb, settings), aspect,));
+    assert_eq!(controls.adjustments().pan_ndc, clamped_pan);
 }
 
 #[test]
@@ -923,13 +1501,7 @@ fn combined_axes_gate_independently() {
     let aabb = standard_pan_aabb();
     let settings = in_range_pan_test_settings();
     let aspect = 1.2;
-    let zero = resolve_camera_parameters_with_aspect(
-        aabb,
-        settings,
-        CameraRuntimeAdjustments::default(),
-        aspect,
-    );
-    let safe_limits = pan_witness_safe_limits(projected_rest_center(zero, aabb, aspect));
+    let intervals = pan_intervals(aabb, settings, CameraRuntimeAdjustments::default(), aspect);
     let saturated = adjustments_after_pan_input(
         aabb,
         settings,
@@ -937,20 +1509,90 @@ fn combined_axes_gate_independently() {
         aspect,
         Vec2::new(10.0, -10.0),
     );
-    let saturated_camera = resolve_camera_parameters_with_aspect(aabb, settings, saturated, aspect);
-    approx_vec2(
-        projected_rest_center(saturated_camera, aabb, aspect),
-        Vec2::new(safe_limits.x, -safe_limits.y),
-    );
+    assert_eq!(saturated.pan_ndc.x, intervals[0].max);
+    assert_eq!(saturated.pan_ndc.y, intervals[1].min);
 
     let x_reversed =
         adjustments_after_pan_input(aabb, settings, saturated, aspect, Vec2::new(-0.2, 0.0));
     assert_eq!(x_reversed.pan_ndc.y, saturated.pan_ndc.y);
-    let reversed_camera = resolve_camera_parameters_with_aspect(aabb, settings, x_reversed, aspect);
-    approx_vec2(
-        projected_rest_center(reversed_camera, aabb, aspect),
-        Vec2::new(safe_limits.x - 0.2, -safe_limits.y),
+    approx_eq(x_reversed.pan_ndc.x, intervals[0].max - 0.2);
+    assert_eq!(x_reversed.pan_ndc.y, saturated.pan_ndc.y);
+}
+
+#[test]
+fn perspective_pan_input_preserves_witness_rate_on_both_axes() {
+    let aabb = standard_pan_aabb();
+    let settings = in_range_pan_test_settings();
+    let aspect = 1.25;
+    let pose = CameraRuntimeAdjustments {
+        yaw_deg: 31.0,
+        pitch_deg: -12.0,
+        roll_deg: 23.0,
+        ..Default::default()
+    };
+    let projection = resolve_pan_witness_projection(aabb, settings, pose, aspect).unwrap();
+    assert!((projection.response - 1.0).abs() > 1.0e-3);
+
+    let desired = Vec2::new(0.12, -0.08);
+    let admitted = adjustments_after_pan_input(aabb, settings, pose, aspect, desired);
+    approx_vec2(admitted.pan_ndc, desired / projection.response);
+
+    let zero = resolve_camera_parameters_with_aspect(aabb, settings, pose, aspect);
+    let moved = resolve_camera_parameters_with_aspect(
+        aabb,
+        settings,
+        CameraRuntimeAdjustments {
+            pan_ndc: admitted.pan_ndc,
+            ..pose
+        },
+        aspect,
     );
+    approx_vec2(
+        projected_point(moved, rest_bounds_center(aabb), aspect).truncate()
+            - projected_point(zero, rest_bounds_center(aabb), aspect).truncate(),
+        desired,
+    );
+}
+
+#[test]
+fn simultaneous_x_and_y_pan_admission_is_independent() {
+    let aabb = standard_pan_aabb();
+    let settings = in_range_pan_test_settings();
+    let aspect = 0.83;
+    let pose = CameraRuntimeAdjustments {
+        yaw_deg: 47.0,
+        pitch_deg: -12.0,
+        roll_deg: 31.0,
+        ..Default::default()
+    };
+    let x_only = adjustments_after_pan_input(aabb, settings, pose, aspect, Vec2::new(0.11, 0.0));
+    let y_only = adjustments_after_pan_input(aabb, settings, pose, aspect, Vec2::new(0.0, -0.09));
+    let both = adjustments_after_pan_input(aabb, settings, pose, aspect, Vec2::new(0.11, -0.09));
+
+    approx_eq(both.pan_ndc.x, x_only.pan_ndc.x);
+    approx_eq(both.pan_ndc.y, y_only.pan_ndc.y);
+}
+
+#[test]
+fn projected_intervals_are_finite_for_audit_rolls_aspects_and_zoom_ranges() {
+    let aabb = standard_pan_aabb();
+    let settings = CameraSettings::default();
+    for aspect in [540.0 / 960.0, 1920.0 / 1080.0] {
+        for roll_deg in [0.0, 45.0, 90.0, -90.0] {
+            for distance_scale in [0.30, settings.distance_scale, 2.0] {
+                let pose = CameraRuntimeAdjustments {
+                    distance_scale_delta: distance_scale - settings.distance_scale,
+                    roll_deg,
+                    ..Default::default()
+                };
+                let intervals = pan_intervals(aabb, settings, pose, aspect);
+                assert!(
+                    intervals.iter().all(|interval| interval.is_valid()),
+                    "aspect={aspect}, roll={roll_deg}, distance_scale={distance_scale}: {intervals:?}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -998,13 +1640,7 @@ fn stopper_is_idempotent_and_reverse_has_no_hidden_windup() {
     let aabb = standard_pan_aabb();
     let settings = in_range_pan_test_settings();
     let aspect = 1.2;
-    let zero = resolve_camera_parameters_with_aspect(
-        aabb,
-        settings,
-        CameraRuntimeAdjustments::default(),
-        aspect,
-    );
-    let safe_limits = pan_witness_safe_limits(projected_rest_center(zero, aabb, aspect));
+    let interval = horizontal_interval(aabb, settings, CameraRuntimeAdjustments::default(), aspect);
     let saturated = adjustments_after_pan_input(
         aabb,
         settings,
@@ -1018,11 +1654,7 @@ fn stopper_is_idempotent_and_reverse_has_no_hidden_windup() {
 
     let reversed =
         adjustments_after_pan_input(aabb, settings, repeated, aspect, Vec2::new(-0.1, 0.0));
-    let reversed_camera = resolve_camera_parameters_with_aspect(aabb, settings, reversed, aspect);
-    approx_eq(
-        projected_rest_center(reversed_camera, aabb, aspect).x,
-        safe_limits.x - 0.1,
-    );
+    approx_eq(reversed.pan_ndc.x, interval.max - 0.1);
     assert!(reversed.pan_ndc.x < saturated.pan_ndc.x);
 }
 
@@ -1042,7 +1674,8 @@ fn reset_is_exact_zero_even_for_outside_baseline() {
     assert_ne!(adjusted.pan_ndc, Vec2::ZERO);
     assert_eq!(reset.pan_ndc, Vec2::ZERO);
     assert_eq!(reset_camera.pan_ndc, Vec2::ZERO);
-    assert!(projected_rest_center(reset_camera, aabb, aspect).y < -PAN_WITNESS_SAFE_Y_NDC);
+    let (min_y, max_y) = projected_rest_bounds_y(reset_camera, aabb, aspect);
+    assert!((max_y.min(1.0) - min_y.max(-1.0)).max(0.0) >= PAN_MIN_VISIBLE_OVERLAP_NDC);
     approx_vec3(reset_camera.frame.target, reset_camera.baseline_target);
 }
 
@@ -1231,4 +1864,314 @@ fn f8_roll_is_a_forward_axis_camera_rotation() {
         rolled.screen_up(),
         rolled.up() * 0.8253356 + rolled.right() * 0.5646425,
     );
+}
+
+#[test]
+fn projected_bounds_use_fraction_floor_and_ceiling() {
+    assert_eq!(required_visible_overlap(0.05), 0.05);
+    assert_eq!(required_visible_overlap(0.20), 0.10);
+    assert_eq!(required_visible_overlap(0.40), 0.10);
+    assert_eq!(required_visible_overlap(1.00), 0.25);
+    approx_eq(required_visible_overlap(3.00), 0.39814815);
+}
+
+#[test]
+fn close_zoom_ceiling_keeps_existing_behavior_at_or_below_start_extent() {
+    for extent in [0.05, 0.20, 0.40, 1.00, 1.80, 2.00] {
+        approx_eq(
+            required_visible_overlap(extent),
+            existing_hybrid_visible_overlap(extent),
+        );
+    }
+}
+
+#[test]
+fn close_zoom_ceiling_reaches_the_close_cap_at_or_above_end_extent() {
+    for extent in [5.00, 5.50, 10.00] {
+        approx_eq(
+            required_visible_overlap(extent),
+            PAN_CLOSE_VISIBLE_OVERLAP_NDC,
+        );
+    }
+}
+
+#[test]
+fn close_zoom_ceiling_transition_is_continuous_and_monotonic() {
+    let start = PAN_CLOSE_RELAX_START_EXTENT_NDC;
+    let end = PAN_CLOSE_RELAX_END_EXTENT_NDC;
+    let before_start = required_visible_overlap(start - 1.0e-4);
+    let at_start = required_visible_overlap(start);
+    let at_end = required_visible_overlap(end);
+    let after_end = required_visible_overlap(end + 1.0e-4);
+
+    approx_eq(before_start, at_start);
+    approx_eq(at_end, after_end);
+
+    let mut previous = at_start;
+    let mut largest_step: f32 = 0.0;
+    for index in 1..=300 {
+        let extent = start + (end - start) * index as f32 / 300.0;
+        let current = required_visible_overlap(extent);
+        assert!(current <= previous + 1.0e-6, "{previous} -> {current}");
+        largest_step = largest_step.max(previous - current);
+        previous = current;
+    }
+    assert!(
+        largest_step < 0.002,
+        "largest transition step: {largest_step}"
+    );
+}
+
+#[test]
+fn close_zoom_relaxes_the_vertical_interval_and_gains_travel() {
+    let aabb = standard_pan_aabb();
+    let settings = CameraSettings::default();
+    let aspect = DEFAULT_VIEWPORT_ASPECT;
+    let close_pose = CameraRuntimeAdjustments {
+        distance_scale_delta: 0.30 - settings.distance_scale,
+        ..Default::default()
+    };
+    let zero = resolve_camera_parameters_with_aspect(aabb, settings, close_pose, aspect);
+    let bounds = projected_rest_bounds_y(zero, aabb, aspect);
+    let extent = bounds.1 - bounds.0;
+    assert!(extent >= PAN_CLOSE_RELAX_END_EXTENT_NDC, "extent={extent}");
+    assert_eq!(
+        required_visible_overlap(extent),
+        PAN_CLOSE_VISIBLE_OVERLAP_NDC
+    );
+
+    let tapered = vertical_interval(aabb, settings, close_pose, aspect);
+    let legacy = legacy_vertical_interval(aabb, settings, close_pose, aspect);
+    assert!(
+        tapered.min < legacy.min,
+        "legacy={legacy:?}, tapered={tapered:?}"
+    );
+    assert!(
+        tapered.max > legacy.max,
+        "legacy={legacy:?}, tapered={tapered:?}"
+    );
+}
+
+#[test]
+fn far_zoom_vertical_intervals_remain_unchanged() {
+    let aabb = standard_pan_aabb();
+    let settings = CameraSettings::default();
+    let aspect = DEFAULT_VIEWPORT_ASPECT;
+
+    for distance_scale in [1.80, 2.00] {
+        let pose = CameraRuntimeAdjustments {
+            distance_scale_delta: distance_scale - settings.distance_scale,
+            ..Default::default()
+        };
+        let zero = resolve_camera_parameters_with_aspect(aabb, settings, pose, aspect);
+        let bounds = projected_rest_bounds_y(zero, aabb, aspect);
+        assert!(
+            bounds.1 - bounds.0 <= PAN_CLOSE_RELAX_START_EXTENT_NDC,
+            "distance_scale={distance_scale}, bounds={bounds:?}"
+        );
+
+        let actual = vertical_interval(aabb, settings, pose, aspect);
+        let legacy = legacy_vertical_interval(aabb, settings, pose, aspect);
+        approx_eq(actual.min, legacy.min);
+        approx_eq(actual.max, legacy.max);
+    }
+}
+
+#[test]
+fn requested_distances_keep_the_projected_bounds_interval_meaningful() {
+    let aabb = standard_pan_aabb();
+    let settings = CameraSettings::default();
+    let aspect = DEFAULT_VIEWPORT_ASPECT;
+
+    for distance_scale in [0.30, 0.60, 1.20, 2.00] {
+        let adjustments = CameraRuntimeAdjustments {
+            distance_scale_delta: distance_scale - settings.distance_scale,
+            ..Default::default()
+        };
+        let interval = vertical_interval(aabb, settings, adjustments, aspect);
+        let parameters = resolve_camera_parameters_with_aspect(aabb, settings, adjustments, aspect);
+        let zero_bounds = projected_rest_bounds_y(parameters, aabb, aspect);
+        let required = required_visible_overlap(zero_bounds.1 - zero_bounds.0);
+
+        assert!(interval.is_valid());
+        for desired_y in [-10.0, 10.0] {
+            let admitted = adjustments_after_pan_input(
+                aabb,
+                settings,
+                adjustments,
+                aspect,
+                Vec2::new(0.0, desired_y),
+            );
+            let stopped = resolve_camera_parameters_with_aspect(aabb, settings, admitted, aspect);
+            assert!(
+                visible_vertical_overlap(projected_rest_bounds_y(stopped, aabb, aspect))
+                    >= required - 1.0e-4,
+                "distance_scale={distance_scale}, required={required}, interval={interval:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn projected_stoppers_preserve_required_overlap_on_both_axes_after_rolls() {
+    let aabb = standard_pan_aabb();
+    let settings = CameraSettings::default();
+    let aspect = 540.0 / 960.0;
+    for pose in [
+        CameraRuntimeAdjustments {
+            roll_deg: 45.0,
+            ..Default::default()
+        },
+        CameraRuntimeAdjustments {
+            roll_deg: 90.0,
+            ..Default::default()
+        },
+        CameraRuntimeAdjustments {
+            roll_deg: -90.0,
+            ..Default::default()
+        },
+        CameraRuntimeAdjustments {
+            yaw_deg: 31.0,
+            pitch_deg: -12.0,
+            roll_deg: 23.0,
+            ..Default::default()
+        },
+    ] {
+        let zero = resolve_camera_parameters_with_aspect(aabb, settings, pose, aspect);
+        for axis in 0..2 {
+            let zero_bounds = projected_rest_bounds_axis(zero, aabb, aspect, axis);
+            let required = required_visible_overlap(zero_bounds.1 - zero_bounds.0);
+            for direction in [-1.0, 1.0] {
+                let mut request = Vec2::ZERO;
+                request[axis] = direction * 100.0;
+                let admitted = adjustments_after_pan_input(aabb, settings, pose, aspect, request);
+                let stopped =
+                    resolve_camera_parameters_with_aspect(aabb, settings, admitted, aspect);
+                let bounds = projected_rest_bounds_axis(stopped, aabb, aspect, axis);
+                let overlap = (bounds.1.min(1.0) - bounds.0.max(-1.0)).max(0.0);
+                assert!(
+                    overlap >= required.min(bounds.1 - bounds.0) - 1.0e-4,
+                    "pose={pose:?}, axis={axis}, direction={direction}, bounds={bounds:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn projected_interval_regression_values_match_audit_cases() {
+    let aabb = standard_pan_aabb();
+    let settings = CameraSettings::default();
+    let cases = [
+        (
+            "portrait roll 0 baseline",
+            540.0 / 960.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            (-3.2196314, 3.2196317),
+            (-1.7667506, 4.729045),
+        ),
+        (
+            "portrait roll +90 baseline",
+            540.0 / 960.0,
+            0.0,
+            0.0,
+            90.0,
+            0.0,
+            (-7.6618204, 2.39552),
+            (-2.1053987, 2.105399),
+        ),
+        (
+            "portrait roll -90 baseline",
+            540.0 / 960.0,
+            0.0,
+            0.0,
+            -90.0,
+            0.0,
+            (-2.39552, 7.6618204),
+            (-2.105399, 2.1053987),
+        ),
+        (
+            "portrait roll +90 far",
+            540.0 / 960.0,
+            0.0,
+            0.0,
+            90.0,
+            2.0 - settings.distance_scale,
+            (-2.6340404, 1.0541499),
+            (-1.23944, 1.2394401),
+        ),
+        (
+            "wide roll 0 baseline",
+            1920.0 / 1080.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            (-1.4182664, 1.4182667),
+            (-1.7667506, 4.729045),
+        ),
+        (
+            "wide roll +90 baseline",
+            1920.0 / 1080.0,
+            0.0,
+            0.0,
+            90.0,
+            0.0,
+            (-2.9600642, 1.2937738),
+            (-2.1053987, 2.105399),
+        ),
+        (
+            "nonzero yaw pitch roll",
+            1.25,
+            31.0,
+            -12.0,
+            23.0,
+            0.0,
+            (-3.0888512, 1.9560902),
+            (-2.011178, 4.938787),
+        ),
+    ];
+
+    for (
+        name,
+        aspect,
+        yaw_deg,
+        pitch_deg,
+        roll_deg,
+        distance_scale_delta,
+        expected_x,
+        expected_y,
+    ) in cases
+    {
+        let adjustments = CameraRuntimeAdjustments {
+            yaw_deg,
+            pitch_deg,
+            roll_deg,
+            distance_scale_delta,
+            ..Default::default()
+        };
+        let projection =
+            resolve_pan_witness_projection(aabb, settings, adjustments, aspect).unwrap();
+        let actual_x = projection.pan_intervals[0];
+        let actual_y = projection.pan_intervals[1];
+        assert!(
+            (actual_x.min - expected_x.0).abs() < 1.0e-4,
+            "{name}: {actual_x:?}"
+        );
+        assert!(
+            (actual_x.max - expected_x.1).abs() < 1.0e-4,
+            "{name}: {actual_x:?}"
+        );
+        assert!(
+            (actual_y.min - expected_y.0).abs() < 1.0e-4,
+            "{name}: {actual_y:?}"
+        );
+        assert!(
+            (actual_y.max - expected_y.1).abs() < 1.0e-4,
+            "{name}: {actual_y:?}"
+        );
+    }
 }

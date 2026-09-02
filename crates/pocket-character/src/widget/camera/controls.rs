@@ -318,7 +318,7 @@ fn requested_pan_witness_delta(
             0.0
         },
         if vertical_action == VerticalCameraAction::Pan {
-            axis(input, KeyCode::ArrowUp, KeyCode::ArrowDown)
+            axis(input, KeyCode::ArrowDown, KeyCode::ArrowUp)
         } else {
             0.0
         },
@@ -352,6 +352,20 @@ impl CameraControls {
         self.horizontal_snap_repeat = HorizontalSnapRepeatState::default();
         self.vertical_snap_repeat = VerticalSnapRepeatState::default();
         self.camera_adjustments = CameraRuntimeAdjustments::default();
+    }
+
+    pub(crate) fn validate_pan(
+        &mut self,
+        pan_context: CameraPanContext,
+        viewport_aspect: f32,
+    ) -> bool {
+        let validated = pan_context.validate(self.camera_adjustments, viewport_aspect);
+        if validated == self.camera_adjustments {
+            return false;
+        }
+
+        self.camera_adjustments = validated;
+        true
     }
 
     pub(crate) fn apply_frame(
@@ -469,8 +483,12 @@ impl CameraControls {
             }
         }
 
-        if requested_pan != Vec2::ZERO {
-            if let Some(pan_context) = pan_context {
+        if let Some(pan_context) = pan_context {
+            // Optics and orientation can invalidate a previously admitted pan.
+            // Revalidate both axes after all effective camera changes, before
+            // applying any newly requested pan movement.
+            adjustments = pan_context.validate(adjustments, viewport_aspect);
+            if requested_pan != Vec2::ZERO {
                 adjustments.pan_ndc =
                     pan_context.admit(adjustments, viewport_aspect, requested_pan);
             }

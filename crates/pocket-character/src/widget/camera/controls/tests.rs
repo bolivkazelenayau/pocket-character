@@ -146,7 +146,7 @@ fn f8_plain_vertical_arrows_select_pan_y_only() {
     assert_eq!(vertical_camera_action(&input), VerticalCameraAction::Pan);
     let up_delta = pan_witness_delta_after_keys(&[KeyCode::ArrowUp], dt);
     assert_eq!(up_delta.x, 0.0);
-    assert!(up_delta.y > 0.0);
+    assert!(up_delta.y < 0.0);
     assert_eq!(
         camera_adjustments_after_keys(&[KeyCode::ArrowUp]),
         CameraRuntimeAdjustments::default()
@@ -157,7 +157,7 @@ fn f8_plain_vertical_arrows_select_pan_y_only() {
     assert_eq!(vertical_camera_action(&input), VerticalCameraAction::Pan);
     let down_delta = pan_witness_delta_after_keys(&[KeyCode::ArrowDown], dt);
     assert_eq!(down_delta.x, 0.0);
-    assert!(down_delta.y < 0.0);
+    assert!(down_delta.y > 0.0);
     assert_eq!(
         camera_adjustments_after_keys(&[KeyCode::ArrowDown]),
         CameraRuntimeAdjustments::default()
@@ -379,7 +379,7 @@ fn f8_alt_alone_remains_vertical_pan() {
     assert_eq!(vertical_camera_action(&input), VerticalCameraAction::Pan);
     let delta = pan_witness_delta_after_keys(&[KeyCode::AltLeft, KeyCode::ArrowUp], dt);
     assert_eq!(delta.x, 0.0);
-    assert!(delta.y > 0.0);
+    assert!(delta.y < 0.0);
 }
 
 #[test]

@@ -192,11 +192,16 @@ impl Widget {
             return;
         };
         let aabb = model.aabb;
+        let viewport_aspect = self.camera_viewport_aspect();
+        self.camera_controls.validate_pan(
+            CameraPanContext::new(aabb, self.camera_settings),
+            viewport_aspect,
+        );
         let parameters = resolve_camera_parameters_with_aspect(
             aabb,
             self.camera_settings,
             self.camera_controls.adjustments(),
-            self.camera_viewport_aspect(),
+            viewport_aspect,
         );
         self.anchor = parameters.baseline_target;
         self.camera.fov_y = parameters.frame.fov_y;

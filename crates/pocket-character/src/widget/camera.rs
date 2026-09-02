@@ -14,15 +14,14 @@ const MAX_RUNTIME_FOV_DELTA_DEG: f32 = 178.0;
 const MAX_RUNTIME_DISTANCE_DELTA: f32 = 10.0;
 const MAX_RUNTIME_PITCH_DEG: f32 = 89.0;
 
-/// UX safety envelope for the rest-bounds center. Values beyond one allow the
-/// center to leave the physical viewport while retaining finite stoppers.
-const PAN_WITNESS_SAFE_X_NDC: f32 = 1.8;
-const PAN_WITNESS_SAFE_Y_NDC: f32 = 3.0;
-/// When the authored zero-pan witness approaches or exceeds a nominal edge,
-/// retain input travel on its outward side. Rolled X needs substantially more
-/// room than Y without widening the ordinary zero-roll horizontal stopper.
-const PAN_X_BASELINE_OUTWARD_SLACK_NDC: f32 = 1.5;
-const PAN_Y_BASELINE_OUTWARD_SLACK_NDC: f32 = 0.5;
+/// Required visible fraction of the projected rest-bounds extent, subject to
+/// absolute NDC floor and ceiling limits.
+const PAN_VISIBLE_FRACTION: f32 = 0.25;
+const PAN_MIN_VISIBLE_OVERLAP_NDC: f32 = 0.10;
+const PAN_MAX_VISIBLE_OVERLAP_NDC: f32 = 0.45;
+const PAN_CLOSE_VISIBLE_OVERLAP_NDC: f32 = 0.25;
+const PAN_CLOSE_RELAX_START_EXTENT_NDC: f32 = 2.0;
+const PAN_CLOSE_RELAX_END_EXTENT_NDC: f32 = 5.0;
 const PAN_WITNESS_DEPTH_EPSILON_RATIO: f32 = 1.0e-5;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -63,6 +62,14 @@ impl CameraPanContext {
             desired_witness_delta_ndc,
         )
     }
+
+    pub(super) fn validate(
+        self,
+        adjustments: CameraRuntimeAdjustments,
+        viewport_aspect: f32,
+    ) -> CameraRuntimeAdjustments {
+        validate_pan(self.aabb, self.base_settings, adjustments, viewport_aspect)
+    }
 }
 
 /// Runtime-only camera deltas used by the temporary F8 validation controls.
@@ -75,9 +82,8 @@ pub(super) struct CameraRuntimeAdjustments {
     pub(super) fov_delta_deg: f32,
     pub(super) distance_scale_delta: f32,
     /// Additional projected displacement of the zero-pan baseline target.
-    /// Positive X is screen-right and positive Y is screen-up. Safety is
-    /// enforced only when admitting new pan input; camera resolution never
-    /// clamps or otherwise corrects this stored state.
+    /// Positive X is screen-right and positive Y is screen-up. Both axes use
+    /// projected rest-bounds safety and are revalidated when framing changes.
     pub(super) pan_ndc: Vec2,
     pub(super) yaw_deg: f32,
     pub(super) roll_deg: f32,
@@ -210,16 +216,6 @@ fn valid_viewport_aspect(viewport_aspect: f32) -> f32 {
     }
 }
 
-fn pan_witness_safe_limits(baseline_witness_ndc: Vec2) -> Vec2 {
-    Vec2::new(PAN_WITNESS_SAFE_X_NDC, PAN_WITNESS_SAFE_Y_NDC).max(
-        baseline_witness_ndc.abs()
-            + Vec2::new(
-                PAN_X_BASELINE_OUTWARD_SLACK_NDC,
-                PAN_Y_BASELINE_OUTWARD_SLACK_NDC,
-            ),
-    )
-}
-
 /// World translation needed for one NDC unit at the authored target plane.
 fn pan_world_per_ndc(distance: f32, fov_y: f32, viewport_aspect: f32) -> Vec2 {
     let aspect = valid_viewport_aspect(viewport_aspect);
@@ -257,21 +253,50 @@ fn sanitize_model_aabb((min, max): (Vec3, Vec3)) -> (Vec3, Vec3) {
     (min, max)
 }
 
-/// Resolve camera state in this order:
-///
-/// 1. Derive the baseline bounds/headroom target.
-/// 2. Apply runtime yaw, pitch, and roll to the baseline orbit orientation.
-/// 3. Derive screen-right and screen-up from that final orientation.
-/// 4. Translate both camera position and target by the stored NDC pan.
-///
-/// The camera basis is therefore never derived from a partially panned frame.
-/// The same path is used by live input and by re-framing after a resize.
-pub(super) fn resolve_camera_parameters_with_aspect(
+fn smoothstep(edge_start: f32, edge_end: f32, value: f32) -> f32 {
+    let t = ((value - edge_start) / (edge_end - edge_start)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn lerp(start: f32, end: f32, t: f32) -> f32 {
+    start + (end - start) * t
+}
+
+fn required_visible_overlap(projected_extent: f32) -> f32 {
+    let existing_hybrid_overlap = projected_extent.min(
+        (projected_extent * PAN_VISIBLE_FRACTION)
+            .clamp(PAN_MIN_VISIBLE_OVERLAP_NDC, PAN_MAX_VISIBLE_OVERLAP_NDC),
+    );
+    let t = smoothstep(
+        PAN_CLOSE_RELAX_START_EXTENT_NDC,
+        PAN_CLOSE_RELAX_END_EXTENT_NDC,
+        projected_extent,
+    );
+    let close_cap = lerp(
+        PAN_MAX_VISIBLE_OVERLAP_NDC,
+        PAN_CLOSE_VISIBLE_OVERLAP_NDC,
+        t,
+    );
+
+    existing_hybrid_overlap.min(close_cap)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CameraOrientation {
+    frame: CameraFrame,
+    baseline_target: Vec3,
+    camera: Camera,
+    distance: f32,
+}
+
+/// Resolve the effective orbit before applying pan. Keeping this separate
+/// lets the projected-bounds solver inspect the exact effective FOV,
+/// distance, yaw, pitch, and roll without recursing through pan resolution.
+fn resolve_camera_orientation(
     aabb: (Vec3, Vec3),
     base_settings: CameraSettings,
     adjustments: CameraRuntimeAdjustments,
-    viewport_aspect: f32,
-) -> CameraParameters {
+) -> CameraOrientation {
     let base_settings = base_settings.sanitized();
     let effective = adjustments.effective(base_settings);
     let authored_frame = resolve_camera_frame(aabb, base_settings);
@@ -304,31 +329,62 @@ pub(super) fn resolve_camera_parameters_with_aspect(
     orientation.pos = baseline_target - orientation.forward() * baseline_frame.distance;
 
     let distance = (baseline_target - orientation.pos).length();
-    let pan_ndc = effective.pan_ndc;
-    let world_pan = pan_ndc * pan_world_per_ndc(distance, baseline_frame.fov_y, viewport_aspect);
-    let screen_right = orientation.screen_right();
-    let screen_up = orientation.screen_up();
+
+    CameraOrientation {
+        frame: baseline_frame,
+        baseline_target,
+        camera: orientation,
+        distance,
+    }
+}
+
+/// Resolve camera state in this order:
+///
+/// 1. Derive the baseline bounds/headroom target.
+/// 2. Apply runtime yaw, pitch, and roll to the baseline orbit orientation.
+/// 3. Solve the projected-bounds-safe X and Y pan intervals for that exact
+///    effective camera state.
+/// 4. Correct either pan axis when necessary, then translate both camera
+///    position and target by the resulting NDC pan.
+///
+/// The camera basis is therefore never derived from a partially panned frame.
+/// The same path is used by live input and by re-framing after a resize.
+pub(super) fn resolve_camera_parameters_with_aspect(
+    aabb: (Vec3, Vec3),
+    base_settings: CameraSettings,
+    adjustments: CameraRuntimeAdjustments,
+    viewport_aspect: f32,
+) -> CameraParameters {
+    let adjustments = adjustments.sanitized();
+    let orientation = resolve_camera_orientation(aabb, base_settings, adjustments);
+    let aspect = valid_viewport_aspect(viewport_aspect);
+    let pan_ndc = validated_pan_ndc(aabb, orientation, adjustments.pan_ndc, aspect);
+    let world_pan =
+        pan_ndc * pan_world_per_ndc(orientation.distance, orientation.frame.fov_y, aspect);
+    let screen_right = orientation.camera.screen_right();
+    let screen_up = orientation.camera.screen_up();
     let requested_translation = -screen_right * world_pan.x - screen_up * world_pan.y;
     let translation = if requested_translation.is_finite() {
         requested_translation
     } else {
         Vec3::ZERO
     };
-    let position = orientation.pos + translation;
-    let mut frame = baseline_frame;
-    frame.target = baseline_target + translation;
+    let position = orientation.camera.pos + translation;
+    let mut frame = orientation.frame;
+    frame.target = orientation.baseline_target + translation;
 
     CameraParameters {
         frame,
-        baseline_target,
+        baseline_target: orientation.baseline_target,
         pan_ndc,
-        yaw_deg,
-        roll_deg,
-        pitch_deg,
+        yaw_deg: orientation.camera.yaw.to_degrees(),
+        roll_deg: orientation.camera.roll.to_degrees(),
+        pitch_deg: orientation.camera.pitch.to_degrees(),
         position,
     }
 }
 
+#[cfg(test)]
 fn camera_for_parameters(parameters: CameraParameters) -> Camera {
     let mut camera = Camera::default();
     camera.pos = parameters.position;
@@ -344,6 +400,218 @@ fn camera_for_parameters(parameters: CameraParameters) -> Camera {
 struct PanWitnessProjection {
     baseline_ndc: Vec2,
     response: f32,
+    pan_intervals: [PanInterval; 2],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PanInterval {
+    min: f32,
+    max: f32,
+}
+
+impl PanInterval {
+    fn is_valid(self) -> bool {
+        self.min.is_finite() && self.max.is_finite() && self.min <= self.max
+    }
+}
+
+fn rest_bounds_corners((min, max): (Vec3, Vec3)) -> [Vec3; 8] {
+    let min = Vec3::new(min.x.min(max.x), min.y.min(max.y), min.z.min(max.z));
+    let max = Vec3::new(max.x.max(min.x), max.y.max(min.y), max.z.max(min.z));
+
+    [
+        Vec3::new(min.x, min.y, min.z),
+        Vec3::new(min.x, min.y, max.z),
+        Vec3::new(min.x, max.y, min.z),
+        Vec3::new(min.x, max.y, max.z),
+        Vec3::new(max.x, min.y, min.z),
+        Vec3::new(max.x, min.y, max.z),
+        Vec3::new(max.x, max.y, min.z),
+        Vec3::new(max.x, max.y, max.z),
+    ]
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ProjectedCorner {
+    projected_ndc: Vec2,
+    response: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ProjectedRestBounds {
+    corners: [ProjectedCorner; 8],
+    extent: Vec2,
+}
+
+/// Project every rest-AABB corner once. The same projected coordinates and
+/// depth response feed the independent X and Y interval reductions below.
+fn project_rest_bounds(
+    camera: Camera,
+    distance: f32,
+    fov_y: f32,
+    aspect: f32,
+    corners: &[Vec3; 8],
+) -> Option<ProjectedRestBounds> {
+    if !distance.is_finite()
+        || distance <= 0.0
+        || !fov_y.is_finite()
+        || fov_y <= 0.0
+        || !aspect.is_finite()
+        || aspect <= 0.0
+    {
+        return None;
+    }
+
+    let view_proj = camera.view_proj(aspect);
+    let forward = camera.forward();
+    let depth_epsilon = distance * PAN_WITNESS_DEPTH_EPSILON_RATIO;
+    let mut projected_corners = [ProjectedCorner {
+        projected_ndc: Vec2::ZERO,
+        response: 0.0,
+    }; 8];
+    let mut min_ndc = Vec2::splat(f32::INFINITY);
+    let mut max_ndc = Vec2::splat(f32::NEG_INFINITY);
+
+    for (index, corner) in corners.iter().enumerate() {
+        let depth = (*corner - camera.pos).dot(forward);
+        if !depth.is_finite() || depth <= depth_epsilon {
+            return None;
+        }
+
+        let projected = view_proj.project_point3(*corner);
+        let projected_ndc = projected.truncate();
+        let response = distance / depth;
+        if !projected.is_finite()
+            || !projected_ndc.is_finite()
+            || !response.is_finite()
+            || response <= 0.0
+        {
+            return None;
+        }
+
+        projected_corners[index] = ProjectedCorner {
+            projected_ndc,
+            response,
+        };
+        min_ndc = min_ndc.min(projected_ndc);
+        max_ndc = max_ndc.max(projected_ndc);
+    }
+
+    let extent = max_ndc - min_ndc;
+    if !min_ndc.is_finite()
+        || !max_ndc.is_finite()
+        || !extent.is_finite()
+        || extent.min_element() < 0.0
+    {
+        return None;
+    }
+
+    Some(ProjectedRestBounds {
+        corners: projected_corners,
+        extent,
+    })
+}
+
+fn projected_pan_interval(projected: &ProjectedRestBounds, axis: usize) -> Option<PanInterval> {
+    let required_overlap = required_visible_overlap(projected.extent[axis]);
+    if !required_overlap.is_finite() || required_overlap < 0.0 {
+        return None;
+    }
+
+    let viewport_min = -1.0 + required_overlap;
+    let viewport_max = 1.0 - required_overlap;
+    let mut min_pan = f32::INFINITY;
+    let mut max_pan = f32::NEG_INFINITY;
+
+    for corner in projected.corners {
+        let coordinate = corner.projected_ndc[axis];
+        let response = corner.response;
+        min_pan = min_pan.min((viewport_min - coordinate) / response);
+        max_pan = max_pan.max((viewport_max - coordinate) / response);
+    }
+
+    let interval = PanInterval {
+        min: min_pan,
+        max: max_pan,
+    };
+    interval.is_valid().then_some(interval)
+}
+
+fn projected_pan_intervals(
+    camera: Camera,
+    distance: f32,
+    fov_y: f32,
+    aspect: f32,
+    corners: &[Vec3; 8],
+) -> Option<[PanInterval; 2]> {
+    let projected = project_rest_bounds(camera, distance, fov_y, aspect, corners)?;
+    Some([
+        projected_pan_interval(&projected, 0)?,
+        projected_pan_interval(&projected, 1)?,
+    ])
+}
+
+fn pan_intervals_for_effective_state(
+    aabb: (Vec3, Vec3),
+    orientation: CameraOrientation,
+    aspect: f32,
+) -> Option<[PanInterval; 2]> {
+    if !aabb_is_finite(aabb) {
+        return None;
+    }
+
+    projected_pan_intervals(
+        orientation.camera,
+        orientation.distance,
+        orientation.frame.fov_y,
+        aspect,
+        &rest_bounds_corners(sanitize_model_aabb(aabb)),
+    )
+}
+
+fn clamp_pan_axis(pan_ndc: f32, interval: PanInterval) -> f32 {
+    if pan_ndc.is_finite() && interval.is_valid() {
+        pan_ndc.clamp(interval.min, interval.max)
+    } else {
+        pan_ndc
+    }
+}
+
+fn validated_pan_ndc(
+    aabb: (Vec3, Vec3),
+    orientation: CameraOrientation,
+    pan_ndc: Vec2,
+    aspect: f32,
+) -> Vec2 {
+    let Some(intervals) = pan_intervals_for_effective_state(aabb, orientation, aspect) else {
+        return pan_ndc;
+    };
+
+    Vec2::new(
+        clamp_pan_axis(pan_ndc.x, intervals[0]),
+        clamp_pan_axis(pan_ndc.y, intervals[1]),
+    )
+}
+
+fn validate_pan(
+    aabb: (Vec3, Vec3),
+    base_settings: CameraSettings,
+    adjustments: CameraRuntimeAdjustments,
+    viewport_aspect: f32,
+) -> CameraRuntimeAdjustments {
+    let adjustments = adjustments.sanitized();
+    let orientation = resolve_camera_orientation(aabb, base_settings, adjustments);
+    let pan_ndc = validated_pan_ndc(
+        aabb,
+        orientation,
+        adjustments.pan_ndc,
+        valid_viewport_aspect(viewport_aspect),
+    );
+
+    CameraRuntimeAdjustments {
+        pan_ndc,
+        ..adjustments
+    }
 }
 
 /// Project the sanitized rest-bounds center through the current zero-pan
@@ -362,13 +630,12 @@ fn resolve_pan_witness_projection(
     let aspect = valid_viewport_aspect(viewport_aspect);
     let mut zero_pan_adjustments = adjustments.sanitized();
     zero_pan_adjustments.pan_ndc = Vec2::ZERO;
-    let zero_pan =
-        resolve_camera_parameters_with_aspect(aabb, base_settings, zero_pan_adjustments, aspect);
-    let camera = camera_for_parameters(zero_pan);
+    let zero_pan = resolve_camera_orientation(aabb, base_settings, zero_pan_adjustments);
+    let camera = zero_pan.camera;
     let (min, max) = sanitize_model_aabb(aabb);
     let witness = (min + max) * 0.5;
-    let distance = (zero_pan.baseline_target - zero_pan.position).length();
-    let depth = (witness - zero_pan.position).dot(camera.forward());
+    let distance = zero_pan.distance;
+    let depth = (witness - zero_pan.camera.pos).dot(camera.forward());
     let depth_epsilon = distance * PAN_WITNESS_DEPTH_EPSILON_RATIO;
     if !distance.is_finite() || distance <= 0.0 || !depth.is_finite() || depth <= depth_epsilon {
         return None;
@@ -380,48 +647,45 @@ fn resolve_pan_witness_projection(
         return None;
     }
 
+    let pan_intervals = pan_intervals_for_effective_state(aabb, zero_pan, aspect)?;
+
     Some(PanWitnessProjection {
         baseline_ndc,
         response,
+        pan_intervals,
     })
 }
 
 fn admit_pan_axis(
     current_pan_ndc: f32,
     desired_witness_delta_ndc: f32,
-    baseline_witness_ndc: f32,
     response: f32,
-    safe_limit_ndc: f32,
+    interval: PanInterval,
 ) -> f32 {
     if desired_witness_delta_ndc == 0.0 {
         return current_pan_ndc;
     }
     if !current_pan_ndc.is_finite()
         || !desired_witness_delta_ndc.is_finite()
-        || !baseline_witness_ndc.is_finite()
         || !response.is_finite()
         || response <= 0.0
-        || !safe_limit_ndc.is_finite()
-        || safe_limit_ndc <= 0.0
+        || !interval.is_valid()
     {
         return current_pan_ndc;
     }
 
-    let current_witness_ndc = baseline_witness_ndc + response * current_pan_ndc;
-    let requested_witness_ndc = current_witness_ndc + desired_witness_delta_ndc;
-    if !current_witness_ndc.is_finite() || !requested_witness_ndc.is_finite() {
+    // Correct stale state before admitting any new movement. This keeps the
+    // same projected-bounds interval invariant for both input and reframe.
+    let current_pan_ndc = clamp_pan_axis(current_pan_ndc, interval);
+    // Pan input is expressed in the rest-center witness space. Convert it to
+    // stored target-plane NDC so perspective does not change the input rate.
+    let delta_pan_ndc = desired_witness_delta_ndc / response;
+    let requested_pan_ndc = current_pan_ndc + delta_pan_ndc;
+    if !requested_pan_ndc.is_finite() {
         return current_pan_ndc;
     }
 
-    let (min_next, max_next) = if current_witness_ndc > safe_limit_ndc {
-        (-safe_limit_ndc, current_witness_ndc)
-    } else if current_witness_ndc < -safe_limit_ndc {
-        (current_witness_ndc, safe_limit_ndc)
-    } else {
-        (-safe_limit_ndc, safe_limit_ndc)
-    };
-    let next_witness_ndc = requested_witness_ndc.clamp(min_next, max_next);
-    let next_pan_ndc = (next_witness_ndc - baseline_witness_ndc) / response;
+    let next_pan_ndc = requested_pan_ndc.clamp(interval.min, interval.max);
     if next_pan_ndc.is_finite() {
         next_pan_ndc
     } else {
@@ -429,8 +693,9 @@ fn admit_pan_axis(
     }
 }
 
-/// Admit only the newly requested witness-space movement. Existing stored pan
-/// is grandfathered across every camera reframe and orientation change.
+/// Admit newly requested witness-space movement against the current camera
+/// policy, correcting stale state when the shared interval solver says it is
+/// outside the valid range.
 pub(super) fn admit_pan_input(
     aabb: (Vec3, Vec3),
     base_settings: CameraSettings,
@@ -439,30 +704,23 @@ pub(super) fn admit_pan_input(
     desired_witness_delta_ndc: Vec2,
 ) -> Vec2 {
     let current = adjustments.sanitized().pan_ndc;
-    if desired_witness_delta_ndc == Vec2::ZERO {
-        return current;
-    }
     let Some(projection) =
         resolve_pan_witness_projection(aabb, base_settings, adjustments, viewport_aspect)
     else {
         return current;
     };
-    let safe_limits = pan_witness_safe_limits(projection.baseline_ndc);
-
     Vec2::new(
         admit_pan_axis(
             current.x,
             desired_witness_delta_ndc.x,
-            projection.baseline_ndc.x,
             projection.response,
-            safe_limits.x,
+            projection.pan_intervals[0],
         ),
         admit_pan_axis(
             current.y,
             desired_witness_delta_ndc.y,
-            projection.baseline_ndc.y,
             projection.response,
-            safe_limits.y,
+            projection.pan_intervals[1],
         ),
     )
 }
