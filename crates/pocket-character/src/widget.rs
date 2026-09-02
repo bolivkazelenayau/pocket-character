@@ -27,9 +27,11 @@ use pocket3d::winit::keyboard::KeyCode;
 use crate::guest::{CharacterGuest, Command, TickEvent, TickState};
 use crate::settings::{AntiAliasingPreference, AppSettings, CameraSettings};
 
+mod aa;
 mod camera;
 mod diagnostics;
 
+use aa::AaRuntime;
 #[cfg(test)]
 use camera::CameraRuntimeAdjustments;
 use camera::controls::CameraControls;
@@ -81,13 +83,7 @@ pub struct Widget {
     debug_hud_enabled: bool,
     debug_gpu_name: String,
     debug_backend: String,
-    debug_requested_msaa: u32,
-    debug_effective_msaa: u32,
-    debug_smaa_enabled: bool,
-    requested_msaa: u32,
-    pending_msaa_request: Option<u32>,
-    requested_smaa: bool,
-    pending_smaa_request: Option<bool>,
+    aa: AaRuntime,
     tick_count: u64,
     hovered: bool,
     pending_events: Vec<TickEvent>,
@@ -161,13 +157,7 @@ impl Widget {
             debug_hud_enabled: false,
             debug_gpu_name: "unknown".into(),
             debug_backend: "unknown".into(),
-            debug_requested_msaa: requested_msaa,
-            debug_effective_msaa: 1,
-            debug_smaa_enabled: requested_smaa,
-            requested_msaa,
-            pending_msaa_request: None,
-            requested_smaa,
-            pending_smaa_request: None,
+            aa: AaRuntime::new(requested_msaa, requested_smaa),
             tick_count: 0,
             hovered: false,
             pending_events: Vec::new(),
@@ -300,12 +290,15 @@ impl Game for Widget {
         let adapter_info = gpu.adapter.get_info();
         self.debug_gpu_name = adapter_info.name;
         self.debug_backend = format!("{:?}", adapter_info.backend);
-        self.requested_msaa = renderer.requested_sample_count();
-        self.debug_requested_msaa = self.requested_msaa;
-        self.debug_effective_msaa = renderer.effective_sample_count();
+        self.aa.initialize_msaa_from_renderer(
+            renderer.requested_sample_count(),
+            renderer.effective_sample_count(),
+        );
         renderer.set_smaa_enabled(gpu, self.settings.rendering.smaa_enabled);
-        self.requested_smaa = self.settings.rendering.smaa_enabled;
-        self.debug_smaa_enabled = renderer.smaa_enabled();
+        self.aa.initialize_smaa_from_renderer(
+            self.settings.rendering.smaa_enabled,
+            renderer.smaa_enabled(),
+        );
 
         // 2048 halves the 4096² authoring textures: invisible at 450×600,
         // and GPU texture memory is the widget's dominant footprint.
@@ -394,12 +387,10 @@ impl Game for Widget {
             self.debug_hud_enabled = !self.debug_hud_enabled;
         }
         if input.key_pressed(KeyCode::F4) {
-            self.requested_msaa = next_msaa_sample_count(self.requested_msaa);
-            self.pending_msaa_request = Some(self.requested_msaa);
+            self.aa.request_next_msaa();
         }
         if input.key_pressed(KeyCode::F5) {
-            self.requested_smaa = !self.requested_smaa;
-            self.pending_smaa_request = Some(self.requested_smaa);
+            self.aa.request_smaa_toggle();
         }
         // Temporary F8 validation controls are never written to AppSettings.
         let camera_changed = self.camera_controls.apply_frame(
@@ -517,18 +508,16 @@ impl Game for Widget {
     }
 
     fn prepare_render(&mut self, gpu: &Gpu, renderer: &mut Renderer) {
-        let requested_msaa = self.pending_msaa_request.take();
-        let requested_smaa = self.pending_smaa_request.take();
-        if requested_msaa.is_none() && requested_smaa.is_none() {
+        let requests = self.aa.take_pending_requests();
+        if requests.is_empty() {
             return;
         }
 
         let mut accepted_msaa = None;
-        if let Some(requested) = requested_msaa {
+        if let Some(requested) = requests.msaa {
             renderer.set_requested_sample_count(gpu, requested);
-            if renderer.requested_sample_count() == requested {
-                accepted_msaa = Some(requested);
-            } else {
+            accepted_msaa = requests.accepted_msaa(renderer.requested_sample_count());
+            if accepted_msaa.is_none() {
                 log::warn!(
                     "renderer rejected requested MSAA {}; keeping persisted preference",
                     diagnostics::format_msaa_count(requested)
@@ -536,11 +525,10 @@ impl Game for Widget {
             }
         }
         let mut accepted_smaa = None;
-        if let Some(enabled) = requested_smaa {
+        if let Some(enabled) = requests.smaa {
             renderer.set_smaa_enabled(gpu, enabled);
-            if renderer.smaa_enabled() == enabled {
-                accepted_smaa = Some(enabled);
-            } else {
+            accepted_smaa = requests.accepted_smaa(renderer.smaa_enabled());
+            if accepted_smaa.is_none() {
                 log::warn!(
                     "renderer rejected requested SMAA {}; keeping persisted preference",
                     if enabled { "on" } else { "off" }
@@ -548,17 +536,18 @@ impl Game for Widget {
             }
         }
 
-        self.requested_msaa = renderer.requested_sample_count();
-        self.debug_requested_msaa = self.requested_msaa;
-        self.debug_effective_msaa = renderer.effective_sample_count();
-        self.requested_smaa = renderer.smaa_enabled();
-        self.debug_smaa_enabled = self.requested_smaa;
+        self.aa.sync_after_application(
+            renderer.requested_sample_count(),
+            renderer.effective_sample_count(),
+            renderer.smaa_enabled(),
+        );
         self.commit_accepted_aa_preferences(accepted_msaa, accepted_smaa);
+        let aa = self.aa.status();
         log::info!(
             "AA: requested {}, effective MSAA {}, SMAA {}",
-            diagnostics::format_msaa_count(self.debug_requested_msaa),
-            diagnostics::format_msaa_count(self.debug_effective_msaa),
-            if self.debug_smaa_enabled { "on" } else { "off" }
+            diagnostics::format_msaa_count(aa.requested_msaa),
+            diagnostics::format_msaa_count(aa.effective_msaa),
+            if aa.smaa_enabled { "on" } else { "off" }
         );
     }
 
@@ -617,16 +606,6 @@ impl Widget {
     }
 }
 
-fn next_msaa_sample_count(requested: u32) -> u32 {
-    match requested {
-        1 => 2,
-        2 => 4,
-        4 => 8,
-        8 => 1,
-        _ => 2,
-    }
-}
-
 impl Widget {
     fn compose_debug_hud(&mut self, size: (u32, u32)) {
         const X: f32 = 14.0;
@@ -636,15 +615,16 @@ impl Widget {
         const PANEL_TOP: f32 = 8.0;
         const PANEL_PADDING: f32 = 8.0;
 
+        let aa = self.aa.status();
         let text = diagnostics::format_debug_hud(
             size,
             &self.stats,
             &self.render_fps,
             &self.debug_gpu_name,
             &self.debug_backend,
-            self.debug_requested_msaa,
-            self.debug_effective_msaa,
-            self.debug_smaa_enabled,
+            aa.requested_msaa,
+            aa.effective_msaa,
+            aa.smaa_enabled,
             self.effective_camera_values(),
             self.camera_controls.camera_controls_enabled(),
         );
@@ -950,22 +930,22 @@ mod tests {
 
         input.inject_key(KeyCode::F4, true);
         widget.frame(0.0, &input);
-        assert_eq!(widget.requested_msaa, 2);
-        assert_eq!(widget.pending_msaa_request, Some(2));
+        assert_eq!(widget.aa.status().requested_msaa, 2);
+        assert_eq!(widget.aa.pending_requests().msaa, Some(2));
 
         input.end_frame();
         assert!(input.key_down(KeyCode::F4));
         assert!(!input.key_pressed(KeyCode::F4));
         widget.frame(0.0, &input);
-        assert_eq!(widget.requested_msaa, 2);
-        assert_eq!(widget.pending_msaa_request, Some(2));
+        assert_eq!(widget.aa.status().requested_msaa, 2);
+        assert_eq!(widget.aa.pending_requests().msaa, Some(2));
 
         input.inject_key(KeyCode::F4, false);
         input.end_frame();
         input.inject_key(KeyCode::F4, true);
         widget.frame(0.0, &input);
-        assert_eq!(widget.requested_msaa, 4);
-        assert_eq!(widget.pending_msaa_request, Some(4));
+        assert_eq!(widget.aa.status().requested_msaa, 4);
+        assert_eq!(widget.aa.pending_requests().msaa, Some(4));
     }
 
     #[test]
@@ -973,27 +953,27 @@ mod tests {
         let mut widget = test_widget();
         let mut input = Input::default();
 
-        assert!(!widget.requested_smaa);
-        assert_eq!(widget.pending_smaa_request, None);
+        assert!(!widget.aa.requested_smaa());
+        assert_eq!(widget.aa.pending_requests().smaa, None);
 
         input.inject_key(KeyCode::F5, true);
         widget.frame(0.0, &input);
-        assert!(widget.requested_smaa);
-        assert_eq!(widget.pending_smaa_request, Some(true));
+        assert!(widget.aa.requested_smaa());
+        assert_eq!(widget.aa.pending_requests().smaa, Some(true));
 
         input.end_frame();
         assert!(input.key_down(KeyCode::F5));
         assert!(!input.key_pressed(KeyCode::F5));
         widget.frame(0.0, &input);
-        assert!(widget.requested_smaa);
-        assert_eq!(widget.pending_smaa_request, Some(true));
+        assert!(widget.aa.requested_smaa());
+        assert_eq!(widget.aa.pending_requests().smaa, Some(true));
 
         input.inject_key(KeyCode::F5, false);
         input.end_frame();
         input.inject_key(KeyCode::F5, true);
         widget.frame(0.0, &input);
-        assert!(!widget.requested_smaa);
-        assert_eq!(widget.pending_smaa_request, Some(false));
+        assert!(!widget.aa.requested_smaa());
+        assert_eq!(widget.aa.pending_requests().smaa, Some(false));
     }
 
     #[test]
@@ -1008,10 +988,11 @@ mod tests {
         };
         let widget = Widget::new_with_settings_path(test_config(), settings, None);
 
-        assert_eq!(widget.requested_msaa, 8);
-        assert!(widget.requested_smaa);
-        assert_eq!(widget.pending_msaa_request, None);
-        assert_eq!(widget.pending_smaa_request, None);
+        let aa = widget.aa.status();
+        assert_eq!(aa.requested_msaa, 8);
+        assert!(widget.aa.requested_smaa());
+        assert_eq!(widget.aa.pending_requests().msaa, None);
+        assert_eq!(widget.aa.pending_requests().smaa, None);
     }
 
     #[test]
@@ -1019,8 +1000,8 @@ mod tests {
         let widget = test_widget();
 
         assert!(widget.settings_path.is_none());
-        assert_eq!(widget.requested_msaa, 1);
-        assert!(!widget.requested_smaa);
+        assert_eq!(widget.aa.status().requested_msaa, 1);
+        assert!(!widget.aa.requested_smaa());
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1112,8 +1093,7 @@ mod tests {
         )
         .unwrap();
         let mut widget = test_widget();
-        widget.requested_smaa = true;
-        widget.pending_smaa_request = Some(true);
+        widget.aa.request_smaa_toggle();
 
         let requested_msaa = renderer.requested_sample_count();
         let effective_msaa = renderer.effective_sample_count();
@@ -1122,26 +1102,16 @@ mod tests {
         assert!(renderer.smaa_enabled());
         assert_eq!(renderer.requested_sample_count(), requested_msaa);
         assert_eq!(renderer.effective_sample_count(), effective_msaa);
-        assert!(widget.debug_smaa_enabled);
-        assert_eq!(widget.pending_smaa_request, None);
+        assert!(widget.aa.status().smaa_enabled);
+        assert_eq!(widget.aa.pending_requests().smaa, None);
 
-        widget.requested_smaa = false;
-        widget.pending_smaa_request = Some(false);
+        widget.aa.request_smaa_toggle();
         widget.prepare_render(&gpu, &mut renderer);
 
         assert!(!renderer.smaa_enabled());
         assert_eq!(renderer.requested_sample_count(), requested_msaa);
         assert_eq!(renderer.effective_sample_count(), effective_msaa);
-        assert!(!widget.debug_smaa_enabled);
-    }
-
-    #[test]
-    fn msaa_cycle_wraps_and_sanitizes() {
-        assert_eq!(next_msaa_sample_count(1), 2);
-        assert_eq!(next_msaa_sample_count(2), 4);
-        assert_eq!(next_msaa_sample_count(4), 8);
-        assert_eq!(next_msaa_sample_count(8), 1);
-        assert_eq!(next_msaa_sample_count(16), 2);
+        assert!(!widget.aa.status().smaa_enabled);
     }
 
     #[test]
