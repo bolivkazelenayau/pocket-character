@@ -708,6 +708,24 @@ fn horizontal_interval(
     pan_intervals(aabb, settings, adjustments, aspect)[0]
 }
 
+fn full_rest_horizontal_interval(
+    aabb: (Vec3, Vec3),
+    settings: CameraSettings,
+    adjustments: CameraRuntimeAdjustments,
+    aspect: f32,
+) -> PanInterval {
+    let orientation = resolve_camera_orientation(aabb, settings, adjustments);
+    let projected = project_rest_bounds(
+        orientation.camera,
+        orientation.distance,
+        orientation.frame.fov_y,
+        aspect,
+        &rest_bounds_corners(sanitize_model_aabb(aabb)),
+    )
+    .unwrap();
+    projected_pan_interval(&projected, 0).unwrap()
+}
+
 fn pan_intervals(
     aabb: (Vec3, Vec3),
     settings: CameraSettings,
@@ -1872,7 +1890,89 @@ fn projected_bounds_use_fraction_floor_and_ceiling() {
     assert_eq!(required_visible_overlap(0.20), 0.10);
     assert_eq!(required_visible_overlap(0.40), 0.10);
     assert_eq!(required_visible_overlap(1.00), 0.25);
-    approx_eq(required_visible_overlap(3.00), 0.39814815);
+    approx_eq(required_visible_overlap(3.00), 0.41296296);
+    approx_eq(required_visible_overlap(5.00), 0.45);
+    approx_eq(required_visible_overlap(10.00), 0.45);
+}
+
+#[test]
+fn horizontal_core_uses_configured_width_fraction() {
+    let (min, max) = horizontal_core_aabb(standard_pan_aabb());
+    approx_vec3(min, Vec3::new(-0.04, 0.0, -0.2));
+    approx_vec3(max, Vec3::new(0.24, 1.8, 0.4));
+    let (aabb_min, aabb_max) = standard_pan_aabb();
+    let full_width = aabb_max.x - aabb_min.x;
+    let core_width = max.x - min.x;
+    approx_eq(
+        core_width / full_width,
+        2.0 * PAN_X_CORE_HALF_WIDTH_FRACTION,
+    );
+    approx_eq(PAN_X_CORE_HALF_WIDTH_FRACTION, 0.140);
+}
+
+#[test]
+fn zero_roll_horizontal_core_stays_visible_across_zoom_and_aspect() {
+    let aabb = standard_pan_aabb();
+    let core = horizontal_core_aabb(sanitize_model_aabb(aabb));
+    let settings = CameraSettings::default();
+
+    for aspect in [540.0 / 960.0, DEFAULT_VIEWPORT_ASPECT, 1920.0 / 1080.0] {
+        for distance_scale in [0.30, 0.60, 1.20] {
+            let pose = CameraRuntimeAdjustments {
+                distance_scale_delta: distance_scale - settings.distance_scale,
+                ..Default::default()
+            };
+            let zero = resolve_camera_parameters_with_aspect(aabb, settings, pose, aspect);
+            let zero_core_bounds = projected_rest_bounds_axis(zero, core, aspect, 0);
+            let required = required_core_visible_overlap(zero_core_bounds.1 - zero_core_bounds.0);
+            let constrained = horizontal_interval(aabb, settings, pose, aspect);
+            let full_rest = full_rest_horizontal_interval(aabb, settings, pose, aspect);
+            assert!(
+                constrained.min > full_rest.min && constrained.max < full_rest.max,
+                "aspect={aspect}, distance={distance_scale}, core={constrained:?}, full={full_rest:?}"
+            );
+
+            for direction in [-1.0, 1.0] {
+                let admitted = adjustments_after_pan_input(
+                    aabb,
+                    settings,
+                    pose,
+                    aspect,
+                    Vec2::new(direction * 100.0, 0.0),
+                );
+                let stopped =
+                    resolve_camera_parameters_with_aspect(aabb, settings, admitted, aspect);
+                let bounds = projected_rest_bounds_axis(stopped, core, aspect, 0);
+                let overlap = (bounds.1.min(1.0) - bounds.0.max(-1.0)).max(0.0);
+                assert!(
+                    overlap >= required.min(bounds.1 - bounds.0) - 1.0e-4,
+                    "aspect={aspect}, distance={distance_scale}, direction={direction}, bounds={bounds:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn roll_90_horizontal_core_preserves_full_height_traversal() {
+    let aabb = standard_pan_aabb();
+    let settings = CameraSettings::default();
+
+    for aspect in [540.0 / 960.0, DEFAULT_VIEWPORT_ASPECT, 1920.0 / 1080.0] {
+        for distance_scale in [0.30, 0.60, 1.20] {
+            for roll_deg in [-90.0, 90.0] {
+                let pose = CameraRuntimeAdjustments {
+                    distance_scale_delta: distance_scale - settings.distance_scale,
+                    roll_deg,
+                    ..Default::default()
+                };
+                let constrained = horizontal_interval(aabb, settings, pose, aspect);
+                let full_rest = full_rest_horizontal_interval(aabb, settings, pose, aspect);
+                approx_eq(constrained.min, full_rest.min);
+                approx_eq(constrained.max, full_rest.max);
+            }
+        }
+    }
 }
 
 #[test]
@@ -1893,12 +1993,111 @@ fn close_zoom_ceiling_reaches_the_close_cap_at_or_above_end_extent() {
             PAN_CLOSE_VISIBLE_OVERLAP_NDC,
         );
     }
+    assert_eq!(PAN_CLOSE_VISIBLE_OVERLAP_NDC, 0.45);
+}
+
+#[test]
+fn horizontal_core_ignores_close_strengthening() {
+    for extent in [0.05, 0.20, 0.40, 1.00, 1.80, 2.00, 3.00, 5.00, 10.00] {
+        approx_eq(
+            required_core_visible_overlap(extent),
+            existing_hybrid_visible_overlap(extent),
+        );
+    }
+    approx_eq(required_core_visible_overlap(3.00), 0.40);
+    approx_eq(required_core_visible_overlap(5.00), 0.40);
+    approx_eq(required_core_visible_overlap(10.00), 0.40);
+}
+
+#[test]
+fn full_bounds_close_requirement_is_axis_neutral() {
+    // The full-bounds policy is a single shared function of projected extent.
+    // There must be no per-axis close constants: the same extent demands the
+    // same overlap on X and Y, so roll=90 (which swaps anatomical axes) can
+    // not change the safety policy.
+    for extent in [0.40, 1.00, 2.00, 3.00, 5.00, 10.00] {
+        approx_eq(
+            required_visible_overlap(extent),
+            required_visible_overlap(extent),
+        );
+        assert!(
+            required_core_visible_overlap(extent) <= required_visible_overlap(extent) + 1.0e-6
+                || extent <= PAN_CLOSE_STRENGTHEN_START_EXTENT_NDC + 1.0e-6
+        );
+    }
+
+    let aabb = standard_pan_aabb();
+    let settings = CameraSettings::default();
+    let aspect = 540.0 / 960.0;
+    for roll_deg in [0.0, 90.0, -90.0] {
+        let pose = CameraRuntimeAdjustments {
+            roll_deg,
+            ..Default::default()
+        };
+        let zero = resolve_camera_parameters_with_aspect(aabb, settings, pose, aspect);
+        for axis in 0..2 {
+            let bounds = projected_rest_bounds_axis(zero, aabb, aspect, axis);
+            let required = required_visible_overlap(bounds.1 - bounds.0);
+            for direction in [-1.0, 1.0] {
+                let mut request = Vec2::ZERO;
+                request[axis] = direction * 100.0;
+                let admitted = adjustments_after_pan_input(aabb, settings, pose, aspect, request);
+                let stopped =
+                    resolve_camera_parameters_with_aspect(aabb, settings, admitted, aspect);
+                let final_bounds = projected_rest_bounds_axis(stopped, aabb, aspect, axis);
+                let overlap = (final_bounds.1.min(1.0) - final_bounds.0.max(-1.0)).max(0.0);
+                assert!(
+                    overlap >= required.min(final_bounds.1 - final_bounds.0) - 1.0e-4,
+                    "roll={roll_deg}, axis={axis}, direction={direction}, bounds={final_bounds:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn admission_and_revalidation_share_close_requirements() {
+    let aabb = standard_pan_aabb();
+    let settings = CameraSettings::default();
+    let aspect = DEFAULT_VIEWPORT_ASPECT;
+    let close_pose = CameraRuntimeAdjustments {
+        distance_scale_delta: 0.30 - settings.distance_scale,
+        ..Default::default()
+    };
+    let intervals = pan_intervals(aabb, settings, close_pose, aspect);
+    for axis in 0..2 {
+        for direction in [-1.0, 1.0] {
+            let mut request = Vec2::ZERO;
+            request[axis] = direction * 10.0;
+            let admitted = adjustments_after_pan_input(aabb, settings, close_pose, aspect, request);
+            let expected = if direction < 0.0 {
+                intervals[axis].min
+            } else {
+                intervals[axis].max
+            };
+            approx_eq(admitted.pan_ndc[axis], expected);
+        }
+    }
+    // Revalidation of the admitted stopper must be a no-op: both paths use
+    // the same required_visible_overlap / required_core_visible_overlap.
+    for axis in 0..2 {
+        for endpoint in [intervals[axis].min, intervals[axis].max] {
+            let mut stored_pan = Vec2::ZERO;
+            stored_pan[axis] = endpoint;
+            let stored = CameraRuntimeAdjustments {
+                pan_ndc: stored_pan,
+                ..close_pose
+            };
+            let resolved = resolve_camera_parameters_with_aspect(aabb, settings, stored, aspect);
+            assert_eq!(resolved.pan_ndc, stored_pan);
+        }
+    }
 }
 
 #[test]
 fn close_zoom_ceiling_transition_is_continuous_and_monotonic() {
-    let start = PAN_CLOSE_RELAX_START_EXTENT_NDC;
-    let end = PAN_CLOSE_RELAX_END_EXTENT_NDC;
+    let start = PAN_CLOSE_STRENGTHEN_START_EXTENT_NDC;
+    let end = PAN_CLOSE_STRENGTHEN_END_EXTENT_NDC;
     let before_start = required_visible_overlap(start - 1.0e-4);
     let at_start = required_visible_overlap(start);
     let at_end = required_visible_overlap(end);
@@ -1912,8 +2111,8 @@ fn close_zoom_ceiling_transition_is_continuous_and_monotonic() {
     for index in 1..=300 {
         let extent = start + (end - start) * index as f32 / 300.0;
         let current = required_visible_overlap(extent);
-        assert!(current <= previous + 1.0e-6, "{previous} -> {current}");
-        largest_step = largest_step.max(previous - current);
+        assert!(current + 1.0e-6 >= previous, "{previous} -> {current}");
+        largest_step = largest_step.max(current - previous);
         previous = current;
     }
     assert!(
@@ -1923,7 +2122,7 @@ fn close_zoom_ceiling_transition_is_continuous_and_monotonic() {
 }
 
 #[test]
-fn close_zoom_relaxes_the_vertical_interval_and_gains_travel() {
+fn close_zoom_strengthens_the_vertical_interval_and_reduces_travel() {
     let aabb = standard_pan_aabb();
     let settings = CameraSettings::default();
     let aspect = DEFAULT_VIEWPORT_ASPECT;
@@ -1934,21 +2133,24 @@ fn close_zoom_relaxes_the_vertical_interval_and_gains_travel() {
     let zero = resolve_camera_parameters_with_aspect(aabb, settings, close_pose, aspect);
     let bounds = projected_rest_bounds_y(zero, aabb, aspect);
     let extent = bounds.1 - bounds.0;
-    assert!(extent >= PAN_CLOSE_RELAX_END_EXTENT_NDC, "extent={extent}");
+    assert!(
+        extent >= PAN_CLOSE_STRENGTHEN_END_EXTENT_NDC,
+        "extent={extent}"
+    );
     assert_eq!(
         required_visible_overlap(extent),
         PAN_CLOSE_VISIBLE_OVERLAP_NDC
     );
 
-    let tapered = vertical_interval(aabb, settings, close_pose, aspect);
+    let strengthened = vertical_interval(aabb, settings, close_pose, aspect);
     let legacy = legacy_vertical_interval(aabb, settings, close_pose, aspect);
     assert!(
-        tapered.min < legacy.min,
-        "legacy={legacy:?}, tapered={tapered:?}"
+        strengthened.min > legacy.min,
+        "legacy={legacy:?}, strengthened={strengthened:?}"
     );
     assert!(
-        tapered.max > legacy.max,
-        "legacy={legacy:?}, tapered={tapered:?}"
+        strengthened.max < legacy.max,
+        "legacy={legacy:?}, strengthened={strengthened:?}"
     );
 }
 
@@ -1966,7 +2168,7 @@ fn far_zoom_vertical_intervals_remain_unchanged() {
         let zero = resolve_camera_parameters_with_aspect(aabb, settings, pose, aspect);
         let bounds = projected_rest_bounds_y(zero, aabb, aspect);
         assert!(
-            bounds.1 - bounds.0 <= PAN_CLOSE_RELAX_START_EXTENT_NDC,
+            bounds.1 - bounds.0 <= PAN_CLOSE_STRENGTHEN_START_EXTENT_NDC,
             "distance_scale={distance_scale}, bounds={bounds:?}"
         );
 
@@ -2070,8 +2272,8 @@ fn projected_interval_regression_values_match_audit_cases() {
             0.0,
             0.0,
             0.0,
-            (-3.2196314, 3.2196317),
-            (-1.7667506, 4.729045),
+            (-1.3998301, 1.3998303),
+            (-1.5111949, 4.4734893),
         ),
         (
             "portrait roll +90 baseline",
@@ -2080,8 +2282,8 @@ fn projected_interval_regression_values_match_audit_cases() {
             0.0,
             90.0,
             0.0,
-            (-7.6618204, 2.39552),
-            (-2.1053987, 2.105399),
+            (-7.4062653, 2.1399643),
+            (-2.0059867, 2.0059869),
         ),
         (
             "portrait roll -90 baseline",
@@ -2090,8 +2292,8 @@ fn projected_interval_regression_values_match_audit_cases() {
             0.0,
             -90.0,
             0.0,
-            (-2.39552, 7.6618204),
-            (-2.105399, 2.1053987),
+            (-2.1399643, 7.4062653),
+            (-2.0059872, 2.0059867),
         ),
         (
             "portrait roll +90 far",
@@ -2100,7 +2302,7 @@ fn projected_interval_regression_values_match_audit_cases() {
             0.0,
             90.0,
             2.0 - settings.distance_scale,
-            (-2.6340404, 1.0541499),
+            (-2.6542566, 1.074366),
             (-1.23944, 1.2394401),
         ),
         (
@@ -2110,8 +2312,8 @@ fn projected_interval_regression_values_match_audit_cases() {
             0.0,
             0.0,
             0.0,
-            (-1.4182664, 1.4182667),
-            (-1.7667506, 4.729045),
+            (-1.3008934, 1.3008934),
+            (-1.5111949, 4.4734893),
         ),
         (
             "wide roll +90 baseline",
@@ -2120,8 +2322,8 @@ fn projected_interval_regression_values_match_audit_cases() {
             0.0,
             90.0,
             0.0,
-            (-2.9600642, 1.2937738),
-            (-2.1053987, 2.105399),
+            (-2.8536265, 1.187336),
+            (-2.0059867, 2.0059869),
         ),
         (
             "nonzero yaw pitch roll",
@@ -2130,8 +2332,8 @@ fn projected_interval_regression_values_match_audit_cases() {
             -12.0,
             23.0,
             0.0,
-            (-3.0888512, 1.9560902),
-            (-2.011178, 4.938787),
+            (-2.5083506, 1.1935925),
+            (-1.82348, 4.6816516),
         ),
     ];
 

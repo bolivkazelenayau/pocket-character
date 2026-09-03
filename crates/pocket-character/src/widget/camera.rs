@@ -15,13 +15,18 @@ const MAX_RUNTIME_DISTANCE_DELTA: f32 = 10.0;
 const MAX_RUNTIME_PITCH_DEG: f32 = 89.0;
 
 /// Required visible fraction of the projected rest-bounds extent, subject to
-/// absolute NDC floor and ceiling limits.
+/// absolute NDC floor and ceiling limits. The full-bounds requirement
+/// strengthens toward the close target as the projected extent grows; the
+/// horizontal body core keeps the unstrengthened hybrid base.
 const PAN_VISIBLE_FRACTION: f32 = 0.25;
 const PAN_MIN_VISIBLE_OVERLAP_NDC: f32 = 0.10;
-const PAN_MAX_VISIBLE_OVERLAP_NDC: f32 = 0.45;
-const PAN_CLOSE_VISIBLE_OVERLAP_NDC: f32 = 0.25;
-const PAN_CLOSE_RELAX_START_EXTENT_NDC: f32 = 2.0;
-const PAN_CLOSE_RELAX_END_EXTENT_NDC: f32 = 5.0;
+const PAN_MAX_VISIBLE_OVERLAP_NDC: f32 = 0.40;
+const PAN_CLOSE_VISIBLE_OVERLAP_NDC: f32 = 0.45;
+const PAN_CLOSE_STRENGTHEN_START_EXTENT_NDC: f32 = 2.0;
+const PAN_CLOSE_STRENGTHEN_END_EXTENT_NDC: f32 = 5.0;
+/// Half-width of the central body proxy used to keep horizontal pan from
+/// admitting an empty extreme of a wide rest AABB.
+const PAN_X_CORE_HALF_WIDTH_FRACTION: f32 = 0.140;
 const PAN_WITNESS_DEPTH_EPSILON_RATIO: f32 = 1.0e-5;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -262,23 +267,26 @@ fn lerp(start: f32, end: f32, t: f32) -> f32 {
     start + (end - start) * t
 }
 
-fn required_visible_overlap(projected_extent: f32) -> f32 {
-    let existing_hybrid_overlap = projected_extent.min(
+fn base_visible_overlap(projected_extent: f32) -> f32 {
+    projected_extent.min(
         (projected_extent * PAN_VISIBLE_FRACTION)
             .clamp(PAN_MIN_VISIBLE_OVERLAP_NDC, PAN_MAX_VISIBLE_OVERLAP_NDC),
-    );
+    )
+}
+
+fn required_visible_overlap(projected_extent: f32) -> f32 {
+    let base = base_visible_overlap(projected_extent);
     let t = smoothstep(
-        PAN_CLOSE_RELAX_START_EXTENT_NDC,
-        PAN_CLOSE_RELAX_END_EXTENT_NDC,
+        PAN_CLOSE_STRENGTHEN_START_EXTENT_NDC,
+        PAN_CLOSE_STRENGTHEN_END_EXTENT_NDC,
         projected_extent,
     );
-    let close_cap = lerp(
-        PAN_MAX_VISIBLE_OVERLAP_NDC,
-        PAN_CLOSE_VISIBLE_OVERLAP_NDC,
-        t,
-    );
 
-    existing_hybrid_overlap.min(close_cap)
+    lerp(base, PAN_CLOSE_VISIBLE_OVERLAP_NDC, t)
+}
+
+fn required_core_visible_overlap(projected_extent: f32) -> f32 {
+    base_visible_overlap(projected_extent)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -431,6 +439,15 @@ fn rest_bounds_corners((min, max): (Vec3, Vec3)) -> [Vec3; 8] {
     ]
 }
 
+fn horizontal_core_aabb((min, max): (Vec3, Vec3)) -> (Vec3, Vec3) {
+    let center_x = (min.x + max.x) * 0.5;
+    let half_width = (max.x - min.x) * PAN_X_CORE_HALF_WIDTH_FRACTION;
+    (
+        Vec3::new(center_x - half_width, min.y, min.z),
+        Vec3::new(center_x + half_width, max.y, max.z),
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ProjectedCorner {
     projected_ndc: Vec2,
@@ -512,8 +529,11 @@ fn project_rest_bounds(
     })
 }
 
-fn projected_pan_interval(projected: &ProjectedRestBounds, axis: usize) -> Option<PanInterval> {
-    let required_overlap = required_visible_overlap(projected.extent[axis]);
+fn projected_pan_interval_with_requirement(
+    projected: &ProjectedRestBounds,
+    axis: usize,
+    required_overlap: f32,
+) -> Option<PanInterval> {
     if !required_overlap.is_finite() || required_overlap < 0.0 {
         return None;
     }
@@ -537,18 +557,43 @@ fn projected_pan_interval(projected: &ProjectedRestBounds, axis: usize) -> Optio
     interval.is_valid().then_some(interval)
 }
 
+fn projected_pan_interval(projected: &ProjectedRestBounds, axis: usize) -> Option<PanInterval> {
+    let required_overlap = required_visible_overlap(projected.extent[axis]);
+    projected_pan_interval_with_requirement(projected, axis, required_overlap)
+}
+
+fn projected_core_pan_interval(
+    projected: &ProjectedRestBounds,
+    axis: usize,
+) -> Option<PanInterval> {
+    let required_overlap = required_core_visible_overlap(projected.extent[axis]);
+    projected_pan_interval_with_requirement(projected, axis, required_overlap)
+}
+
+fn intersect_pan_intervals(first: PanInterval, second: PanInterval) -> Option<PanInterval> {
+    let interval = PanInterval {
+        min: first.min.max(second.min),
+        max: first.max.min(second.max),
+    };
+    interval.is_valid().then_some(interval)
+}
+
 fn projected_pan_intervals(
     camera: Camera,
     distance: f32,
     fov_y: f32,
     aspect: f32,
     corners: &[Vec3; 8],
+    horizontal_core_corners: &[Vec3; 8],
 ) -> Option<[PanInterval; 2]> {
     let projected = project_rest_bounds(camera, distance, fov_y, aspect, corners)?;
-    Some([
+    let projected_horizontal_core =
+        project_rest_bounds(camera, distance, fov_y, aspect, horizontal_core_corners)?;
+    let horizontal = intersect_pan_intervals(
         projected_pan_interval(&projected, 0)?,
-        projected_pan_interval(&projected, 1)?,
-    ])
+        projected_core_pan_interval(&projected_horizontal_core, 0)?,
+    )?;
+    Some([horizontal, projected_pan_interval(&projected, 1)?])
 }
 
 fn pan_intervals_for_effective_state(
@@ -560,12 +605,14 @@ fn pan_intervals_for_effective_state(
         return None;
     }
 
+    let sanitized_aabb = sanitize_model_aabb(aabb);
     projected_pan_intervals(
         orientation.camera,
         orientation.distance,
         orientation.frame.fov_y,
         aspect,
-        &rest_bounds_corners(sanitize_model_aabb(aabb)),
+        &rest_bounds_corners(sanitized_aabb),
+        &rest_bounds_corners(horizontal_core_aabb(sanitized_aabb)),
     )
 }
 
