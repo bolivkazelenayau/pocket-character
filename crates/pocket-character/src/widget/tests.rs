@@ -53,16 +53,20 @@ fn invalid_live_settings_are_sanitized() {
 #[test]
 fn live_settings_are_available_before_model_load() {
     let mut widget = test_widget();
-    widget.set_camera_settings(CameraSettings {
-        fov_deg: 35.0,
-        distance_scale: 0.75,
-        headroom: 0.08,
-        ..CameraSettings::default()
-    });
+    // Canonical base lives in `settings.camera`; menu actions work before the
+    // model loads (no pan to revalidate, no camera to reapply yet).
+    widget.apply_control_action(super::controls::ControlAction::SetBaseFov(35.0));
+    widget.apply_control_action(super::controls::ControlAction::SetBaseDistance(0.75));
 
-    assert_eq!(widget.camera_settings.fov_deg, 35.0);
-    assert_eq!(widget.camera_settings.distance_scale, 0.75);
-    assert_eq!(widget.camera_settings.headroom, 0.08);
+    assert_eq!(widget.settings.camera.fov_deg, 35.0);
+    assert_eq!(widget.settings.camera.distance_scale, 0.75);
+    assert_eq!(
+        widget.settings.camera.headroom,
+        CameraSettings::default().headroom
+    );
+    let snapshot = widget.controls_snapshot();
+    assert_eq!(snapshot.base_fov_deg(), 35.0);
+    assert_eq!(snapshot.base_distance_scale(), 0.75);
 }
 
 #[test]
@@ -77,11 +81,10 @@ fn live_snap_steps_update_controls_without_resetting_runtime_adjustments() {
         pitch_deg: -8.0,
     };
     widget.set_camera_adjustments(existing_adjustments);
-    widget.set_camera_settings(CameraSettings {
-        yaw_snap_deg: 5.0,
-        roll_snap_deg: 17.5,
-        pitch_snap_deg: 30.0,
-        ..CameraSettings::default()
+    widget.apply_control_action(super::controls::ControlAction::SetAllSnaps {
+        yaw_deg: 5.0,
+        pitch_deg: 30.0,
+        roll_deg: 17.5,
     });
 
     assert_eq!(widget.camera_controls.adjustments(), existing_adjustments);
@@ -101,19 +104,14 @@ fn live_snap_steps_update_controls_without_resetting_runtime_adjustments() {
         ..existing_adjustments
     };
     assert_eq!(widget.camera_controls.adjustments(), after_first_snap);
-    assert_eq!(widget.camera_settings.yaw_snap_deg, 5.0);
-    assert_eq!(widget.camera_settings.roll_snap_deg, 17.5);
-    assert_eq!(widget.camera_settings.pitch_snap_deg, 30.0);
+    assert_eq!(widget.settings.camera.yaw_snap_deg, 5.0);
+    assert_eq!(widget.settings.camera.roll_snap_deg, 17.5);
+    assert_eq!(widget.settings.camera.pitch_snap_deg, 30.0);
 
     input.end_frame();
     input.inject_key(KeyCode::ArrowLeft, false);
     widget.frame(0.0, &input);
-    widget.set_camera_settings(CameraSettings {
-        yaw_snap_deg: 10.0,
-        roll_snap_deg: 17.5,
-        pitch_snap_deg: 30.0,
-        ..CameraSettings::default()
-    });
+    widget.apply_control_action(super::controls::ControlAction::SetYawSnap(10.0));
     assert_eq!(widget.camera_controls.adjustments(), after_first_snap);
 
     input.end_frame();
@@ -125,9 +123,9 @@ fn live_snap_steps_update_controls_without_resetting_runtime_adjustments() {
         ..after_first_snap
     };
     assert_eq!(widget.camera_controls.adjustments(), after_second_snap);
-    assert_eq!(widget.camera_settings.yaw_snap_deg, 10.0);
-    assert_eq!(widget.camera_settings.roll_snap_deg, 17.5);
-    assert_eq!(widget.camera_settings.pitch_snap_deg, 30.0);
+    assert_eq!(widget.settings.camera.yaw_snap_deg, 10.0);
+    assert_eq!(widget.settings.camera.roll_snap_deg, 17.5);
+    assert_eq!(widget.settings.camera.pitch_snap_deg, 30.0);
 }
 
 #[test]
@@ -138,14 +136,14 @@ fn f8_toggles_live_camera_controls_without_touching_base_settings() {
     input.inject_key(KeyCode::F8, true);
     widget.frame(0.0, &input);
     assert!(widget.camera_controls.camera_controls_enabled());
-    assert_eq!(widget.camera_settings, CameraSettings::default());
+    assert_eq!(widget.settings.camera, CameraSettings::default());
 
     input.inject_key(KeyCode::F8, false);
     input.end_frame();
     input.inject_key(KeyCode::KeyE, true);
     widget.frame(1.0 / 60.0, &input);
     assert!(widget.effective_camera_values().settings.fov_deg > 40.0);
-    assert_eq!(widget.camera_settings, CameraSettings::default());
+    assert_eq!(widget.settings.camera, CameraSettings::default());
 }
 
 #[test]
@@ -264,7 +262,7 @@ fn aa_shortcuts_do_not_reset_runtime_camera_adjustments() {
     assert_eq!(widget.camera_controls.adjustments(), adjustments);
     assert_eq!(
         widget.effective_camera_values(),
-        adjustments.effective(widget.camera_settings)
+        adjustments.effective(widget.settings.camera)
     );
 }
 
@@ -520,4 +518,440 @@ fn widget_frame_records_render_fps() {
     }
 
     approx_eq(widget.render_fps.fps(), 4.0);
+}
+
+use super::controls::{ControlAction, ControlsSnapshot};
+
+fn snapshot_base_equals_persisted(widget: &Widget) {
+    let snapshot = widget.controls_snapshot();
+    assert_eq!(snapshot.base_fov_deg(), widget.settings.camera.fov_deg);
+    assert_eq!(
+        snapshot.base_distance_scale(),
+        widget.settings.camera.distance_scale
+    );
+    assert_eq!(snapshot.yaw_snap_deg(), widget.settings.camera.yaw_snap_deg);
+    assert_eq!(
+        snapshot.pitch_snap_deg(),
+        widget.settings.camera.pitch_snap_deg
+    );
+    assert_eq!(
+        snapshot.roll_snap_deg(),
+        widget.settings.camera.roll_snap_deg
+    );
+}
+
+#[test]
+fn canonical_camera_settings_cannot_diverge_from_persisted_settings() {
+    let mut widget = test_widget();
+    // Single source of truth: snapshot base always mirrors `settings.camera`.
+    snapshot_base_equals_persisted(&widget);
+
+    widget.apply_control_action(ControlAction::SetBaseFov(55.0));
+    snapshot_base_equals_persisted(&widget);
+    assert_eq!(widget.settings.camera.fov_deg, 55.0);
+
+    widget.apply_control_action(ControlAction::SetBaseDistance(1.25));
+    snapshot_base_equals_persisted(&widget);
+    assert_eq!(widget.settings.camera.distance_scale, 1.25);
+
+    widget.apply_control_action(ControlAction::SetYawSnap(7.0));
+    snapshot_base_equals_persisted(&widget);
+    assert_eq!(widget.settings.camera.yaw_snap_deg, 7.0);
+
+    widget.apply_control_action(ControlAction::SetPitchSnap(9.0));
+    snapshot_base_equals_persisted(&widget);
+    assert_eq!(widget.settings.camera.pitch_snap_deg, 9.0);
+
+    widget.apply_control_action(ControlAction::SetRollSnap(11.0));
+    snapshot_base_equals_persisted(&widget);
+    assert_eq!(widget.settings.camera.roll_snap_deg, 11.0);
+
+    widget.apply_control_action(ControlAction::SetAllSnaps {
+        yaw_deg: 5.0,
+        pitch_deg: 10.0,
+        roll_deg: 20.0,
+    });
+    snapshot_base_equals_persisted(&widget);
+    assert_eq!(widget.settings.camera.yaw_snap_deg, 5.0);
+    assert_eq!(widget.settings.camera.pitch_snap_deg, 10.0);
+    assert_eq!(widget.settings.camera.roll_snap_deg, 20.0);
+
+    // Session-only pose never touches persisted base.
+    widget.apply_control_action(ControlAction::SetYaw(33.0));
+    snapshot_base_equals_persisted(&widget);
+    widget.apply_control_action(ControlAction::ResetRuntimeCamera);
+    snapshot_base_equals_persisted(&widget);
+}
+
+#[test]
+fn setting_base_fov_rebases_runtime_fov_delta() {
+    let mut widget = test_widget();
+    widget.set_camera_adjustments(CameraRuntimeAdjustments {
+        fov_delta_deg: 10.0,
+        ..CameraRuntimeAdjustments::default()
+    });
+    assert_eq!(
+        widget.effective_camera_values().settings.fov_deg,
+        50.0,
+        "precondition: 40 base + 10 delta"
+    );
+
+    let snapshot = widget.apply_control_action(ControlAction::SetBaseFov(55.0));
+    assert_eq!(widget.settings.camera.fov_deg, 55.0);
+    assert_eq!(widget.camera_controls.adjustments().fov_delta_deg, 0.0);
+    assert_eq!(snapshot.base_fov_deg(), 55.0);
+    assert_eq!(snapshot.effective_fov_deg(), 55.0);
+    assert_eq!(
+        widget.effective_camera_values().settings.fov_deg,
+        55.0,
+        "no hidden keyboard delta reappears"
+    );
+}
+
+#[test]
+fn setting_base_distance_rebases_runtime_distance_delta() {
+    let mut widget = test_widget();
+    widget.set_camera_adjustments(CameraRuntimeAdjustments {
+        distance_scale_delta: 0.25,
+        ..CameraRuntimeAdjustments::default()
+    });
+    assert_eq!(
+        widget.effective_camera_values().settings.distance_scale,
+        0.85,
+        "precondition: 0.6 base + 0.25 delta"
+    );
+
+    let snapshot = widget.apply_control_action(ControlAction::SetBaseDistance(1.0));
+    assert_eq!(widget.settings.camera.distance_scale, 1.0);
+    assert_eq!(
+        widget.camera_controls.adjustments().distance_scale_delta,
+        0.0
+    );
+    assert_eq!(snapshot.base_distance_scale(), 1.0);
+    assert_eq!(snapshot.effective_distance_scale(), 1.0);
+    assert_eq!(
+        widget.effective_camera_values().settings.distance_scale,
+        1.0,
+        "no hidden keyboard delta reappears"
+    );
+}
+
+#[test]
+fn control_actions_preserve_runtime_pan_before_model_load() {
+    let mut widget = test_widget();
+    // No model is loaded, so Widget-level `validate_pan(CameraPanContext)` is
+    // a no-op here. This proves only that control actions preserve existing
+    // runtime pan before model load. Projected-bound clamping is covered by
+    // the existing camera-kernel tests.
+    widget.set_camera_adjustments(CameraRuntimeAdjustments {
+        pan_ndc: Vec2::new(0.03, 0.02),
+        ..CameraRuntimeAdjustments::default()
+    });
+
+    widget.apply_control_action(ControlAction::SetYaw(10.0));
+    assert_eq!(
+        widget.camera_controls.adjustments().pan_ndc,
+        Vec2::new(0.03, 0.02)
+    );
+
+    widget.apply_control_action(ControlAction::SetBaseFov(45.0));
+    // Base FOV clears only its own delta; existing pan is preserved.
+    assert_eq!(widget.settings.camera.fov_deg, 45.0);
+    assert_eq!(
+        widget.camera_controls.adjustments().pan_ndc,
+        Vec2::new(0.03, 0.02)
+    );
+
+    widget.apply_control_action(ControlAction::SetBaseDistance(0.8));
+    assert_eq!(widget.settings.camera.distance_scale, 0.8);
+    assert_eq!(
+        widget.camera_controls.adjustments().pan_ndc,
+        Vec2::new(0.03, 0.02)
+    );
+}
+
+#[test]
+fn yaw_pitch_roll_actions_return_authoritative_accepted_values() {
+    let mut widget = test_widget();
+
+    let snapshot = widget.apply_control_action(ControlAction::SetYaw(45.0));
+    assert_eq!(snapshot.yaw_deg(), 45.0);
+    assert_eq!(widget.camera_controls.adjustments().yaw_deg, 45.0);
+
+    // Yaw/roll wrap through the kernel normalizer; pitch clamps.
+    let snapshot = widget.apply_control_action(ControlAction::SetYaw(190.0));
+    assert_eq!(snapshot.yaw_deg(), -170.0);
+    let snapshot = widget.apply_control_action(ControlAction::SetRoll(190.0));
+    assert_eq!(snapshot.roll_deg(), -170.0);
+    let snapshot = widget.apply_control_action(ControlAction::SetPitch(100.0));
+    assert_eq!(snapshot.pitch_deg(), 89.0);
+    let snapshot = widget.apply_control_action(ControlAction::SetPitch(-100.0));
+    assert_eq!(snapshot.pitch_deg(), -89.0);
+
+    // Nonfinite session values sanitize to the kernel fallback (0).
+    let snapshot = widget.apply_control_action(ControlAction::SetYaw(f32::NAN));
+    assert_eq!(snapshot.yaw_deg(), 0.0);
+    let snapshot = widget.apply_control_action(ControlAction::SetPitch(f32::INFINITY));
+    assert_eq!(snapshot.pitch_deg(), 0.0);
+    let snapshot = widget.apply_control_action(ControlAction::SetRoll(f32::NEG_INFINITY));
+    assert_eq!(snapshot.roll_deg(), 0.0);
+
+    // Persisted base is untouched by session-only pose.
+    assert_eq!(widget.settings.camera, CameraSettings::default());
+}
+
+#[test]
+fn reset_restores_saved_framing_without_resetting_snaps_or_aa() {
+    let settings = AppSettings {
+        camera: CameraSettings {
+            fov_deg: 35.0,
+            distance_scale: 0.75,
+            yaw_snap_deg: 5.0,
+            roll_snap_deg: 17.5,
+            pitch_snap_deg: 30.0,
+            ..CameraSettings::default()
+        },
+        rendering: RenderSettings {
+            msaa: AntiAliasingPreference::X8,
+            smaa_enabled: true,
+            ..RenderSettings::default()
+        },
+        ..AppSettings::default()
+    };
+    let mut widget = Widget::new_with_settings_path(test_config(), settings, None);
+    widget.set_camera_adjustments(CameraRuntimeAdjustments {
+        fov_delta_deg: 8.0,
+        distance_scale_delta: 0.4,
+        pan_ndc: Vec2::new(0.05, -0.04),
+        yaw_deg: 33.0,
+        roll_deg: -21.0,
+        pitch_deg: 12.0,
+    });
+
+    let snapshot = widget.apply_control_action(ControlAction::ResetRuntimeCamera);
+    assert_eq!(
+        widget.camera_controls.adjustments(),
+        CameraRuntimeAdjustments::default()
+    );
+    assert_eq!(snapshot.effective_fov_deg(), 35.0);
+    assert_eq!(snapshot.effective_distance_scale(), 0.75);
+    assert_eq!(snapshot.yaw_deg(), 0.0);
+    assert_eq!(snapshot.pitch_deg(), 0.0);
+    assert_eq!(snapshot.roll_deg(), 0.0);
+
+    // Persisted snaps and rendering preferences survive the reset.
+    assert_eq!(widget.settings.camera.yaw_snap_deg, 5.0);
+    assert_eq!(widget.settings.camera.roll_snap_deg, 17.5);
+    assert_eq!(widget.settings.camera.pitch_snap_deg, 30.0);
+    assert_eq!(snapshot.yaw_snap_deg(), 5.0);
+    assert_eq!(snapshot.roll_snap_deg(), 17.5);
+    assert_eq!(snapshot.pitch_snap_deg(), 30.0);
+    assert_eq!(widget.settings.rendering.msaa, AntiAliasingPreference::X8);
+    assert!(widget.settings.rendering.smaa_enabled);
+    assert_eq!(snapshot.requested_msaa(), AntiAliasingPreference::X8);
+    assert!(snapshot.requested_smaa());
+}
+
+#[test]
+fn linked_snap_update_is_atomic_and_leaves_no_link_in_persisted_settings() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let mut widget =
+        Widget::new_with_settings_path(test_config(), AppSettings::default(), Some(path.clone()));
+    assert_eq!(widget.save_count, 0);
+
+    let snapshot = widget.apply_control_action(ControlAction::SetAllSnaps {
+        yaw_deg: 5.0,
+        pitch_deg: 10.0,
+        roll_deg: 20.0,
+    });
+    assert_eq!(snapshot.yaw_snap_deg(), 5.0);
+    assert_eq!(snapshot.pitch_snap_deg(), 10.0);
+    assert_eq!(snapshot.roll_snap_deg(), 20.0);
+    assert_eq!(
+        widget.save_count, 1,
+        "linked edit must cause one save, not three transient updates"
+    );
+
+    let persisted = AppSettings::load_from_path(&path);
+    assert_eq!(persisted.camera.yaw_snap_deg, 5.0);
+    assert_eq!(persisted.camera.pitch_snap_deg, 10.0);
+    assert_eq!(persisted.camera.roll_snap_deg, 20.0);
+    let json = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !json.to_ascii_lowercase().contains("link"),
+        "Link is UI-only and must not appear in persisted JSON: {json}"
+    );
+}
+
+#[test]
+fn malformed_values_are_sanitized_through_authoritative_policy() {
+    let mut widget = test_widget();
+
+    let expected_fov = CameraSettings {
+        fov_deg: f32::NAN,
+        ..CameraSettings::default()
+    }
+    .sanitized()
+    .fov_deg;
+    let snapshot = widget.apply_control_action(ControlAction::SetBaseFov(f32::NAN));
+    assert_eq!(snapshot.base_fov_deg(), expected_fov);
+    assert_eq!(snapshot.base_fov_deg(), 40.0);
+
+    let snapshot = widget.apply_control_action(ControlAction::SetBaseFov(1000.0));
+    assert_eq!(snapshot.base_fov_deg(), 179.0);
+    let snapshot = widget.apply_control_action(ControlAction::SetBaseFov(-50.0));
+    assert_eq!(snapshot.base_fov_deg(), 1.0);
+
+    let expected_distance = CameraSettings {
+        distance_scale: f32::INFINITY,
+        ..CameraSettings::default()
+    }
+    .sanitized()
+    .distance_scale;
+    let snapshot = widget.apply_control_action(ControlAction::SetBaseDistance(f32::INFINITY));
+    assert_eq!(snapshot.base_distance_scale(), expected_distance);
+    assert_eq!(snapshot.base_distance_scale(), 0.6);
+
+    let snapshot = widget.apply_control_action(ControlAction::SetBaseDistance(-5.0));
+    assert_eq!(snapshot.base_distance_scale(), 0.1);
+    let snapshot = widget.apply_control_action(ControlAction::SetBaseDistance(100.0));
+    assert_eq!(snapshot.base_distance_scale(), 10.0);
+
+    let snapshot = widget.apply_control_action(ControlAction::SetYawSnap(f32::NAN));
+    assert_eq!(snapshot.yaw_snap_deg(), 15.0);
+    let snapshot = widget.apply_control_action(ControlAction::SetYawSnap(0.0));
+    assert_eq!(snapshot.yaw_snap_deg(), 0.1);
+    let snapshot = widget.apply_control_action(ControlAction::SetRollSnap(500.0));
+    assert_eq!(snapshot.roll_snap_deg(), 90.0);
+
+    let all = widget.apply_control_action(ControlAction::SetAllSnaps {
+        yaw_deg: f32::NAN,
+        pitch_deg: f32::INFINITY,
+        roll_deg: -1000.0,
+    });
+    assert_eq!(all.yaw_snap_deg(), 15.0);
+    assert_eq!(all.pitch_snap_deg(), 15.0);
+    assert_eq!(all.roll_snap_deg(), 0.1);
+}
+
+#[test]
+fn requested_and_effective_msaa_can_differ() {
+    let mut widget = test_widget();
+    assert_eq!(
+        widget.controls_snapshot().requested_msaa(),
+        AntiAliasingPreference::Off
+    );
+
+    // Pending window: requested moves immediately, effective waits for the
+    // between-frame renderer application.
+    widget.apply_control_action(ControlAction::RequestMsaa(AntiAliasingPreference::X8));
+    let snapshot = widget.controls_snapshot();
+    assert_eq!(snapshot.requested_msaa(), AntiAliasingPreference::X8);
+    assert!(snapshot.msaa_pending());
+
+    // Hardware fallback window: simulate a renderer that accepted 8x but can
+    // only realize 4x. Requested stays 8x while effective is 4x.
+    widget.aa.initialize_msaa_from_renderer(8, 4);
+    let snapshot = widget.controls_snapshot();
+    assert_eq!(snapshot.requested_msaa(), AntiAliasingPreference::X8);
+    assert_eq!(snapshot.effective_msaa(), 4);
+    assert_ne!(
+        snapshot.requested_msaa().samples().unwrap_or(1),
+        snapshot.effective_msaa()
+    );
+}
+
+#[test]
+fn requested_and_effective_smaa_can_differ() {
+    let mut widget = test_widget();
+    assert!(!widget.controls_snapshot().requested_smaa());
+    assert!(!widget.controls_snapshot().effective_smaa());
+
+    // Pending window: requested flips immediately, renderer-observed waits for
+    // the between-frame application. The snapshot must not collapse them.
+    widget.apply_control_action(ControlAction::RequestSmaa(true));
+    let snapshot = widget.controls_snapshot();
+    assert!(snapshot.requested_smaa());
+    assert!(!snapshot.effective_smaa());
+    assert!(snapshot.smaa_pending());
+    assert_ne!(snapshot.requested_smaa(), snapshot.effective_smaa());
+
+    // Renderer-observed window: simulate observed still off while requested on.
+    widget.aa.initialize_smaa_from_renderer(true, false);
+    let snapshot = widget.controls_snapshot();
+    assert!(snapshot.requested_smaa());
+    assert!(!snapshot.effective_smaa());
+
+    widget.aa.initialize_smaa_from_renderer(true, true);
+    let snapshot = widget.controls_snapshot();
+    assert!(snapshot.requested_smaa());
+    assert!(snapshot.effective_smaa());
+}
+
+#[test]
+fn persistence_occurs_once_per_committed_settings_action() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let mut widget =
+        Widget::new_with_settings_path(test_config(), AppSettings::default(), Some(path.clone()));
+    assert_eq!(widget.save_count, 0);
+
+    widget.apply_control_action(ControlAction::SetBaseFov(50.0));
+    assert_eq!(widget.save_count, 1);
+    assert_eq!(AppSettings::load_from_path(&path).camera.fov_deg, 50.0);
+
+    // Identical re-request commits nothing and persists nothing.
+    widget.apply_control_action(ControlAction::SetBaseFov(50.0));
+    assert_eq!(widget.save_count, 1);
+
+    // Session-only pose never persists.
+    widget.apply_control_action(ControlAction::SetYaw(25.0));
+    widget.apply_control_action(ControlAction::SetPitch(10.0));
+    widget.apply_control_action(ControlAction::SetRoll(-12.0));
+    widget.apply_control_action(ControlAction::ResetRuntimeCamera);
+    assert_eq!(widget.save_count, 1);
+
+    // One snap change is one save.
+    widget.apply_control_action(ControlAction::SetYawSnap(7.0));
+    assert_eq!(widget.save_count, 2);
+    assert_eq!(AppSettings::load_from_path(&path).camera.yaw_snap_deg, 7.0);
+
+    // Linked edit is still one save, not three.
+    widget.apply_control_action(ControlAction::SetAllSnaps {
+        yaw_deg: 6.0,
+        pitch_deg: 12.0,
+        roll_deg: 18.0,
+    });
+    assert_eq!(widget.save_count, 3);
+    let persisted = AppSettings::load_from_path(&path);
+    assert_eq!(persisted.camera.yaw_snap_deg, 6.0);
+    assert_eq!(persisted.camera.pitch_snap_deg, 12.0);
+    assert_eq!(persisted.camera.roll_snap_deg, 18.0);
+
+    // AA requests queue renderer work without immediate persistence; the
+    // existing between-frame accepted-only persistence is preserved.
+    widget.apply_control_action(ControlAction::RequestMsaa(AntiAliasingPreference::X8));
+    widget.apply_control_action(ControlAction::RequestSmaa(true));
+    assert_eq!(widget.save_count, 3);
+    let snapshot = widget.controls_snapshot();
+    assert!(snapshot.msaa_pending());
+    assert!(snapshot.smaa_pending());
+    assert_eq!(
+        AppSettings::load_from_path(&path).rendering.msaa,
+        AntiAliasingPreference::default()
+    );
+}
+
+#[test]
+fn controls_snapshot_is_immutable_value_state() {
+    let widget = test_widget();
+    let snapshot: ControlsSnapshot = widget.controls_snapshot();
+    let copy = snapshot;
+    assert_eq!(snapshot, copy);
+    // No setters exist: the only way to change state is another action.
+    let mut widget = widget;
+    let next = widget.apply_control_action(ControlAction::SetBaseFov(48.0));
+    assert_eq!(next.base_fov_deg(), 48.0);
+    assert_eq!(snapshot.base_fov_deg(), 40.0);
 }

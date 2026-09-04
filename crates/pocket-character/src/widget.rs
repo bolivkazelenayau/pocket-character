@@ -29,6 +29,7 @@ use crate::settings::{AntiAliasingPreference, AppSettings, CameraSettings};
 
 mod aa;
 mod camera;
+mod controls;
 mod diagnostics;
 
 use aa::AaRuntime;
@@ -39,6 +40,7 @@ use camera::{
     CameraPanContext, DEFAULT_VIEWPORT_ASPECT, EffectiveCameraValues,
     resolve_camera_parameters_with_aspect,
 };
+use controls::{ControlAction, ControlsSnapshot};
 use diagnostics::{FrameStats, RenderFps};
 
 pub struct WidgetConfig {
@@ -73,11 +75,12 @@ pub struct Widget {
     camera: Camera,
     hud: Hud,
     anchor: Vec3,
-    camera_settings: CameraSettings,
     camera_controls: CameraControls,
     viewport_size: Option<(u32, u32)>,
     settings: AppSettings,
     settings_path: Option<PathBuf>,
+    #[cfg(test)]
+    save_count: usize,
 
     stats: FrameStats,
     render_fps: RenderFps,
@@ -98,7 +101,9 @@ impl Widget {
     }
 
     pub fn new_with_camera_settings(cfg: WidgetConfig, camera_settings: CameraSettings) -> Self {
-        Self::new_internal(cfg, camera_settings, AppSettings::default(), None, 1, false)
+        let mut settings = AppSettings::default();
+        settings.camera = camera_settings.sanitized();
+        Self::new_internal(cfg, settings, None, 1, false)
     }
 
     pub fn new_with_settings_path(
@@ -109,24 +114,20 @@ impl Widget {
         let settings = settings.sanitized();
         let requested_msaa = settings.rendering.msaa.samples().unwrap_or(1);
         let requested_smaa = settings.rendering.smaa_enabled;
-        Self::new_internal(
-            cfg,
-            settings.camera,
-            settings,
-            settings_path,
-            requested_msaa,
-            requested_smaa,
-        )
+        Self::new_internal(cfg, settings, settings_path, requested_msaa, requested_smaa)
     }
 
     fn new_internal(
         cfg: WidgetConfig,
-        camera_settings: CameraSettings,
         settings: AppSettings,
         settings_path: Option<PathBuf>,
         requested_msaa: u32,
         requested_smaa: bool,
     ) -> Self {
+        // `AppSettings.camera` is the single canonical persisted/base camera
+        // settings. `CameraControls` holds runtime/session adjustments.
+        // `reapply_camera()` is the common application path.
+        let settings = settings.sanitized();
         // Seed fixed for reproducible measurement runs; behavior parity is
         // distributional, not per-run.
         let sim = CharacterSim::new(0x0c9a_11e0, Vec3::ZERO);
@@ -148,11 +149,12 @@ impl Widget {
             camera: Camera::default(),
             hud: Hud::default(),
             anchor: Vec3::ZERO,
-            camera_settings: camera_settings.sanitized(),
             camera_controls: CameraControls::default(),
             viewport_size: None,
             settings,
             settings_path,
+            #[cfg(test)]
+            save_count: 0,
             stats: FrameStats::new(),
             render_fps: RenderFps::new(),
             debug_hud_enabled: false,
@@ -165,13 +167,6 @@ impl Widget {
             exit: false,
             rendered_frames: 0,
         }
-    }
-
-    /// Update character framing live. The next composed frame uses the new
-    /// camera without recreating the renderer, surface, or pipelines.
-    pub fn set_camera_settings(&mut self, settings: CameraSettings) {
-        self.camera_settings = settings.sanitized();
-        self.reapply_camera();
     }
 
     fn reapply_camera(&mut self) {
@@ -194,12 +189,12 @@ impl Widget {
         let aabb = model.aabb;
         let viewport_aspect = self.camera_viewport_aspect();
         self.camera_controls.validate_pan(
-            CameraPanContext::new(aabb, self.camera_settings),
+            CameraPanContext::new(aabb, self.settings.camera),
             viewport_aspect,
         );
         let parameters = resolve_camera_parameters_with_aspect(
             aabb,
-            self.camera_settings,
+            self.settings.camera,
             self.camera_controls.adjustments(),
             viewport_aspect,
         );
@@ -223,14 +218,175 @@ impl Widget {
     fn effective_camera_values(&self) -> EffectiveCameraValues {
         self.camera_controls
             .adjustments()
-            .effective(self.camera_settings)
+            .effective(self.settings.camera)
     }
 
     fn camera_snap_steps(&self) -> CameraSnapSteps {
         CameraSnapSteps {
-            yaw_deg: self.camera_settings.yaw_snap_deg,
-            roll_deg: self.camera_settings.roll_snap_deg,
-            pitch_deg: self.camera_settings.pitch_snap_deg,
+            yaw_deg: self.settings.camera.yaw_snap_deg,
+            roll_deg: self.settings.camera.roll_snap_deg,
+            pitch_deg: self.settings.camera.pitch_snap_deg,
+        }
+    }
+
+    /// Settings/action boundary for persisted/base camera changes.
+    ///
+    /// `AppSettings.camera` is the single canonical persisted/base camera
+    /// settings. `CameraControls` holds runtime/session adjustments (including
+    /// keyboard/session controls, which mutate it directly). Each
+    /// `ControlAction` that touches persisted settings sanitizes through the
+    /// existing settings/kernel policy, rebases runtime FOV/distance deltas
+    /// where appropriate, revalidates pan through the kernel, reapplies via
+    /// the common `reapply_camera()` path, and persists only accepted
+    /// committed changes (once per action). No clamp/safety math is duplicated
+    /// here.
+    pub(crate) fn apply_control_action(&mut self, action: ControlAction) -> ControlsSnapshot {
+        match action {
+            ControlAction::SetBaseFov(fov_deg) => {
+                let mut candidate = self.settings.camera;
+                candidate.fov_deg = fov_deg;
+                let sanitized = candidate.sanitized();
+                if sanitized != self.settings.camera {
+                    let fov_changed = sanitized.fov_deg != self.settings.camera.fov_deg;
+                    self.settings.camera = sanitized;
+                    // Clear only the corresponding delta on an accepted base
+                    // change so no hidden keyboard delta reappears. No-ops
+                    // preserve keyboard feel.
+                    if fov_changed {
+                        self.camera_controls.clear_fov_delta();
+                    }
+                    self.reapply_camera();
+                    self.persist_settings();
+                }
+            }
+            ControlAction::SetBaseDistance(distance_scale) => {
+                let mut candidate = self.settings.camera;
+                candidate.distance_scale = distance_scale;
+                let sanitized = candidate.sanitized();
+                if sanitized != self.settings.camera {
+                    let distance_changed =
+                        sanitized.distance_scale != self.settings.camera.distance_scale;
+                    self.settings.camera = sanitized;
+                    if distance_changed {
+                        self.camera_controls.clear_distance_delta();
+                    }
+                    self.reapply_camera();
+                    self.persist_settings();
+                }
+            }
+            ControlAction::SetYaw(yaw_deg) => {
+                self.camera_controls.set_yaw_deg(yaw_deg);
+                self.reapply_camera();
+            }
+            ControlAction::SetPitch(pitch_deg) => {
+                self.camera_controls.set_pitch_deg(pitch_deg);
+                self.reapply_camera();
+            }
+            ControlAction::SetRoll(roll_deg) => {
+                self.camera_controls.set_roll_deg(roll_deg);
+                self.reapply_camera();
+            }
+            ControlAction::ResetRuntimeCamera => {
+                self.camera_controls.reset_adjustments();
+                self.reapply_camera();
+            }
+            ControlAction::SetYawSnap(snap_deg) => {
+                let mut candidate = self.settings.camera;
+                candidate.yaw_snap_deg = snap_deg;
+                let sanitized = candidate.sanitized();
+                if sanitized != self.settings.camera {
+                    self.settings.camera = sanitized;
+                    self.reapply_camera();
+                    self.persist_settings();
+                }
+            }
+            ControlAction::SetPitchSnap(snap_deg) => {
+                let mut candidate = self.settings.camera;
+                candidate.pitch_snap_deg = snap_deg;
+                let sanitized = candidate.sanitized();
+                if sanitized != self.settings.camera {
+                    self.settings.camera = sanitized;
+                    self.reapply_camera();
+                    self.persist_settings();
+                }
+            }
+            ControlAction::SetRollSnap(snap_deg) => {
+                let mut candidate = self.settings.camera;
+                candidate.roll_snap_deg = snap_deg;
+                let sanitized = candidate.sanitized();
+                if sanitized != self.settings.camera {
+                    self.settings.camera = sanitized;
+                    self.reapply_camera();
+                    self.persist_settings();
+                }
+            }
+            ControlAction::SetAllSnaps {
+                yaw_deg,
+                pitch_deg,
+                roll_deg,
+            } => {
+                let mut candidate = self.settings.camera;
+                candidate.yaw_snap_deg = yaw_deg;
+                candidate.pitch_snap_deg = pitch_deg;
+                candidate.roll_snap_deg = roll_deg;
+                let sanitized = candidate.sanitized();
+                if sanitized != self.settings.camera {
+                    self.settings.camera = sanitized;
+                    self.reapply_camera();
+                    self.persist_settings();
+                }
+            }
+            ControlAction::RequestMsaa(preference) => {
+                self.aa
+                    .request_msaa_samples(preference.samples().unwrap_or(1));
+            }
+            ControlAction::RequestSmaa(enabled) => {
+                self.aa.request_smaa(enabled);
+            }
+        }
+        self.controls_snapshot()
+    }
+
+    pub(crate) fn controls_snapshot(&self) -> ControlsSnapshot {
+        let base = self.settings.camera.sanitized();
+        let adjustments = self.camera_controls.adjustments();
+        let effective = adjustments.effective(self.settings.camera);
+        let requested_msaa = AntiAliasingPreference::from_samples(self.aa.requested_msaa())
+            .unwrap_or(AntiAliasingPreference::Off);
+        let pending = self.aa.pending_requests();
+        ControlsSnapshot::new(
+            base.fov_deg,
+            base.distance_scale,
+            adjustments.sanitized().yaw_deg,
+            adjustments.sanitized().pitch_deg,
+            adjustments.sanitized().roll_deg,
+            base.yaw_snap_deg,
+            base.pitch_snap_deg,
+            base.roll_snap_deg,
+            effective.settings.fov_deg,
+            effective.settings.distance_scale,
+            requested_msaa,
+            self.aa.effective_msaa(),
+            self.aa.requested_smaa(),
+            self.aa.effective_smaa(),
+            pending.msaa.is_some(),
+            pending.smaa.is_some(),
+        )
+    }
+
+    fn persist_settings(&mut self) {
+        let Some(path) = self.settings_path.clone() else {
+            return;
+        };
+        if let Err(error) = self.settings.save_to_path(&path) {
+            log::warn!(
+                "unable to persist settings to {}: {error:#}",
+                path.display()
+            );
+        }
+        #[cfg(test)]
+        {
+            self.save_count += 1;
         }
     }
 
@@ -375,9 +531,11 @@ impl Game for Widget {
         self.scene.models.push(inst);
 
         // Camera framing is character-owned and derived from the loaded
-        // model's bounds. It remains live through set_camera_settings().
+        // model's bounds. `AppSettings.camera` is the canonical persisted/base
+        // settings, `CameraControls` holds session adjustments, and
+        // `reapply_camera()` is the common application path.
         self.model = Some(model.clone());
-        self.set_camera_settings(self.camera_settings);
+        self.reapply_camera();
 
         // Guest boots last so its boot table reflects the loaded assets.
         let bundle = std::fs::read_to_string(&self.cfg.bundle_path)
@@ -411,7 +569,7 @@ impl Game for Widget {
         let pan_context = self
             .model
             .as_ref()
-            .map(|model| CameraPanContext::new(model.aabb, self.camera_settings));
+            .map(|model| CameraPanContext::new(model.aabb, self.settings.camera));
         let camera_changed = self.camera_controls.apply_frame(
             dt,
             input,
@@ -613,14 +771,8 @@ impl Widget {
             changed = true;
         }
 
-        if changed
-            && let Some(path) = self.settings_path.as_deref()
-            && let Err(error) = self.settings.save_to_path(path)
-        {
-            log::warn!(
-                "unable to persist AA settings to {}: {error:#}",
-                path.display()
-            );
+        if changed {
+            self.persist_settings();
         }
     }
 }

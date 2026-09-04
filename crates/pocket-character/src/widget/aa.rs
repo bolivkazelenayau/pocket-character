@@ -57,6 +57,29 @@ impl AaRuntime {
         }
     }
 
+    pub(super) fn requested_msaa(&self) -> u32 {
+        self.requested_msaa
+    }
+
+    pub(super) fn effective_msaa(&self) -> u32 {
+        self.effective_msaa
+    }
+
+    pub(super) fn requested_smaa(&self) -> bool {
+        self.requested_smaa
+    }
+
+    pub(super) fn effective_smaa(&self) -> bool {
+        self.smaa_enabled
+    }
+
+    pub(super) fn pending_requests(&self) -> AaRequests {
+        AaRequests {
+            msaa: self.pending_msaa_request,
+            smaa: self.pending_smaa_request,
+        }
+    }
+
     pub(super) fn initialize_msaa_from_renderer(
         &mut self,
         requested_msaa: u32,
@@ -83,6 +106,35 @@ impl AaRuntime {
     pub(super) fn request_smaa_toggle(&mut self) {
         self.requested_smaa = !self.requested_smaa;
         self.pending_smaa_request = Some(self.requested_smaa);
+    }
+
+    /// Menu request path: set an explicit MSAA sample count.
+    ///
+    /// Only the hardware candidates `1/2/4/8` are accepted; anything else is
+    /// rejected without touching requested state or queueing renderer work.
+    /// Identical re-requests are a no-op so no redundant apply/persist occurs.
+    pub(super) fn request_msaa_samples(&mut self, samples: u32) {
+        match samples {
+            1 | 2 | 4 | 8 => {
+                if samples != self.requested_msaa {
+                    self.requested_msaa = samples;
+                    self.pending_msaa_request = Some(samples);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Menu request path: set an explicit SMAA preference.
+    ///
+    /// Identical re-requests are a no-op. Application to the renderer still
+    /// happens between frames via [`Self::take_pending_requests`], preserving
+    /// the existing accepted-only persistence behavior.
+    pub(super) fn request_smaa(&mut self, enabled: bool) {
+        if enabled != self.requested_smaa {
+            self.requested_smaa = enabled;
+            self.pending_smaa_request = Some(enabled);
+        }
     }
 
     pub(super) fn take_pending_requests(&mut self) -> AaRequests {
@@ -112,20 +164,6 @@ fn next_msaa_sample_count(requested: u32) -> u32 {
         4 => 8,
         8 => 1,
         _ => 2,
-    }
-}
-
-#[cfg(test)]
-impl AaRuntime {
-    pub(in crate::widget) fn requested_smaa(&self) -> bool {
-        self.requested_smaa
-    }
-
-    pub(in crate::widget) fn pending_requests(&self) -> AaRequests {
-        AaRequests {
-            msaa: self.pending_msaa_request,
-            smaa: self.pending_smaa_request,
-        }
     }
 }
 

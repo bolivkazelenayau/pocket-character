@@ -348,6 +348,42 @@ impl CameraControls {
         self.camera_adjustments = adjustments.sanitized();
     }
 
+    /// Menu/session request paths. Each sanitizes through the existing
+    /// [`CameraRuntimeAdjustments`] kernel policy and returns the authoritative
+    /// accepted value. No clamp/safety math is duplicated here.
+    pub(crate) fn set_yaw_deg(&mut self, yaw_deg: f32) -> f32 {
+        let mut next = self.camera_adjustments;
+        next.yaw_deg = yaw_deg;
+        self.camera_adjustments = next.sanitized();
+        self.camera_adjustments.yaw_deg
+    }
+
+    pub(crate) fn set_pitch_deg(&mut self, pitch_deg: f32) -> f32 {
+        let mut next = self.camera_adjustments;
+        next.pitch_deg = pitch_deg;
+        self.camera_adjustments = next.sanitized();
+        self.camera_adjustments.pitch_deg
+    }
+
+    pub(crate) fn set_roll_deg(&mut self, roll_deg: f32) -> f32 {
+        let mut next = self.camera_adjustments;
+        next.roll_deg = roll_deg;
+        self.camera_adjustments = next.sanitized();
+        self.camera_adjustments.roll_deg
+    }
+
+    pub(crate) fn clear_fov_delta(&mut self) {
+        let mut next = self.camera_adjustments;
+        next.fov_delta_deg = 0.0;
+        self.camera_adjustments = next.sanitized();
+    }
+
+    pub(crate) fn clear_distance_delta(&mut self) {
+        let mut next = self.camera_adjustments;
+        next.distance_scale_delta = 0.0;
+        self.camera_adjustments = next.sanitized();
+    }
+
     pub(crate) fn reset_adjustments(&mut self) {
         self.horizontal_snap_repeat = HorizontalSnapRepeatState::default();
         self.vertical_snap_repeat = VerticalSnapRepeatState::default();
