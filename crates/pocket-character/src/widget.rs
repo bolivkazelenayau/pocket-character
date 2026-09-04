@@ -25,6 +25,7 @@ use pocket3d::scene::Scene;
 use pocket3d::winit::keyboard::KeyCode;
 
 use crate::guest::{CharacterGuest, Command, TickEvent, TickState};
+use crate::menu_guest::MenuGuest;
 use crate::settings::{AntiAliasingPreference, AppSettings, CameraSettings};
 
 mod aa;
@@ -47,6 +48,10 @@ pub struct WidgetConfig {
     pub model_path: PathBuf,
     pub vrma_path: PathBuf,
     pub bundle_path: PathBuf,
+    /// Generated PocketUI menu bundle (`dist/menu.js`).
+    pub menu_bundle_path: PathBuf,
+    /// Generated PocketUI menu pak (`dist/menu.pak`).
+    pub menu_pak_path: PathBuf,
     pub size: (u32, u32),
     /// Render N frames then exit (verification runs).
     pub frames: Option<u32>,
@@ -55,6 +60,10 @@ pub struct WidgetConfig {
 pub struct Widget {
     cfg: WidgetConfig,
     guest: Option<CharacterGuest>,
+    /// PocketUI overlay guest — a separate QuickJS realm from `guest`.
+    /// Boots in `init` once the GPU/renderer exist; `None` until then (and
+    /// in unit tests that never call `init`).
+    menu: Option<MenuGuest>,
 
     // Loaded in init (needs the GPU).
     model: Option<Arc<ModelAsset>>,
@@ -134,6 +143,7 @@ impl Widget {
         Self {
             cfg,
             guest: None,
+            menu: None,
             model: None,
             vrm: None,
             clips: Vec::new(),
@@ -549,6 +559,21 @@ impl Game for Widget {
             &expr_names,
         )?);
 
+        // The menu guest boots independently of the character guest (separate
+        // QuickJS realm + ui surface), after the GPU/renderer exist so the
+        // overlay pipeline can bind the render target's color format.
+        let (menu_bundle, menu_pak) = crate::menu_guest::load_menu_assets(
+            &self.cfg.menu_bundle_path,
+            &self.cfg.menu_pak_path,
+        )?;
+        self.menu = Some(MenuGuest::boot(
+            gpu,
+            &menu_bundle,
+            &menu_pak,
+            (self.cfg.size.0 as f32, self.cfg.size.1 as f32),
+            renderer.color_format,
+        )?);
+
         self.vrm = Some(vrm);
         log::info!("init: {:.0} ms", t0.elapsed().as_secs_f32() * 1000.0);
         Ok(())
@@ -682,6 +707,16 @@ impl Game for Widget {
         }
 
         self.stats.record(t0.elapsed().as_secs_f32() * 1000.0);
+
+        // --- menu (PocketUI overlay proof) ------------------------------
+        // A separate concern layered after the character lifecycle above —
+        // zero input this pass (no controls wired yet); the next pass feeds
+        // ControlsSnapshot facts here.
+        if let Some(menu) = self.menu.as_mut()
+            && let Err(e) = menu.step()
+        {
+            log::error!("menu frame: {e:#}");
+        }
     }
 
     fn prepare_render(&mut self, gpu: &Gpu, renderer: &mut Renderer) {
@@ -731,6 +766,13 @@ impl Game for Widget {
     fn compose(&mut self, _alpha: f32, time: f32, size: (u32, u32)) -> (&Scene, &Camera, &Hud) {
         self.scene.time = time;
         self.update_viewport(size);
+        // The menu lays out in the same pixel space the rest of the widget
+        // uses (the size the app loop reports; see compose_debug_hud).
+        if let Some(menu) = self.menu.as_mut()
+            && let Err(e) = menu.set_viewport(size.0 as f32, size.1 as f32)
+        {
+            log::error!("menu resize: {e:#}");
+        }
         self.rendered_frames += 1;
         if let Some(n) = self.cfg.frames
             && self.rendered_frames >= n
@@ -742,6 +784,26 @@ impl Game for Widget {
             self.compose_debug_hud(size);
         }
         (&self.scene, &self.camera, &self.hud)
+    }
+
+    /// PocketUI overlay: the menu draw list alpha-blended over the finished
+    /// character frame. Runs on the logical output view the app loop hands
+    /// us (transparent Windows path included); `LoadOp::Load` keeps every
+    /// pixel the scene pass wrote, and the UI pipeline has no depth
+    /// attachment so character depth is untouched.
+    fn overlay(
+        &mut self,
+        gpu: &Gpu,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        format: wgpu::TextureFormat,
+        size: (u32, u32),
+    ) {
+        if let Some(menu) = self.menu.as_mut()
+            && let Err(e) = menu.render(gpu, encoder, view, format, size)
+        {
+            log::error!("menu overlay: {e:#}");
+        }
     }
 
     fn wants_exit(&self) -> bool {

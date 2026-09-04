@@ -1,6 +1,9 @@
-// Bundle the guest program (plain TS policy bundle — no JSX/pak needed until
-// the widget grows 2D chrome; then this switches to the vendored PocketJS
-// build pipeline).
+// Bundle the guest programs:
+//   - dist/character.js: plain TS policy bundle (no JSX/pak needed).
+//   - dist/menu.js + dist/menu.pak: the PocketUI TSX app, built through the
+//     vendored PocketJS pipeline (tools/build.ts --outdir keeps outputs
+//     repo-local; see that script's header). Bun regenerates the bundle/pak;
+//     at runtime the Rust binary only loads the generated artifacts.
 export {};
 
 const result = await Bun.build({
@@ -16,3 +19,12 @@ if (!result.success) {
   process.exit(1);
 }
 console.log("dist/character.js built");
+
+const menu = Bun.spawnSync(
+  ["bun", "vendor/pocketjs/tools/build.ts", "app/menu.tsx", "--outdir=dist"],
+  { stdout: "inherit", stderr: "inherit" },
+);
+if (!menu.success) {
+  console.error("menu build failed — run `bun install` in vendor/pocketjs first?");
+  process.exit(1);
+}

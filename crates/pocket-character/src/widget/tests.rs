@@ -12,6 +12,8 @@ fn test_config() -> WidgetConfig {
         model_path: PathBuf::new(),
         vrma_path: PathBuf::new(),
         bundle_path: PathBuf::new(),
+        menu_bundle_path: PathBuf::new(),
+        menu_pak_path: PathBuf::new(),
         size: (450, 600),
         frames: None,
     }

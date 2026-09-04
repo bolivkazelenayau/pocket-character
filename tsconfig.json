@@ -6,7 +6,17 @@
     "strict": true,
     "noEmit": true,
     "skipLibCheck": true,
-    "types": ["bun-types"]
+    "types": ["bun-types"],
+    // app/menu.tsx typechecks only — babel-preset-solid owns the real JSX
+    // transform inside the vendored PocketJS build (jsx must stay "preserve").
+    "jsx": "preserve",
+    "allowImportingTsExtensions": true,
+    "baseUrl": ".",
+    "paths": {
+      "@pocketjs/framework": ["vendor/pocketjs/framework/src/index.ts"],
+      "@pocketjs/framework/components": ["vendor/pocketjs/framework/src/components.ts"],
+      "@pocketjs/framework/solid": ["vendor/pocketjs/framework/src/index.ts"]
+    }
   },
-  "include": ["app", "scripts"]
+  "include": ["app", "scripts", "vendor/pocketjs/framework/src/jsx.d.ts"]
 }
