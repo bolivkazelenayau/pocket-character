@@ -293,6 +293,26 @@ fn resize_preserves_runtime_camera_values_and_last_valid_viewport() {
 }
 
 #[test]
+fn desktop_menu_coordinates_use_logical_pixels_at_common_scale_factors() {
+    assert_eq!(logical_viewport_for((450, 600), 1.0), (450.0, 600.0));
+    assert_eq!(logical_viewport_for((675, 900), 1.5), (450.0, 600.0));
+    assert_eq!(logical_viewport_for((900, 1200), 2.0), (450.0, 600.0));
+}
+
+#[test]
+fn menu_failure_policy_latches_the_first_terminal_error() {
+    let mut health = MenuHealth::default();
+
+    assert!(health.is_healthy());
+    assert!(health.latch("frame", "guest threw"));
+    assert_eq!(health.failure(), Some("frame: guest threw"));
+    assert!(!health.is_healthy());
+
+    assert!(!health.latch("overlay", "second error"));
+    assert_eq!(health.failure(), Some("frame: guest threw"));
+}
+
+#[test]
 fn f3_toggles_debug_hud_once_per_key_press() {
     let mut widget = test_widget();
     let mut input = Input::default();

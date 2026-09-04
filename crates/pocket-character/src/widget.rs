@@ -5,6 +5,7 @@
 //! shape: sample clip locals → eye look-at → spring bones → globals →
 //! palette; blink lands as morph weights, uploaded only when it changes.
 
+use std::fmt::Display;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -57,6 +58,53 @@ pub struct WidgetConfig {
     pub frames: Option<u32>,
 }
 
+#[derive(Debug, Default)]
+struct MenuHealth {
+    /// The first terminal runtime error disables the overlay for the rest of
+    /// this process. Keeping the original message lets headless callers
+    /// report why a capture was rejected.
+    failure: Option<String>,
+}
+
+impl MenuHealth {
+    fn is_healthy(&self) -> bool {
+        self.failure.is_none()
+    }
+
+    fn latch(&mut self, operation: &str, error: impl Display) -> bool {
+        if self.failure.is_some() {
+            return false;
+        }
+        self.failure = Some(format!("{operation}: {error}"));
+        true
+    }
+
+    fn failure(&self) -> Option<&str> {
+        self.failure.as_deref()
+    }
+}
+
+const DEFAULT_WINDOW_SCALE_FACTOR: f64 = 1.0;
+
+fn normalized_scale_factor(scale_factor: f64) -> f64 {
+    if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        DEFAULT_WINDOW_SCALE_FACTOR
+    }
+}
+
+/// Convert a physical window size to the logical pixel viewport consumed by
+/// PocketUI. Rounding mirrors the note-widget host so layout stays integral
+/// while a fractional-DPI window is resized.
+fn logical_viewport_for(physical_size: (u32, u32), scale_factor: f64) -> (f32, f32) {
+    let scale_factor = normalized_scale_factor(scale_factor);
+    (
+        ((physical_size.0 as f64 / scale_factor).round().max(1.0)) as f32,
+        ((physical_size.1 as f64 / scale_factor).round().max(1.0)) as f32,
+    )
+}
+
 pub struct Widget {
     cfg: WidgetConfig,
     guest: Option<CharacterGuest>,
@@ -64,6 +112,7 @@ pub struct Widget {
     /// Boots in `init` once the GPU/renderer exist; `None` until then (and
     /// in unit tests that never call `init`).
     menu: Option<MenuGuest>,
+    menu_health: MenuHealth,
 
     // Loaded in init (needs the GPU).
     model: Option<Arc<ModelAsset>>,
@@ -86,6 +135,9 @@ pub struct Widget {
     anchor: Vec3,
     camera_controls: CameraControls,
     viewport_size: Option<(u32, u32)>,
+    /// Physical window metrics supplied by the Pocket3D desktop host.
+    window_physical_size: Option<(u32, u32)>,
+    window_scale_factor: f64,
     settings: AppSettings,
     settings_path: Option<PathBuf>,
     #[cfg(test)]
@@ -144,6 +196,7 @@ impl Widget {
             cfg,
             guest: None,
             menu: None,
+            menu_health: MenuHealth::default(),
             model: None,
             vrm: None,
             clips: Vec::new(),
@@ -161,6 +214,8 @@ impl Widget {
             anchor: Vec3::ZERO,
             camera_controls: CameraControls::default(),
             viewport_size: None,
+            window_physical_size: None,
+            window_scale_factor: DEFAULT_WINDOW_SCALE_FACTOR,
             settings,
             settings_path,
             #[cfg(test)]
@@ -183,6 +238,17 @@ impl Widget {
         if self.model.is_some() {
             self.apply_camera_settings();
         }
+    }
+
+    fn latch_menu_failure(&mut self, operation: &str, error: anyhow::Error) {
+        let message = format!("{error:#}");
+        if self.menu_health.latch(operation, &message) {
+            log::error!("menu {operation} failed; disabling overlay: {message}");
+        }
+    }
+
+    pub(crate) fn menu_failure(&self) -> Option<&str> {
+        self.menu_health.failure()
     }
 
     fn camera_viewport_aspect(&self) -> f32 {
@@ -466,6 +532,11 @@ fn apply_expression(vrm: &VrmDoc, model: &Arc<ModelAsset>, scene: &mut Scene, na
 }
 
 impl Game for Widget {
+    fn window_metrics(&mut self, physical_size: (u32, u32), scale_factor: f64) {
+        self.window_physical_size = Some(physical_size);
+        self.window_scale_factor = normalized_scale_factor(scale_factor);
+    }
+
     fn init(&mut self, gpu: &Gpu, renderer: &mut Renderer) -> Result<()> {
         let t0 = Instant::now();
         let adapter_info = gpu.adapter.get_info();
@@ -566,11 +637,14 @@ impl Game for Widget {
             &self.cfg.menu_bundle_path,
             &self.cfg.menu_pak_path,
         )?;
+        let initial_physical_size = self.window_physical_size.unwrap_or(self.cfg.size);
+        let initial_ui_viewport =
+            logical_viewport_for(initial_physical_size, self.window_scale_factor);
         self.menu = Some(MenuGuest::boot(
             gpu,
             &menu_bundle,
             &menu_pak,
-            (self.cfg.size.0 as f32, self.cfg.size.1 as f32),
+            initial_ui_viewport,
             renderer.color_format,
         )?);
 
@@ -710,17 +784,22 @@ impl Game for Widget {
 
         // --- menu (PocketUI controls bridge) ------------------------------
         // A separate concern layered after the character lifecycle above.
-        // One-way facts only this pass: the authoritative snapshot is
-        // queued ahead of the guest turn, so the framework frame observes
-        // this tick's effective camera values (no controls wired yet).
-        let snapshot = self.controls_snapshot();
-        if let Some(menu) = self.menu.as_mut() {
-            menu.push_state(
-                snapshot.effective_fov_deg(),
-                snapshot.effective_distance_scale(),
-            );
-            if let Err(e) = menu.step() {
-                log::error!("menu frame: {e:#}");
+        // One-way facts only this pass: the authoritative snapshot is queued
+        // ahead of the guest turn, so the framework frame observes this
+        // tick's camera values (no controls wired yet).
+        if self.menu_health.is_healthy() {
+            let snapshot = self.controls_snapshot();
+            let result = self.menu.as_mut().map(|menu| {
+                menu.push_state(
+                    snapshot.base_fov_deg(),
+                    snapshot.base_distance_scale(),
+                    snapshot.effective_fov_deg(),
+                    snapshot.effective_distance_scale(),
+                )?;
+                menu.step()
+            });
+            if let Some(Err(error)) = result {
+                self.latch_menu_failure("frame", error);
             }
         }
     }
@@ -772,12 +851,21 @@ impl Game for Widget {
     fn compose(&mut self, _alpha: f32, time: f32, size: (u32, u32)) -> (&Scene, &Camera, &Hud) {
         self.scene.time = time;
         self.update_viewport(size);
-        // The menu lays out in the same pixel space the rest of the widget
-        // uses (the size the app loop reports; see compose_debug_hud).
-        if let Some(menu) = self.menu.as_mut()
-            && let Err(e) = menu.set_viewport(size.0 as f32, size.1 as f32)
-        {
-            log::error!("menu resize: {e:#}");
+        // Desktop UI coordinate contract: Pocket3D surface/cursor coordinates
+        // are physical px; MenuGuest's UiSurface/layout/hit-test coordinates
+        // are logical px = physical px / scale; UiRenderer multiplies the
+        // logical DrawList by that scale into the physical target. The future
+        // pointer bridge therefore uses full numeric logical svc coordinates,
+        // never the packed 9-bit Guest::frame_with_touches representation.
+        if self.menu_health.is_healthy() {
+            let ui_viewport = logical_viewport_for(size, self.window_scale_factor);
+            let result = self
+                .menu
+                .as_mut()
+                .map(|menu| menu.set_viewport(ui_viewport.0, ui_viewport.1));
+            if let Some(Err(error)) = result {
+                self.latch_menu_failure("resize", error);
+            }
         }
         self.rendered_frames += 1;
         if let Some(n) = self.cfg.frames
@@ -805,10 +893,20 @@ impl Game for Widget {
         format: wgpu::TextureFormat,
         size: (u32, u32),
     ) {
-        if let Some(menu) = self.menu.as_mut()
-            && let Err(e) = menu.render(gpu, encoder, view, format, size)
-        {
-            log::error!("menu overlay: {e:#}");
+        if self.menu_health.is_healthy() {
+            let result = self.menu.as_mut().map(|menu| {
+                menu.render(
+                    gpu,
+                    encoder,
+                    view,
+                    format,
+                    size,
+                    self.window_scale_factor as f32,
+                )
+            });
+            if let Some(Err(error)) = result {
+                self.latch_menu_failure("overlay", error);
+            }
         }
     }
 

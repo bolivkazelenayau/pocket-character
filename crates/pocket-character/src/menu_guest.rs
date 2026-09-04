@@ -4,7 +4,7 @@
 //! `@pocketjs/framework` TSX app, mirroring the vendored reference boot in
 //! `engine/pocket3d/examples/uihost`:
 //!
-//!   UiSurface::new → feed_pak → Guest::new → surface.mount → guest.eval
+//!   UiSurface::new_with_density → feed_pak → Guest::new → surface.mount → guest.eval
 //!
 //! Deliberately independent of [`crate::guest::CharacterGuest`]: the two
 //! guests share no realm, namespace, or state. This pass is render-only —
@@ -20,6 +20,8 @@ use pocket3d::gpu::Gpu;
 /// The framework bundle bakes its tick rate (build default 60) and refuses a
 /// host running another; the widget's fixed tick runs at the same rate.
 const MENU_TICK_HZ: u32 = 60;
+/// Must match the `--density=2` menu build in `scripts/build-ui.ts`.
+const MENU_RASTER_DENSITY: u32 = 2;
 
 /// svc service name the menu guest probes (`ui.svcOpen("controls")`, the
 /// note-app dialect). Declared before `mount`, which publishes it.
@@ -27,18 +29,18 @@ const MENU_SVC: &str = "controls";
 
 /// One-way host→guest controls facts for the render-only menu.
 ///
-/// Only the user-facing values the menu displays: the effective camera
-/// facts the widget is actually rendering with (base settings plus live
-/// keyboard/session deltas — named `effective_*` to distinguish them from
-/// the persisted/base values future menu actions will edit). Serialized as
-/// one JSON line per tick on the svc channel; TSX performs display
-/// formatting only, with no validation or clamping — camera policy stays
-/// canonical in Rust and is never duplicated there.
+/// The private host→guest wire shape. Base values are persisted settings;
+/// effective values include live keyboard/session adjustments. Serialized as
+/// one JSON line per tick on the svc channel; TSX performs display formatting
+/// only, with no validation or clamping — camera policy stays canonical in
+/// Rust and is never duplicated there.
 #[derive(serde::Serialize)]
 struct MenuState {
     /// Line discriminator (the channel multiplexes by `t`, per the note-app
     /// dialect); the menu ignores any other `t`.
     t: &'static str,
+    base_fov_deg: f32,
+    base_distance_scale: f32,
     effective_fov_deg: f32,
     effective_distance_scale: f32,
 }
@@ -56,8 +58,7 @@ impl MenuGuest {
     /// Boot the UI guest: feed the pak, mount `globalThis.ui`, eval the
     /// bundle. `viewport` is the initial logical UI size; `target_format`
     /// must be the format of the view the overlay pass will draw into (the
-    /// renderer's color format — the transparent window's logical output
-    /// matches it).
+    /// renderer's color format — the transparent window's output matches it).
     pub fn boot(
         gpu: &Gpu,
         bundle: &str,
@@ -65,7 +66,7 @@ impl MenuGuest {
         viewport: (f32, f32),
         target_format: wgpu::TextureFormat,
     ) -> Result<MenuGuest> {
-        let surface = UiSurface::new(viewport);
+        let surface = UiSurface::new_with_density(viewport, MENU_RASTER_DENSITY);
         ensure!(
             surface.set_tick_rate(MENU_TICK_HZ),
             "menu ui surface rejected tick rate {MENU_TICK_HZ}"
@@ -98,16 +99,23 @@ impl MenuGuest {
     /// Queue the latest controls facts for the guest's next `svcPoll`
     /// (one-way host→guest; call once per tick, before `step()`, so the
     /// framework frame that follows observes them).
-    pub fn push_state(&self, effective_fov_deg: f32, effective_distance_scale: f32) {
+    pub fn push_state(
+        &self,
+        base_fov_deg: f32,
+        base_distance_scale: f32,
+        effective_fov_deg: f32,
+        effective_distance_scale: f32,
+    ) -> Result<()> {
         let state = MenuState {
             t: "state",
+            base_fov_deg,
+            base_distance_scale,
             effective_fov_deg,
             effective_distance_scale,
         };
-        match serde_json::to_string(&state) {
-            Ok(line) => self.surface.svc_push(line),
-            Err(e) => log::warn!("menu state serialize: {e:#}"),
-        }
+        let line = serde_json::to_string(&state).context("serialize menu state")?;
+        self.surface.svc_push(line);
+        Ok(())
     }
 
     /// One UI turn: framework frame with zero input (no controls wired in
@@ -118,10 +126,10 @@ impl MenuGuest {
         Ok(())
     }
 
-    /// Live-viewport resize: relayout the core, then run the framework's
-    /// installed resize hook so the mounted layers follow (the vendored
-    /// desktop-host dialect). Safe to call every frame; work happens only on
-    /// an actual change.
+    /// Live-viewport resize in logical pixels: relayout the core, then run the
+    /// framework's installed resize hook so the mounted layers follow (the
+    /// vendored desktop-host dialect). Safe to call every frame; work happens
+    /// only on an actual change.
     pub fn set_viewport(&mut self, w: f32, h: f32) -> Result<()> {
         let changed = self.surface.with_ui(|ui| {
             let (vw, vh) = ui.viewport();
@@ -142,16 +150,18 @@ impl MenuGuest {
         Ok(())
     }
 
-    /// Record the overlay pass: the UI draw list alpha-blended over the
-    /// finished frame in `view` (`LoadOp::Load` — never clear). `format` must
-    /// match `view`'s format; the pipeline is rebuilt if it changed.
+    /// Record the overlay pass: the logical UI draw list is scaled into the
+    /// physical `view` and alpha-blended over the finished frame
+    /// (`LoadOp::Load` — never clear). `format` must match `view`'s format;
+    /// the pipeline is rebuilt if it changed.
     pub fn render(
         &mut self,
         gpu: &Gpu,
         encoder: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
         format: wgpu::TextureFormat,
-        size: (u32, u32),
+        physical_size: (u32, u32),
+        scale_factor: f32,
     ) -> Result<()> {
         if self.renderer_format != format {
             log::info!("menu overlay: rebuilding pipeline for {format:?}");
@@ -159,8 +169,17 @@ impl MenuGuest {
             self.renderer_format = format;
         }
         self.surface.with_ui(|ui| {
-            self.renderer
-                .render(gpu, ui, encoder, view, size, wgpu::LoadOp::Load)
+            let words = ui.draw().words.clone();
+            self.renderer.render_words_scaled(
+                gpu,
+                ui,
+                &words,
+                encoder,
+                view,
+                physical_size,
+                scale_factor,
+                wgpu::LoadOp::Load,
+            )
         })?;
         Ok(())
     }
@@ -181,4 +200,34 @@ pub fn load_menu_assets(
     let pak = std::fs::read(pak_path)
         .with_context(|| format!("reading menu pak {}: {build_hint}", pak_path.display()))?;
     Ok((bundle, pak))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MenuState;
+
+    #[test]
+    fn menu_state_wire_keeps_base_and_effective_camera_values_explicit() {
+        let value = serde_json::to_value(MenuState {
+            t: "state",
+            base_fov_deg: 40.0,
+            base_distance_scale: 0.6,
+            effective_fov_deg: 44.0,
+            effective_distance_scale: 0.55,
+        })
+        .unwrap();
+
+        for (name, expected) in [
+            ("base_fov_deg", 40.0),
+            ("base_distance_scale", 0.6),
+            ("effective_fov_deg", 44.0),
+            ("effective_distance_scale", 0.55),
+        ] {
+            let actual = value[name].as_f64().unwrap();
+            assert!(
+                (actual - expected).abs() < 1.0e-6,
+                "{name}: {actual} != {expected}"
+            );
+        }
+    }
 }

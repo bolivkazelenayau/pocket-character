@@ -1,9 +1,8 @@
 // PocketUI controls menu: a panel rendered through the MenuGuest →
 // UiSurface → UiRenderer → Pocket3D Game::overlay() path, alpha-blended
 // over the 3D character. This pass is render-only and one-way — Rust
-// pushes effective camera facts over the svc channel, the app polls them
-// per frame into a Solid signal and applies display formatting (decimals)
-// only. No Focusable,
+// pushes camera facts over the svc channel, the app polls them per frame into
+// a Solid signal and applies display formatting (decimals) only. No Focusable,
 // no press/touch/keyboard input, no svc lines back to Rust.
 import { createSignal } from "solid-js";
 import { Text, View } from "@pocketjs/framework/components";
@@ -17,6 +16,8 @@ import { mount } from "@pocketjs/framework/solid";
 /// clamping — camera validation/settings semantics stay canonical in Rust
 /// and must never be duplicated here.
 interface ControlsState {
+  base_fov_deg: number;
+  base_distance_scale: number;
   effective_fov_deg: number;
   effective_distance_scale: number;
 }
@@ -39,13 +40,30 @@ function pollControls() {
     try {
       const msg = JSON.parse(line) as {
         t?: unknown;
+        base_fov_deg?: unknown;
+        base_distance_scale?: unknown;
         effective_fov_deg?: unknown;
         effective_distance_scale?: unknown;
       };
       if (msg.t !== "state") continue;
-      if (typeof msg.effective_fov_deg !== "number" || typeof msg.effective_distance_scale !== "number") continue;
-      if (!Number.isFinite(msg.effective_fov_deg) || !Number.isFinite(msg.effective_distance_scale)) continue;
-      setControls({ effective_fov_deg: msg.effective_fov_deg, effective_distance_scale: msg.effective_distance_scale });
+      if (
+        typeof msg.base_fov_deg !== "number" ||
+        typeof msg.base_distance_scale !== "number" ||
+        typeof msg.effective_fov_deg !== "number" ||
+        typeof msg.effective_distance_scale !== "number"
+      ) continue;
+      if (
+        !Number.isFinite(msg.base_fov_deg) ||
+        !Number.isFinite(msg.base_distance_scale) ||
+        !Number.isFinite(msg.effective_fov_deg) ||
+        !Number.isFinite(msg.effective_distance_scale)
+      ) continue;
+      setControls({
+        base_fov_deg: msg.base_fov_deg,
+        base_distance_scale: msg.base_distance_scale,
+        effective_fov_deg: msg.effective_fov_deg,
+        effective_distance_scale: msg.effective_distance_scale,
+      });
     } catch {
       // Skip malformed lines.
     }

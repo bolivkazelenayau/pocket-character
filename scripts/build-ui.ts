@@ -21,7 +21,8 @@ if (!result.success) {
 console.log("dist/character.js built");
 
 const menu = Bun.spawnSync(
-  ["bun", "vendor/pocketjs/tools/build.ts", "app/menu.tsx", "--outdir=dist"],
+  // Keep menu raster assets native through the desktop's 1x-2x scale range.
+  ["bun", "vendor/pocketjs/tools/build.ts", "app/menu.tsx", "--density=2", "--outdir=dist"],
   { stdout: "inherit", stderr: "inherit" },
 );
 if (!menu.success) {

@@ -12,7 +12,7 @@ mod widget;
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use pocket3d::app::{AppConfig, Game};
 use pocket3d::gpu::{Gpu, OffscreenTarget};
 use pocket3d::input::Input;
@@ -135,7 +135,7 @@ fn headless_seq(cfg: WidgetConfig, ticks: u32, skip: u32, dir: PathBuf) -> Resul
         }
         let (scene, camera, hud) = widget.compose(0.0, i as f32 * dt, size);
         renderer.render(&gpu, &target.view, size, scene, camera, hud);
-        overlay_offscreen(&gpu, &mut widget, &target.view, size);
+        overlay_offscreen(&gpu, &mut widget, &target.view, size)?;
         target.save_png(&gpu, &dir.join(format!("frame-{:05}.png", i - skip)))?;
     }
     println!("wrote {} frames to {}", ticks, dir.display());
@@ -145,7 +145,12 @@ fn headless_seq(cfg: WidgetConfig, ticks: u32, skip: u32, dir: PathBuf) -> Resul
 /// The windowed loop records the menu overlay after the scene pass and
 /// before present; the headless drives replay the same presentation step so
 /// captures include the PocketUI overlay.
-fn overlay_offscreen(gpu: &Gpu, widget: &mut Widget, view: &wgpu::TextureView, size: (u32, u32)) {
+fn overlay_offscreen(
+    gpu: &Gpu,
+    widget: &mut Widget,
+    view: &wgpu::TextureView,
+    size: (u32, u32),
+) -> Result<()> {
     let mut encoder = gpu.device.create_command_encoder(&Default::default());
     widget.overlay(
         gpu,
@@ -154,7 +159,13 @@ fn overlay_offscreen(gpu: &Gpu, widget: &mut Widget, view: &wgpu::TextureView, s
         pocket3d::gpu::OFFSCREEN_FORMAT,
         size,
     );
+    if let Some(failure) = widget.menu_failure() {
+        return Err(anyhow!(
+            "headless capture rejected: menu overlay failed ({failure})"
+        ));
+    }
     gpu.queue.submit([encoder.finish()]);
+    Ok(())
 }
 
 /// Drive the widget for `ticks` fixed steps without a window, render one
@@ -176,7 +187,7 @@ fn headless_shot(cfg: WidgetConfig, ticks: u32, out: PathBuf) -> Result<()> {
     let (scene, camera, hud) = widget.compose(0.0, ticks as f32 * dt, size);
     let target = OffscreenTarget::new(&gpu, size.0, size.1);
     renderer.render(&gpu, &target.view, size, scene, camera, hud);
-    overlay_offscreen(&gpu, &mut widget, &target.view, size);
+    overlay_offscreen(&gpu, &mut widget, &target.view, size)?;
     target.save_png(&gpu, &out)?;
     println!("wrote {}", out.display());
     Ok(())
