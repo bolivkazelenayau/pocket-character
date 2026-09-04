@@ -21,6 +21,28 @@ use pocket3d::gpu::Gpu;
 /// host running another; the widget's fixed tick runs at the same rate.
 const MENU_TICK_HZ: u32 = 60;
 
+/// svc service name the menu guest probes (`ui.svcOpen("controls")`, the
+/// note-app dialect). Declared before `mount`, which publishes it.
+const MENU_SVC: &str = "controls";
+
+/// One-way host→guest controls facts for the render-only menu.
+///
+/// Only the user-facing values the menu displays: the effective camera
+/// facts the widget is actually rendering with (base settings plus live
+/// keyboard/session deltas — named `effective_*` to distinguish them from
+/// the persisted/base values future menu actions will edit). Serialized as
+/// one JSON line per tick on the svc channel; TSX performs display
+/// formatting only, with no validation or clamping — camera policy stays
+/// canonical in Rust and is never duplicated there.
+#[derive(serde::Serialize)]
+struct MenuState {
+    /// Line discriminator (the channel multiplexes by `t`, per the note-app
+    /// dialect); the menu ignores any other `t`.
+    t: &'static str,
+    effective_fov_deg: f32,
+    effective_distance_scale: f32,
+}
+
 pub struct MenuGuest {
     guest: Guest,
     surface: UiSurface,
@@ -49,6 +71,7 @@ impl MenuGuest {
             "menu ui surface rejected tick rate {MENU_TICK_HZ}"
         );
         surface.feed_pak(pak);
+        surface.set_svc_allowlist([MENU_SVC]);
         let guest = Guest::new()?;
         surface.mount(&guest)?;
         guest.eval("menu", bundle)?;
@@ -70,6 +93,21 @@ impl MenuGuest {
             renderer: UiRenderer::new(gpu, target_format),
             renderer_format: target_format,
         })
+    }
+
+    /// Queue the latest controls facts for the guest's next `svcPoll`
+    /// (one-way host→guest; call once per tick, before `step()`, so the
+    /// framework frame that follows observes them).
+    pub fn push_state(&self, effective_fov_deg: f32, effective_distance_scale: f32) {
+        let state = MenuState {
+            t: "state",
+            effective_fov_deg,
+            effective_distance_scale,
+        };
+        match serde_json::to_string(&state) {
+            Ok(line) => self.surface.svc_push(line),
+            Err(e) => log::warn!("menu state serialize: {e:#}"),
+        }
     }
 
     /// One UI turn: framework frame with zero input (no controls wired in

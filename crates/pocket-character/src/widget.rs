@@ -708,14 +708,20 @@ impl Game for Widget {
 
         self.stats.record(t0.elapsed().as_secs_f32() * 1000.0);
 
-        // --- menu (PocketUI overlay proof) ------------------------------
-        // A separate concern layered after the character lifecycle above —
-        // zero input this pass (no controls wired yet); the next pass feeds
-        // ControlsSnapshot facts here.
-        if let Some(menu) = self.menu.as_mut()
-            && let Err(e) = menu.step()
-        {
-            log::error!("menu frame: {e:#}");
+        // --- menu (PocketUI controls bridge) ------------------------------
+        // A separate concern layered after the character lifecycle above.
+        // One-way facts only this pass: the authoritative snapshot is
+        // queued ahead of the guest turn, so the framework frame observes
+        // this tick's effective camera values (no controls wired yet).
+        let snapshot = self.controls_snapshot();
+        if let Some(menu) = self.menu.as_mut() {
+            menu.push_state(
+                snapshot.effective_fov_deg(),
+                snapshot.effective_distance_scale(),
+            );
+            if let Err(e) = menu.step() {
+                log::error!("menu frame: {e:#}");
+            }
         }
     }
 

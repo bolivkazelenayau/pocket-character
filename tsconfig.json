@@ -15,6 +15,7 @@
     "paths": {
       "@pocketjs/framework": ["vendor/pocketjs/framework/src/index.ts"],
       "@pocketjs/framework/components": ["vendor/pocketjs/framework/src/components.ts"],
+      "@pocketjs/framework/lifecycle": ["vendor/pocketjs/framework/src/lifecycle.ts"],
       "@pocketjs/framework/solid": ["vendor/pocketjs/framework/src/index.ts"]
     }
   },
