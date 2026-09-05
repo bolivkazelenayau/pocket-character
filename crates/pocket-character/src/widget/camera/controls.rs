@@ -60,12 +60,12 @@ fn fov_axis(input: &Input) -> f32 {
     (increase as i8 - decrease as i8) as f32
 }
 
-pub(crate) fn base_fov_after_step(base_fov_deg: f32, direction: i8) -> f32 {
-    base_fov_deg + direction as f32 * CAMERA_FOV_STEP_DEG
+pub(crate) fn fov_step(direction: i8) -> f32 {
+    direction as f32 * CAMERA_FOV_STEP_DEG
 }
 
-pub(crate) fn base_distance_after_step(base_distance_scale: f32, direction: i8) -> f32 {
-    base_distance_scale + direction as f32 * CAMERA_DISTANCE_STEP
+pub(crate) fn distance_step(direction: i8) -> f32 {
+    direction as f32 * CAMERA_DISTANCE_STEP
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -398,7 +398,37 @@ impl CameraControls {
         self.camera_adjustments = next.sanitized();
     }
 
-    pub(crate) fn reset_adjustments(&mut self) {
+    /// Apply one live/session FOV step using the same increment as the
+    /// continuous keyboard controls. The widget revalidates pan after the
+    /// accepted adjustment through its common camera application path.
+    pub(crate) fn adjust_fov_step(&mut self, direction: i8) -> bool {
+        let mut next = self.camera_adjustments;
+        next.fov_delta_deg += fov_step(direction);
+        next = next.sanitized();
+        if next == self.camera_adjustments {
+            return false;
+        }
+        self.camera_adjustments = next;
+        true
+    }
+
+    /// Apply one live/session distance step using the same increment as the
+    /// continuous keyboard controls.
+    pub(crate) fn adjust_distance_step(&mut self, direction: i8) -> bool {
+        let mut next = self.camera_adjustments;
+        next.distance_scale_delta += distance_step(direction);
+        next = next.sanitized();
+        if next == self.camera_adjustments {
+            return false;
+        }
+        self.camera_adjustments = next;
+        true
+    }
+
+    /// Clear all session-only camera adjustments and return live optics to the
+    /// persisted camera configuration. This is the shared implementation for
+    /// the keyboard `R` shortcut and the semantic ResetRuntimeCamera action.
+    pub(crate) fn reset_runtime_camera(&mut self) {
         self.horizontal_snap_repeat = HorizontalSnapRepeatState::default();
         self.vertical_snap_repeat = VerticalSnapRepeatState::default();
         self.camera_adjustments = CameraRuntimeAdjustments::default();
@@ -435,7 +465,7 @@ impl CameraControls {
         }
 
         if self.camera_controls_enabled && input.key_pressed(KeyCode::KeyR) {
-            self.reset_adjustments();
+            self.reset_runtime_camera();
             true
         } else if self.camera_controls_enabled {
             self.apply_keyboard_controls(dt, input, pan_context, snap_steps, viewport_aspect)

@@ -46,14 +46,15 @@ fn logical_pointer(cursor: Option<Vec2>, scale_factor: f64) -> Option<(f32, f32)
 }
 
 /// Discrete intents accepted from the PocketUI controls guest. The guest only
-/// names an operation; the widget resolves it against the current base values
-/// before constructing the authoritative [`ControlAction`].
+/// names an operation; the widget applies it to the authoritative live camera
+/// or routes an explicit Save through the persistence boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MenuAction {
     DistanceDecrement,
     DistanceIncrement,
     FovDecrement,
     FovIncrement,
+    SaveCamera,
     ResetRuntimeCamera,
 }
 
@@ -76,6 +77,7 @@ fn decode_menu_action(line: &str) -> Option<MenuAction> {
         "distance_increment" => Some(MenuAction::DistanceIncrement),
         "fov_decrement" => Some(MenuAction::FovDecrement),
         "fov_increment" => Some(MenuAction::FovIncrement),
+        "save_camera" => Some(MenuAction::SaveCamera),
         "reset_runtime_camera" => Some(MenuAction::ResetRuntimeCamera),
         _ => None,
     }
@@ -373,6 +375,10 @@ mod tests {
             (
                 r#"{"t":"action","action":"fov_increment"}"#,
                 MenuAction::FovIncrement,
+            ),
+            (
+                r#"{"t":"action","action":"save_camera"}"#,
+                MenuAction::SaveCamera,
             ),
             (
                 r#"{"t":"action","action":"reset_runtime_camera"}"#,

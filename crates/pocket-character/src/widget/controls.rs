@@ -15,18 +15,22 @@ use crate::settings::AntiAliasingPreference;
 
 /// One authoritative settings/action boundary for the controls menu.
 ///
-/// Camera base values (`SetBaseDistance` / `SetBaseFov`) mean the saved base
-/// value; the corresponding runtime delta is cleared so no hidden keyboard
-/// delta reappears. Yaw/pitch/roll remain session-only. `ResetRuntimeCamera`
-/// returns to saved base framing with zero runtime pan/yaw/pitch/roll without
-/// factory-resetting persisted snaps or rendering settings.
+/// FOV/distance step actions mutate the live/session optic deltas using the
+/// same policy as keyboard controls. `SaveCamera` commits the representable
+/// live optics to persisted camera settings and clears only those deltas.
+/// Pan/yaw/pitch/roll remain session-only because `CameraSettings` has no
+/// corresponding runtime pose fields. `ResetRuntimeCamera` returns to saved
+/// base framing with zero runtime pan/yaw/pitch/roll without overwriting
+/// persisted camera or rendering settings. The same semantic reset is used by
+/// the keyboard `R` shortcut and the PocketUI Reset Camera action.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum ControlAction {
-    SetBaseDistance(f32),
-    SetBaseFov(f32),
+    AdjustDistance(i8),
+    AdjustFov(i8),
     SetYaw(f32),
     SetPitch(f32),
     SetRoll(f32),
+    SaveCamera,
     ResetRuntimeCamera,
     SetYawSnap(f32),
     SetPitchSnap(f32),

@@ -430,18 +430,11 @@ impl Widget {
 
     fn menu_control_action(&self, action: MenuAction) -> ControlAction {
         match action {
-            MenuAction::DistanceDecrement => ControlAction::SetBaseDistance(
-                camera::controls::base_distance_after_step(self.settings.camera.distance_scale, -1),
-            ),
-            MenuAction::DistanceIncrement => ControlAction::SetBaseDistance(
-                camera::controls::base_distance_after_step(self.settings.camera.distance_scale, 1),
-            ),
-            MenuAction::FovDecrement => ControlAction::SetBaseFov(
-                camera::controls::base_fov_after_step(self.settings.camera.fov_deg, -1),
-            ),
-            MenuAction::FovIncrement => ControlAction::SetBaseFov(
-                camera::controls::base_fov_after_step(self.settings.camera.fov_deg, 1),
-            ),
+            MenuAction::DistanceDecrement => ControlAction::AdjustDistance(-1),
+            MenuAction::DistanceIncrement => ControlAction::AdjustDistance(1),
+            MenuAction::FovDecrement => ControlAction::AdjustFov(-1),
+            MenuAction::FovIncrement => ControlAction::AdjustFov(1),
+            MenuAction::SaveCamera => ControlAction::SaveCamera,
             MenuAction::ResetRuntimeCamera => ControlAction::ResetRuntimeCamera,
         }
     }
@@ -450,49 +443,42 @@ impl Widget {
         self.apply_control_action(self.menu_control_action(action))
     }
 
-    /// Settings/action boundary for persisted/base camera changes.
-    ///
-    /// `AppSettings.camera` is the single canonical persisted/base camera
-    /// settings. `CameraControls` holds runtime/session adjustments (including
-    /// keyboard/session controls, which mutate it directly). Each
-    /// `ControlAction` that touches persisted settings sanitizes through the
-    /// existing settings/kernel policy, rebases runtime FOV/distance deltas
-    /// where appropriate, revalidates pan through the kernel, reapplies via
-    /// the common `reapply_camera()` path, and persists only accepted
-    /// committed changes (once per action). No clamp/safety math is duplicated
-    /// here.
+    /// Persist the live optic values that have a representation in
+    /// `AppSettings.camera`. Runtime pan and orientation remain session-only:
+    /// `CameraSettings` does not contain corresponding fields.
+    fn save_camera(&mut self) {
+        let effective = self.effective_camera_values();
+        let mut saved = self.settings.camera.sanitized();
+        saved.fov_deg = effective.settings.fov_deg;
+        saved.distance_scale = effective.settings.distance_scale;
+        self.settings.camera = saved.sanitized();
+        self.camera_controls.clear_fov_delta();
+        self.camera_controls.clear_distance_delta();
+        // The live camera already contains the effective FOV/distance. Do not
+        // re-resolve the bounds-derived baseline here: rebasing the persisted
+        // optics would otherwise recompute headroom and visibly move the
+        // camera on the Save action. The next normal camera change/reset can
+        // resolve against the new saved baseline.
+        self.persist_settings();
+    }
+
+    /// Return the live camera to the saved camera configuration and clear all
+    /// session-only adjustments without persisting anything.
+    fn reset_runtime_camera(&mut self) {
+        self.camera_controls.reset_runtime_camera();
+        self.reapply_camera();
+    }
+
     pub(crate) fn apply_control_action(&mut self, action: ControlAction) -> ControlsSnapshot {
         match action {
-            ControlAction::SetBaseFov(fov_deg) => {
-                let mut candidate = self.settings.camera;
-                candidate.fov_deg = fov_deg;
-                let sanitized = candidate.sanitized();
-                if sanitized != self.settings.camera {
-                    let fov_changed = sanitized.fov_deg != self.settings.camera.fov_deg;
-                    self.settings.camera = sanitized;
-                    // Clear only the corresponding delta on an accepted base
-                    // change so no hidden keyboard delta reappears. No-ops
-                    // preserve keyboard feel.
-                    if fov_changed {
-                        self.camera_controls.clear_fov_delta();
-                    }
+            ControlAction::AdjustFov(direction) => {
+                if self.camera_controls.adjust_fov_step(direction) {
                     self.reapply_camera();
-                    self.persist_settings();
                 }
             }
-            ControlAction::SetBaseDistance(distance_scale) => {
-                let mut candidate = self.settings.camera;
-                candidate.distance_scale = distance_scale;
-                let sanitized = candidate.sanitized();
-                if sanitized != self.settings.camera {
-                    let distance_changed =
-                        sanitized.distance_scale != self.settings.camera.distance_scale;
-                    self.settings.camera = sanitized;
-                    if distance_changed {
-                        self.camera_controls.clear_distance_delta();
-                    }
+            ControlAction::AdjustDistance(direction) => {
+                if self.camera_controls.adjust_distance_step(direction) {
                     self.reapply_camera();
-                    self.persist_settings();
                 }
             }
             ControlAction::SetYaw(yaw_deg) => {
@@ -507,10 +493,8 @@ impl Widget {
                 self.camera_controls.set_roll_deg(roll_deg);
                 self.reapply_camera();
             }
-            ControlAction::ResetRuntimeCamera => {
-                self.camera_controls.reset_adjustments();
-                self.reapply_camera();
-            }
+            ControlAction::SaveCamera => self.save_camera(),
+            ControlAction::ResetRuntimeCamera => self.reset_runtime_camera(),
             ControlAction::SetYawSnap(snap_deg) => {
                 let mut candidate = self.settings.camera;
                 candidate.yaw_snap_deg = snap_deg;

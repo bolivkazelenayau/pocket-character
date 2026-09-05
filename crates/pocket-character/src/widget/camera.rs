@@ -77,7 +77,8 @@ impl CameraPanContext {
     }
 }
 
-/// Runtime-only camera deltas used by the temporary F8 validation controls.
+/// Runtime-only camera deltas used by the keyboard and PocketUI session
+/// controls.
 ///
 /// These deliberately live outside [`CameraSettings`]. Persisted settings
 /// remain the framing baseline, while this state can be changed on the live
