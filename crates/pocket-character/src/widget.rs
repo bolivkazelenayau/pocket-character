@@ -15,7 +15,7 @@ use glam::{Mat4, Vec3};
 use pocket_character_core::{CharacterSim, TrackingMode};
 use pocket_vrm::{SpringSolver, VrmDoc};
 use pocket3d::anim::NodeTrs;
-use pocket3d::app::Game;
+use pocket3d::app::{Game, TextInputRequest};
 use pocket3d::camera::Camera;
 use pocket3d::gpu::Gpu;
 use pocket3d::hud::Hud;
@@ -26,7 +26,9 @@ use pocket3d::scene::Scene;
 use pocket3d::winit::keyboard::KeyCode;
 
 use crate::guest::{CharacterGuest, Command, TickEvent, TickState};
-use crate::menu_guest::{MenuAction, MenuGuest};
+use crate::menu_guest::{
+    MenuAction, MenuGuest, MenuInputFrame, MenuInputModifiers, MenuTextInputCapture,
+};
 use crate::settings::{AntiAliasingPreference, AppSettings, CameraSettings};
 
 mod aa;
@@ -109,6 +111,59 @@ fn native_drag_allowed_for_menu_pointer(menu_pointer_owned: bool) -> bool {
     !menu_pointer_owned
 }
 
+/// Map the guest's logical PocketUI caret rectangle to the physical-pixel
+/// contract consumed by Pocket3D's winit window loop. Invalid geometry
+/// releases the native IME rather than allowing a non-finite per-frame update.
+fn physical_text_input_request(
+    capture: MenuTextInputCapture,
+    scale_factor: f64,
+) -> TextInputRequest {
+    if !capture.active {
+        return TextInputRequest::default();
+    }
+    let Some(area) = capture.cursor_area_logical_px else {
+        return TextInputRequest::default();
+    };
+    let scale = normalized_scale_factor(scale_factor);
+    if !scale.is_finite() || !area.0.is_finite() || !area.1.is_finite() {
+        return TextInputRequest::default();
+    }
+    if !area.2.is_finite() || !area.3.is_finite() {
+        return TextInputRequest::default();
+    }
+
+    let physical = (
+        area.0 as f64 * scale,
+        area.1 as f64 * scale,
+        area.2 as f64 * scale,
+        area.3 as f64 * scale,
+    );
+    if ![physical.0, physical.1, physical.2, physical.3]
+        .iter()
+        .all(|value| value.is_finite())
+    {
+        return TextInputRequest::default();
+    }
+    let physical = (
+        physical.0 as f32,
+        physical.1 as f32,
+        physical.2 as f32,
+        physical.3 as f32,
+    );
+    if !physical.0.is_finite()
+        || !physical.1.is_finite()
+        || !physical.2.is_finite()
+        || !physical.3.is_finite()
+    {
+        return TextInputRequest::default();
+    }
+
+    TextInputRequest {
+        active: true,
+        cursor_area_px: Some(physical),
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct MenuPress {
     cursor: glam::Vec2,
@@ -179,6 +234,15 @@ pub struct Widget {
     pending_menu_press: Option<MenuPress>,
     pending_menu_pointer: Vec<MenuPointerFrame>,
     observed_menu_pointer: Option<(Option<glam::Vec2>, bool)>,
+    /// PocketUI owns text capture. These frames are captured once per render
+    /// frame and consumed by the next menu tick, including across zero-tick
+    /// frames but never more than once during catch-up.
+    menu_text_input_capture: MenuTextInputCapture,
+    pending_menu_input: Vec<MenuInputFrame>,
+    last_menu_input_modifiers: Option<MenuInputModifiers>,
+    /// After text capture ends, hold camera keyboard routing until all camera
+    /// keys have been released so a key pressed during editing cannot leak.
+    camera_input_blocked: bool,
     /// Accepted outside-menu presses waiting for the next character guest
     /// turn. Keep the count so multiple zero-tick frames do not coalesce.
     pending_character_clicks: usize,
@@ -263,6 +327,10 @@ impl Widget {
             pending_menu_press: None,
             pending_menu_pointer: Vec::new(),
             observed_menu_pointer: None,
+            menu_text_input_capture: MenuTextInputCapture::default(),
+            pending_menu_input: Vec::new(),
+            last_menu_input_modifiers: None,
+            camera_input_blocked: false,
             pending_character_clicks: 0,
             pending_events: Vec::new(),
             exit: false,
@@ -279,7 +347,15 @@ impl Widget {
     fn latch_menu_failure(&mut self, operation: &str, error: anyhow::Error) {
         let message = format!("{error:#}");
         if self.menu_health.latch(operation, &message) {
+            let text_capture_was_active = self.menu_text_input_capture.active;
             self.clear_menu_pointer_buffer();
+            if let Some(menu) = self.menu.as_mut() {
+                menu.clear_text_input_state();
+            }
+            self.clear_menu_input_buffer();
+            if text_capture_was_active {
+                self.arm_camera_input_release_barrier();
+            }
             log::error!("menu {operation} failed; disabling overlay: {message}");
         }
     }
@@ -289,6 +365,71 @@ impl Widget {
         self.pending_menu_press = None;
         self.pending_menu_pointer.clear();
         self.observed_menu_pointer = None;
+    }
+
+    fn clear_menu_input_buffer(&mut self) {
+        self.menu_text_input_capture = MenuTextInputCapture::default();
+        self.pending_menu_input.clear();
+        self.last_menu_input_modifiers = None;
+        self.camera_controls.suspend_keyboard_input();
+    }
+
+    fn arm_camera_input_release_barrier(&mut self) {
+        self.camera_input_blocked = true;
+        self.camera_controls.suspend_keyboard_input();
+    }
+
+    fn menu_input_modifiers(input: &Input) -> MenuInputModifiers {
+        MenuInputModifiers {
+            shift: input.key_down(KeyCode::ShiftLeft) || input.key_down(KeyCode::ShiftRight),
+            control: input.key_down(KeyCode::ControlLeft) || input.key_down(KeyCode::ControlRight),
+            alt: input.key_down(KeyCode::AltLeft) || input.key_down(KeyCode::AltRight),
+            super_key: input.super_down(),
+        }
+    }
+
+    fn buffer_menu_input(&mut self, input: &Input) {
+        if !self.menu_health.is_healthy() {
+            self.clear_menu_input_buffer();
+            return;
+        }
+
+        let modifiers = Self::menu_input_modifiers(input);
+        if input.interaction_cancelled() {
+            // Drop edits/composition accumulated before focus loss. Keep only
+            // the cancellation edge so the guest can clear its editor too.
+            self.pending_menu_input.clear();
+            self.menu_text_input_capture = MenuTextInputCapture::default();
+            self.arm_camera_input_release_barrier();
+            self.pending_menu_input.push(MenuInputFrame {
+                edits: Vec::new(),
+                ime: Vec::new(),
+                modifiers,
+                cancelled: true,
+            });
+            self.last_menu_input_modifiers = Some(modifiers);
+            return;
+        }
+
+        let edits = input.edits();
+        let ime = input.ime_events();
+        if !edits.is_empty()
+            || !ime.is_empty()
+            || self.menu_text_input_capture.active
+            || self.last_menu_input_modifiers != Some(modifiers)
+        {
+            self.pending_menu_input.push(MenuInputFrame {
+                edits: edits.to_vec(),
+                ime: ime.to_vec(),
+                modifiers,
+                cancelled: false,
+            });
+        }
+        self.last_menu_input_modifiers = Some(modifiers);
+    }
+
+    fn take_pending_menu_input(&mut self) -> Vec<MenuInputFrame> {
+        std::mem::take(&mut self.pending_menu_input)
     }
 
     pub(crate) fn menu_failure(&self) -> Option<&str> {
@@ -666,6 +807,13 @@ impl Game for Widget {
         self.window_scale_factor = normalized_scale_factor(scale_factor);
     }
 
+    fn text_input_request(&self) -> TextInputRequest {
+        if !self.menu_health.is_healthy() {
+            return TextInputRequest::default();
+        }
+        physical_text_input_request(self.menu_text_input_capture, self.window_scale_factor)
+    }
+
     fn init(&mut self, gpu: &Gpu, renderer: &mut Renderer) -> Result<()> {
         let t0 = Instant::now();
         let adapter_info = gpu.adapter.get_info();
@@ -785,29 +933,50 @@ impl Game for Widget {
     fn frame(&mut self, dt: f32, input: &Input) {
         self.render_fps.record(dt);
         self.buffer_menu_pointer(input);
-        if input.key_pressed(KeyCode::F3) {
-            self.debug_hud_enabled = !self.debug_hud_enabled;
-        }
-        if input.key_pressed(KeyCode::F4) {
-            self.aa.request_next_msaa();
-        }
-        if input.key_pressed(KeyCode::F5) {
-            self.aa.request_smaa_toggle();
-        }
-        // Temporary F8 validation controls are never written to AppSettings.
-        let pan_context = self
-            .model
-            .as_ref()
-            .map(|model| CameraPanContext::new(model.aabb, self.settings.camera));
-        let camera_changed = self.camera_controls.apply_frame(
-            dt,
-            input,
-            pan_context,
-            self.camera_snap_steps(),
-            self.camera_viewport_aspect(),
-        );
-        if camera_changed {
-            self.reapply_camera();
+        self.buffer_menu_input(input);
+
+        let text_input_active = self.menu_text_input_capture.active;
+        let camera_key_held = camera::controls::camera_input_held(input);
+        let keyboard_suppressed = if text_input_active {
+            self.camera_input_blocked = true;
+            self.camera_controls.suspend_keyboard_input();
+            true
+        } else if self.camera_input_blocked {
+            self.camera_controls.suspend_keyboard_input();
+            if !camera_key_held {
+                self.camera_input_blocked = false;
+            }
+            true
+        } else {
+            false
+        };
+
+        if !keyboard_suppressed {
+            if input.key_pressed(KeyCode::F3) {
+                self.debug_hud_enabled = !self.debug_hud_enabled;
+            }
+            if input.key_pressed(KeyCode::F4) {
+                self.aa.request_next_msaa();
+            }
+            if input.key_pressed(KeyCode::F5) {
+                self.aa.request_smaa_toggle();
+            }
+            // Temporary F8 validation controls are never written to
+            // AppSettings.
+            let pan_context = self
+                .model
+                .as_ref()
+                .map(|model| CameraPanContext::new(model.aabb, self.settings.camera));
+            let camera_changed = self.camera_controls.apply_frame(
+                dt,
+                input,
+                pan_context,
+                self.camera_snap_steps(),
+                self.camera_viewport_aspect(),
+            );
+            if camera_changed {
+                self.reapply_camera();
+            }
         }
 
         let hovered = input.cursor().is_some();
@@ -922,44 +1091,53 @@ impl Game for Widget {
             let snapshot = self.controls_snapshot();
             let scale_factor = self.window_scale_factor;
             let pointer_frames = std::mem::take(&mut self.pending_menu_pointer);
-            let result = self.menu.as_mut().map(|menu| -> Result<Vec<MenuAction>> {
-                menu.push_state(
-                    snapshot.base_fov_deg(),
-                    snapshot.base_distance_scale(),
-                    snapshot.effective_fov_deg(),
-                    snapshot.effective_distance_scale(),
-                )?;
-                for pointer_frame in pointer_frames {
-                    if pointer_frame.cancelled {
-                        menu.cancel_pointer();
-                        continue;
-                    }
-                    if pointer_frame.pressed_edge {
-                        menu.push_pointer_transition(
-                            pointer_frame.press_cursor.or(pointer_frame.cursor),
-                            scale_factor,
-                            true,
-                        );
-                        if !pointer_frame.button_down {
-                            menu.push_pointer_transition(
-                                pointer_frame.cursor.or(pointer_frame.press_cursor),
-                                scale_factor,
-                                false,
-                            );
+            let input_frames = self.take_pending_menu_input();
+            let result =
+                self.menu
+                    .as_mut()
+                    .map(|menu| -> Result<(Vec<MenuAction>, MenuTextInputCapture)> {
+                        menu.push_state(
+                            snapshot.base_fov_deg(),
+                            snapshot.base_distance_scale(),
+                            snapshot.effective_fov_deg(),
+                            snapshot.effective_distance_scale(),
+                        )?;
+                        for pointer_frame in pointer_frames {
+                            if pointer_frame.cancelled {
+                                menu.cancel_pointer();
+                                continue;
+                            }
+                            if pointer_frame.pressed_edge {
+                                menu.push_pointer_transition(
+                                    pointer_frame.press_cursor.or(pointer_frame.cursor),
+                                    scale_factor,
+                                    true,
+                                );
+                                if !pointer_frame.button_down {
+                                    menu.push_pointer_transition(
+                                        pointer_frame.cursor.or(pointer_frame.press_cursor),
+                                        scale_factor,
+                                        false,
+                                    );
+                                }
+                            } else {
+                                menu.push_pointer_transition(
+                                    pointer_frame.cursor,
+                                    scale_factor,
+                                    pointer_frame.button_down,
+                                );
+                            }
                         }
-                    } else {
-                        menu.push_pointer_transition(
-                            pointer_frame.cursor,
-                            scale_factor,
-                            pointer_frame.button_down,
-                        );
-                    }
-                }
-                menu.step()?;
-                Ok(menu.drain_actions())
-            });
+                        for input_frame in input_frames {
+                            menu.push_input_frame(&input_frame);
+                        }
+                        menu.step()?;
+                        let actions = menu.drain_actions();
+                        Ok((actions, menu.text_input_capture()))
+                    });
             match result {
-                Some(Ok(actions)) => {
+                Some(Ok((actions, text_input_capture))) => {
+                    self.menu_text_input_capture = text_input_capture;
                     for action in actions {
                         self.apply_menu_action(action);
                     }

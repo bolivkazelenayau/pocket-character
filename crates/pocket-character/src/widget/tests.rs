@@ -264,6 +264,108 @@ fn pointer_press_is_buffered_at_press_position_across_zero_tick_frames() {
 }
 
 #[test]
+fn text_input_is_buffered_across_zero_tick_frames_and_taken_once() {
+    let mut widget = test_widget();
+    let mut input = Input::default();
+    input.inject_edit(pocket3d::input::EditKey::Char('x'));
+    input.inject_ime(pocket3d::input::ImeInput::Preedit("x".into(), Some((0, 1))));
+
+    widget.frame(0.0, &input);
+    input.end_frame();
+    widget.frame(0.0, &input);
+
+    assert_eq!(widget.pending_menu_input.len(), 1);
+    assert_eq!(widget.pending_menu_input[0].edits.len(), 1);
+    assert_eq!(widget.pending_menu_input[0].ime.len(), 1);
+    let frames = widget.take_pending_menu_input();
+    assert_eq!(frames.len(), 1);
+    assert!(widget.take_pending_menu_input().is_empty());
+}
+
+#[test]
+fn logical_text_input_cursor_area_maps_to_physical_window_pixels() {
+    let capture = MenuTextInputCapture {
+        active: true,
+        cursor_area_logical_px: Some((10.0, 20.0, 2.0, 16.0)),
+    };
+
+    for (scale, expected) in [
+        (1.0, (10.0, 20.0, 2.0, 16.0)),
+        (1.5, (15.0, 30.0, 3.0, 24.0)),
+        (2.0, (20.0, 40.0, 4.0, 32.0)),
+    ] {
+        let request = physical_text_input_request(capture, scale);
+        assert!(request.active);
+        assert_eq!(request.cursor_area_px, Some(expected));
+    }
+
+    let inactive = physical_text_input_request(MenuTextInputCapture::default(), 2.0);
+    assert!(!inactive.active);
+    assert_eq!(inactive.cursor_area_px, None);
+    assert!(
+        !physical_text_input_request(
+            MenuTextInputCapture {
+                active: true,
+                cursor_area_logical_px: Some((f32::NAN, 0.0, 1.0, 1.0)),
+            },
+            2.0,
+        )
+        .active
+    );
+}
+
+#[test]
+fn default_widget_text_input_request_is_inactive() {
+    let widget = test_widget();
+    let request = widget.text_input_request();
+    assert!(!request.active);
+    assert_eq!(request.cursor_area_px, None);
+}
+
+#[test]
+fn text_capture_suppresses_camera_and_requires_release_before_routing_resumes() {
+    let mut widget = test_widget();
+    let mut input = Input::default();
+
+    input.inject_key(KeyCode::F8, true);
+    widget.frame(0.0, &input);
+    input.inject_key(KeyCode::F8, false);
+    input.end_frame();
+    assert!(widget.camera_controls.camera_controls_enabled());
+
+    widget.menu_text_input_capture = MenuTextInputCapture {
+        active: true,
+        cursor_area_logical_px: Some((0.0, 0.0, 1.0, 16.0)),
+    };
+    input.inject_key(KeyCode::KeyE, true);
+    widget.frame(1.0 / 60.0, &input);
+    assert_eq!(
+        widget.camera_controls.adjustments(),
+        CameraRuntimeAdjustments::default()
+    );
+
+    widget.menu_text_input_capture = MenuTextInputCapture::default();
+    input.end_frame();
+    widget.frame(1.0 / 60.0, &input);
+    assert_eq!(
+        widget.camera_controls.adjustments(),
+        CameraRuntimeAdjustments::default()
+    );
+
+    input.inject_key(KeyCode::KeyE, false);
+    input.end_frame();
+    widget.frame(1.0 / 60.0, &input);
+    assert_eq!(
+        widget.camera_controls.adjustments(),
+        CameraRuntimeAdjustments::default()
+    );
+
+    input.inject_key(KeyCode::KeyE, true);
+    widget.frame(1.0 / 60.0, &input);
+    assert!(widget.camera_controls.adjustments().fov_delta_deg > 0.0);
+}
+
+#[test]
 fn focus_loss_buffers_cancellation_and_clears_pending_character_click() {
     let mut widget = test_widget();
     let cursor = Vec2::new(24.0, 520.0);
@@ -281,6 +383,33 @@ fn focus_loss_buffers_cancellation_and_clears_pending_character_click() {
     assert!(!widget.menu_pointer_owned);
     assert_eq!(widget.pending_menu_pointer.len(), 2);
     assert!(widget.pending_menu_pointer[1].cancelled);
+}
+
+#[test]
+fn focus_loss_clears_text_capture_and_drops_pending_edits() {
+    let mut widget = test_widget();
+    widget.menu_text_input_capture = MenuTextInputCapture {
+        active: true,
+        cursor_area_logical_px: Some((4.0, 5.0, 1.0, 16.0)),
+    };
+    widget.pending_menu_input.push(MenuInputFrame {
+        edits: vec![pocket3d::input::EditKey::Char('a')],
+        ime: vec![],
+        modifiers: MenuInputModifiers::default(),
+        cancelled: false,
+    });
+
+    let mut input = Input::default();
+    input.clear();
+    widget.frame(0.0, &input);
+
+    assert_eq!(
+        widget.menu_text_input_capture,
+        MenuTextInputCapture::default()
+    );
+    assert_eq!(widget.pending_menu_input.len(), 1);
+    assert!(widget.pending_menu_input[0].cancelled);
+    assert!(widget.pending_menu_input[0].edits.is_empty());
 }
 
 #[test]
@@ -321,12 +450,73 @@ fn unhealthy_menu_discards_pointer_buffer_and_stops_recording_frames() {
     widget.latch_menu_failure("test", anyhow::anyhow!("terminal"));
 
     assert!(widget.pending_menu_pointer.is_empty());
+    assert!(widget.pending_menu_input.is_empty());
+    assert_eq!(
+        widget.menu_text_input_capture,
+        MenuTextInputCapture::default()
+    );
     assert!(widget.pending_menu_press.is_none());
 
     let mut input = Input::default();
     input.inject_cursor(80.0, 80.0);
     widget.frame(0.0, &input);
     assert!(widget.pending_menu_pointer.is_empty());
+}
+
+#[test]
+fn menu_failure_without_text_capture_does_not_disable_keyboard_controls() {
+    let mut widget = test_widget();
+    let mut input = Input::default();
+    widget.latch_menu_failure("test", anyhow::anyhow!("terminal"));
+
+    input.inject_key(KeyCode::F8, true);
+    widget.frame(0.0, &input);
+    assert!(widget.camera_controls.camera_controls_enabled());
+
+    input.inject_key(KeyCode::F8, false);
+    input.end_frame();
+    input.inject_key(KeyCode::KeyE, true);
+    widget.frame(1.0 / 60.0, &input);
+
+    assert!(widget.menu_failure().is_some());
+    assert!(widget.camera_controls.adjustments().fov_delta_deg > 0.0);
+}
+
+#[test]
+fn menu_failure_during_text_capture_keeps_held_camera_keys_blocked_until_release() {
+    let mut widget = test_widget();
+    let mut input = Input::default();
+    input.inject_key(KeyCode::F8, true);
+    widget.frame(0.0, &input);
+    input.inject_key(KeyCode::F8, false);
+    input.end_frame();
+
+    widget.menu_text_input_capture = MenuTextInputCapture {
+        active: true,
+        cursor_area_logical_px: Some((0.0, 0.0, 1.0, 16.0)),
+    };
+    input.inject_key(KeyCode::KeyE, true);
+    widget.frame(1.0 / 60.0, &input);
+    widget.latch_menu_failure("test", anyhow::anyhow!("terminal"));
+
+    input.end_frame();
+    widget.frame(1.0 / 60.0, &input);
+    assert_eq!(
+        widget.camera_controls.adjustments(),
+        CameraRuntimeAdjustments::default()
+    );
+
+    input.inject_key(KeyCode::KeyE, false);
+    input.end_frame();
+    widget.frame(1.0 / 60.0, &input);
+    assert_eq!(
+        widget.camera_controls.adjustments(),
+        CameraRuntimeAdjustments::default()
+    );
+
+    input.inject_key(KeyCode::KeyE, true);
+    widget.frame(1.0 / 60.0, &input);
+    assert!(widget.camera_controls.adjustments().fov_delta_deg > 0.0);
 }
 
 #[test]

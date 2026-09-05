@@ -54,6 +54,32 @@ fn modifier_down(input: &Input, left: KeyCode, right: KeyCode) -> bool {
     input.key_down(left) || input.key_down(right)
 }
 
+/// Keys which can alter the camera or toggle its keyboard-control mode. The
+/// widget uses this guard while a PocketUI editor owns native text input, so
+/// a key held through editing cannot leak into the next camera frame.
+pub(crate) fn camera_input_held(input: &Input) -> bool {
+    [
+        KeyCode::ArrowUp,
+        KeyCode::ArrowDown,
+        KeyCode::ArrowLeft,
+        KeyCode::ArrowRight,
+        KeyCode::ShiftLeft,
+        KeyCode::ShiftRight,
+        KeyCode::ControlLeft,
+        KeyCode::ControlRight,
+        KeyCode::AltLeft,
+        KeyCode::AltRight,
+        KeyCode::KeyQ,
+        KeyCode::KeyE,
+        KeyCode::BracketLeft,
+        KeyCode::BracketRight,
+        KeyCode::KeyR,
+        KeyCode::F8,
+    ]
+    .into_iter()
+    .any(|key| input.key_down(key))
+}
+
 fn fov_axis(input: &Input) -> f32 {
     let increase = input.key_down(KeyCode::KeyE) || input.key_down(KeyCode::BracketRight);
     let decrease = input.key_down(KeyCode::KeyQ) || input.key_down(KeyCode::BracketLeft);
@@ -355,6 +381,14 @@ impl CameraControls {
 
     pub(crate) fn camera_controls_enabled(&self) -> bool {
         self.camera_controls_enabled
+    }
+
+    /// Clear only keyboard repeat state while another input owner is active.
+    /// Runtime camera adjustments remain intact for the eventual return to
+    /// camera control.
+    pub(crate) fn suspend_keyboard_input(&mut self) {
+        self.horizontal_snap_repeat = HorizontalSnapRepeatState::default();
+        self.vertical_snap_repeat = VerticalSnapRepeatState::default();
     }
 
     #[cfg(test)]

@@ -1,7 +1,8 @@
 // PocketUI controls menu: a panel rendered through the MenuGuest →
 // UiSurface → UiRenderer → Pocket3D Game::overlay() path, alpha-blended
 // over the 3D character. Rust owns camera policy; this guest renders the
-// authoritative live camera values and emits semantic button intents only.
+// authoritative live camera values, emits semantic button intents, and
+// exposes generic text-input ownership for future editable widgets.
 import { createSignal } from "solid-js";
 import { Focusable, Text, View } from "@pocketjs/framework/components";
 import { virtualNow } from "@pocketjs/framework/clock";
@@ -10,6 +11,7 @@ import { focusNode, hitFocusable, pressNode, setActiveNode } from "@pocketjs/fra
 import { onFrame } from "@pocketjs/framework/lifecycle";
 import { mount } from "@pocketjs/framework/solid";
 import { PointerRepeat, type RepeatAction } from "./menu-repeat";
+import { textInput } from "./text-input";
 
 /// Authoritative camera facts pushed by the Rust host (MenuState in
 /// crates/pocket-character/src/menu_guest.rs). This compact panel displays the
@@ -134,12 +136,15 @@ function pollControls(): void {
           Number.isFinite(msg.y)
         ) {
           handleMouse(msg.x, msg.y, msg.d);
+        } else if (msg.t === "input") {
+          textInput.dispatch(msg);
         }
       } catch {
         // Skip malformed values.
       }
     }
   }
+  textInput.syncCapture();
 
   for (const action of pointerRepeat.tick(virtualNow())) {
     if (!sendAction(action)) {
