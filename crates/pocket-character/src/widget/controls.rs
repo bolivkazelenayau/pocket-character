@@ -1,6 +1,6 @@
-//! Application-private controls contract for the future PocketUI menu.
+//! Application-private controls contract for the PocketUI menu.
 //!
-//! This is an adapter boundary, not a framework: the later UI stays dumb by
+//! This is an adapter boundary, not a framework: the guest stays dumb by
 //! sending `ControlAction`s and rendering `ControlsSnapshot`s. It never sees
 //! runtime adjustment structs, the dynamic pan solver, projected bounds,
 //! `PAN_*` internals, or renderer internals. Snapshots expose user-facing
@@ -13,7 +13,7 @@
 
 use crate::settings::AntiAliasingPreference;
 
-/// One authoritative settings/action boundary for the future controls menu.
+/// One authoritative settings/action boundary for the controls menu.
 ///
 /// Camera base values (`SetBaseDistance` / `SetBaseFov`) mean the saved base
 /// value; the corresponding runtime delta is cleared so no hidden keyboard
@@ -40,7 +40,7 @@ pub(crate) enum ControlAction {
     RequestSmaa(bool),
 }
 
-/// Immutable user-facing accepted/effective state for the future menu.
+/// Immutable user-facing accepted/effective state for the menu.
 ///
 /// Requested vs. effective AA are kept independent: requested MSAA can exceed
 /// hardware-effective MSAA, and requested SMAA can differ from the

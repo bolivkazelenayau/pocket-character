@@ -26,7 +26,7 @@ use pocket3d::scene::Scene;
 use pocket3d::winit::keyboard::KeyCode;
 
 use crate::guest::{CharacterGuest, Command, TickEvent, TickState};
-use crate::menu_guest::MenuGuest;
+use crate::menu_guest::{MenuAction, MenuGuest};
 use crate::settings::{AntiAliasingPreference, AppSettings, CameraSettings};
 
 mod aa;
@@ -105,6 +105,25 @@ fn logical_viewport_for(physical_size: (u32, u32), scale_factor: f64) -> (f32, f
     )
 }
 
+fn native_drag_allowed_for_menu_pointer(menu_pointer_owned: bool) -> bool {
+    !menu_pointer_owned
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MenuPress {
+    cursor: glam::Vec2,
+    owned: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MenuPointerFrame {
+    cursor: Option<glam::Vec2>,
+    press_cursor: Option<glam::Vec2>,
+    pressed_edge: bool,
+    button_down: bool,
+    cancelled: bool,
+}
+
 pub struct Widget {
     cfg: WidgetConfig,
     guest: Option<CharacterGuest>,
@@ -151,6 +170,18 @@ pub struct Widget {
     aa: AaRuntime,
     tick_count: u64,
     hovered: bool,
+    /// UI ownership is latched from the press edge until release. The same
+    /// latch gates native dragging and CharacterGuest click delivery.
+    menu_pointer_owned: bool,
+    /// Pointer edges are captured once per rendered frame and consumed by the
+    /// next menu tick. This survives zero-tick frames and prevents a catch-up
+    /// loop from replaying the same edge.
+    pending_menu_press: Option<MenuPress>,
+    pending_menu_pointer: Vec<MenuPointerFrame>,
+    observed_menu_pointer: Option<(Option<glam::Vec2>, bool)>,
+    /// Accepted outside-menu presses waiting for the next character guest
+    /// turn. Keep the count so multiple zero-tick frames do not coalesce.
+    pending_character_clicks: usize,
     pending_events: Vec<TickEvent>,
     exit: bool,
     rendered_frames: u32,
@@ -228,6 +259,11 @@ impl Widget {
             aa: AaRuntime::new(requested_msaa, requested_smaa),
             tick_count: 0,
             hovered: false,
+            menu_pointer_owned: false,
+            pending_menu_press: None,
+            pending_menu_pointer: Vec::new(),
+            observed_menu_pointer: None,
+            pending_character_clicks: 0,
             pending_events: Vec::new(),
             exit: false,
             rendered_frames: 0,
@@ -243,8 +279,16 @@ impl Widget {
     fn latch_menu_failure(&mut self, operation: &str, error: anyhow::Error) {
         let message = format!("{error:#}");
         if self.menu_health.latch(operation, &message) {
+            self.clear_menu_pointer_buffer();
             log::error!("menu {operation} failed; disabling overlay: {message}");
         }
+    }
+
+    fn clear_menu_pointer_buffer(&mut self) {
+        self.menu_pointer_owned = false;
+        self.pending_menu_press = None;
+        self.pending_menu_pointer.clear();
+        self.observed_menu_pointer = None;
     }
 
     pub(crate) fn menu_failure(&self) -> Option<&str> {
@@ -303,6 +347,107 @@ impl Widget {
             roll_deg: self.settings.camera.roll_snap_deg,
             pitch_deg: self.settings.camera.pitch_snap_deg,
         }
+    }
+
+    fn menu_owns_pointer(&mut self, cursor: glam::Vec2) -> bool {
+        if !self.menu_health.is_healthy() {
+            return false;
+        }
+        let scale_factor = self.window_scale_factor;
+        self.menu
+            .as_mut()
+            .is_some_and(|menu| menu.pointer_owns(cursor, scale_factor))
+    }
+
+    fn buffer_menu_pointer(&mut self, input: &Input) {
+        let left = pocket3d::winit::event::MouseButton::Left;
+        let cancelled = input.interaction_cancelled();
+        let pressed_edge = !cancelled && input.mouse_button_pressed(left);
+        let button_down = !cancelled && input.mouse_button_down(left);
+        let cursor = input.cursor();
+
+        // A terminal menu failure disables the guest for the rest of the
+        // process. Do not keep recording desktop pointer motion for a menu
+        // that can no longer consume it, while still preserving accepted
+        // outside-menu presses for CharacterGuest.
+        if !self.menu_health.is_healthy() {
+            self.clear_menu_pointer_buffer();
+            if cancelled {
+                self.pending_character_clicks = 0;
+            } else if pressed_edge {
+                self.pending_character_clicks = self.pending_character_clicks.saturating_add(1);
+            }
+            return;
+        }
+
+        // Input::clear() is a cancellation boundary, not a normal release.
+        // Drop a not-yet-consumed press/click here; the bridge receives an
+        // explicit cancel frame below so the guest cannot activate it.
+        if cancelled {
+            self.pending_menu_press = None;
+            self.pending_character_clicks = 0;
+            self.menu_pointer_owned = false;
+        }
+
+        let press = if pressed_edge {
+            let press = self.pending_menu_press.take().or_else(|| {
+                cursor.map(|cursor| MenuPress {
+                    cursor,
+                    owned: self.menu_owns_pointer(cursor),
+                })
+            });
+            let owned = press.is_some_and(|press| press.owned);
+            self.menu_pointer_owned = owned;
+            if !owned {
+                self.pending_character_clicks = self.pending_character_clicks.saturating_add(1);
+            }
+            press.map(|press| press.cursor)
+        } else {
+            None
+        };
+
+        let pointer_state = (cursor, button_down);
+        let pointer_changed = self
+            .observed_menu_pointer
+            .is_some_and(|previous| previous != pointer_state)
+            || (self.observed_menu_pointer.is_none() && cursor.is_some());
+        self.observed_menu_pointer = Some(pointer_state);
+
+        if pressed_edge || pointer_changed || cancelled {
+            self.pending_menu_pointer.push(MenuPointerFrame {
+                cursor,
+                press_cursor: press,
+                pressed_edge,
+                button_down,
+                cancelled,
+            });
+        }
+
+        if !button_down && !pressed_edge && !cancelled {
+            self.menu_pointer_owned = false;
+        }
+    }
+
+    fn menu_control_action(&self, action: MenuAction) -> ControlAction {
+        match action {
+            MenuAction::DistanceDecrement => ControlAction::SetBaseDistance(
+                camera::controls::base_distance_after_step(self.settings.camera.distance_scale, -1),
+            ),
+            MenuAction::DistanceIncrement => ControlAction::SetBaseDistance(
+                camera::controls::base_distance_after_step(self.settings.camera.distance_scale, 1),
+            ),
+            MenuAction::FovDecrement => ControlAction::SetBaseFov(
+                camera::controls::base_fov_after_step(self.settings.camera.fov_deg, -1),
+            ),
+            MenuAction::FovIncrement => ControlAction::SetBaseFov(
+                camera::controls::base_fov_after_step(self.settings.camera.fov_deg, 1),
+            ),
+            MenuAction::ResetRuntimeCamera => ControlAction::ResetRuntimeCamera,
+        }
+    }
+
+    fn apply_menu_action(&mut self, action: MenuAction) -> ControlsSnapshot {
+        self.apply_control_action(self.menu_control_action(action))
     }
 
     /// Settings/action boundary for persisted/base camera changes.
@@ -655,6 +800,7 @@ impl Game for Widget {
 
     fn frame(&mut self, dt: f32, input: &Input) {
         self.render_fps.record(dt);
+        self.buffer_menu_pointer(input);
         if input.key_pressed(KeyCode::F3) {
             self.debug_hud_enabled = !self.debug_hud_enabled;
         }
@@ -691,7 +837,7 @@ impl Game for Widget {
         }
     }
 
-    fn tick(&mut self, dt: f32, input: &Input) {
+    fn tick(&mut self, dt: f32, _input: &Input) {
         let t0 = Instant::now();
         let (Some(model), Some(vrm)) = (self.model.clone(), self.vrm.as_ref()) else {
             return;
@@ -754,9 +900,10 @@ impl Game for Widget {
 
         // --- guest turn -------------------------------------------------
         let mut events: Vec<TickEvent> = std::mem::take(&mut self.pending_events);
-        if input.mouse_button_pressed(pocket3d::winit::event::MouseButton::Left) {
+        for _ in 0..self.pending_character_clicks {
             events.push(TickEvent::Click);
         }
+        self.pending_character_clicks = 0;
         let state = TickState {
             t: self.tick_count as f64 * dt as f64,
             blink: out.blink,
@@ -783,23 +930,58 @@ impl Game for Widget {
         self.stats.record(t0.elapsed().as_secs_f32() * 1000.0);
 
         // --- menu (PocketUI controls bridge) ------------------------------
-        // A separate concern layered after the character lifecycle above.
-        // One-way facts only this pass: the authoritative snapshot is queued
-        // ahead of the guest turn, so the framework frame observes this
-        // tick's camera values (no controls wired yet).
+        // Fixed ordering: queue the authoritative host snapshot and logical
+        // pointer → guest frame/input → guest action send → host action drain
+        // → apply_control_action → the fresh snapshot becomes authoritative
+        // for the next tick. This is one fixed-tick reconciliation delay.
         if self.menu_health.is_healthy() {
             let snapshot = self.controls_snapshot();
-            let result = self.menu.as_mut().map(|menu| {
+            let scale_factor = self.window_scale_factor;
+            let pointer_frames = std::mem::take(&mut self.pending_menu_pointer);
+            let result = self.menu.as_mut().map(|menu| -> Result<Vec<MenuAction>> {
                 menu.push_state(
                     snapshot.base_fov_deg(),
                     snapshot.base_distance_scale(),
                     snapshot.effective_fov_deg(),
                     snapshot.effective_distance_scale(),
                 )?;
-                menu.step()
+                for pointer_frame in pointer_frames {
+                    if pointer_frame.cancelled {
+                        menu.cancel_pointer();
+                        continue;
+                    }
+                    if pointer_frame.pressed_edge {
+                        menu.push_pointer_transition(
+                            pointer_frame.press_cursor.or(pointer_frame.cursor),
+                            scale_factor,
+                            true,
+                        );
+                        if !pointer_frame.button_down {
+                            menu.push_pointer_transition(
+                                pointer_frame.cursor.or(pointer_frame.press_cursor),
+                                scale_factor,
+                                false,
+                            );
+                        }
+                    } else {
+                        menu.push_pointer_transition(
+                            pointer_frame.cursor,
+                            scale_factor,
+                            pointer_frame.button_down,
+                        );
+                    }
+                }
+                menu.step()?;
+                Ok(menu.drain_actions())
             });
-            if let Some(Err(error)) = result {
-                self.latch_menu_failure("frame", error);
+            match result {
+                Some(Ok(actions)) => {
+                    for action in actions {
+                        self.apply_menu_action(action);
+                    }
+                }
+                Some(Err(error)) => self.latch_menu_failure("frame", error),
+                None => {}
             }
         }
     }
@@ -854,7 +1036,7 @@ impl Game for Widget {
         // Desktop UI coordinate contract: Pocket3D surface/cursor coordinates
         // are physical px; MenuGuest's UiSurface/layout/hit-test coordinates
         // are logical px = physical px / scale; UiRenderer multiplies the
-        // logical DrawList by that scale into the physical target. The future
+        // logical DrawList by that scale into the physical target. The
         // pointer bridge therefore uses full numeric logical svc coordinates,
         // never the packed 9-bit Guest::frame_with_touches representation.
         if self.menu_health.is_healthy() {
@@ -912,6 +1094,13 @@ impl Game for Widget {
 
     fn wants_exit(&self) -> bool {
         self.exit
+    }
+
+    fn drag_at(&mut self, cursor: glam::Vec2) -> bool {
+        let owned = self.menu_owns_pointer(cursor);
+        self.menu_pointer_owned = owned;
+        self.pending_menu_press = Some(MenuPress { cursor, owned });
+        native_drag_allowed_for_menu_pointer(owned)
     }
 }
 

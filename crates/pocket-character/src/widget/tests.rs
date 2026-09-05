@@ -1,4 +1,5 @@
 use super::*;
+use crate::menu_guest::MenuAction;
 use crate::settings::{AntiAliasingPreference, AppSettings, RenderSettings};
 use glam::Vec2;
 use tempfile::tempdir;
@@ -69,6 +70,179 @@ fn live_settings_are_available_before_model_load() {
     let snapshot = widget.controls_snapshot();
     assert_eq!(snapshot.base_fov_deg(), 35.0);
     assert_eq!(snapshot.base_distance_scale(), 0.75);
+}
+
+#[test]
+fn discrete_menu_actions_map_to_current_base_values() {
+    let mut widget = test_widget();
+    widget.apply_control_action(ControlAction::SetBaseFov(55.0));
+    widget.apply_control_action(ControlAction::SetBaseDistance(0.8));
+
+    assert_eq!(
+        widget.menu_control_action(MenuAction::FovDecrement),
+        ControlAction::SetBaseFov(super::camera::controls::base_fov_after_step(55.0, -1))
+    );
+    assert_eq!(
+        widget.menu_control_action(MenuAction::FovIncrement),
+        ControlAction::SetBaseFov(super::camera::controls::base_fov_after_step(55.0, 1))
+    );
+    assert_eq!(
+        widget.menu_control_action(MenuAction::DistanceDecrement),
+        ControlAction::SetBaseDistance(super::camera::controls::base_distance_after_step(0.8, -1))
+    );
+    assert_eq!(
+        widget.menu_control_action(MenuAction::DistanceIncrement),
+        ControlAction::SetBaseDistance(super::camera::controls::base_distance_after_step(0.8, 1))
+    );
+    assert_eq!(
+        widget.menu_control_action(MenuAction::ResetRuntimeCamera),
+        ControlAction::ResetRuntimeCamera
+    );
+}
+
+#[test]
+fn one_discrete_menu_change_persists_once() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let mut widget =
+        Widget::new_with_settings_path(test_config(), AppSettings::default(), Some(path.clone()));
+    let expected = super::camera::controls::base_fov_after_step(widget.settings.camera.fov_deg, 1);
+
+    widget.apply_menu_action(MenuAction::FovIncrement);
+
+    assert_eq!(widget.settings.camera.fov_deg, expected);
+    assert_eq!(widget.save_count, 1);
+    assert_eq!(AppSettings::load_from_path(&path).camera.fov_deg, expected);
+}
+
+#[test]
+fn reset_menu_action_preserves_base_settings_and_does_not_persist() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let settings = AppSettings {
+        camera: CameraSettings {
+            fov_deg: 55.0,
+            distance_scale: 0.8,
+            ..CameraSettings::default()
+        },
+        ..AppSettings::default()
+    };
+    let mut widget = Widget::new_with_settings_path(test_config(), settings, Some(path));
+    widget.set_camera_adjustments(CameraRuntimeAdjustments {
+        fov_delta_deg: 6.0,
+        distance_scale_delta: -0.1,
+        yaw_deg: 15.0,
+        ..CameraRuntimeAdjustments::default()
+    });
+
+    widget.apply_menu_action(MenuAction::ResetRuntimeCamera);
+
+    assert_eq!(widget.settings.camera.fov_deg, 55.0);
+    assert_eq!(widget.settings.camera.distance_scale, 0.8);
+    assert_eq!(
+        widget.camera_controls.adjustments(),
+        CameraRuntimeAdjustments::default()
+    );
+    assert_eq!(widget.save_count, 0);
+}
+
+#[test]
+fn menu_owned_pointer_blocks_native_drag_and_character_click() {
+    assert!(!native_drag_allowed_for_menu_pointer(true));
+    assert!(native_drag_allowed_for_menu_pointer(false));
+}
+
+#[test]
+fn pointer_press_is_buffered_at_press_position_across_zero_tick_frames() {
+    let mut widget = test_widget();
+    let press_cursor = Vec2::new(24.0, 520.0);
+    let release_cursor = Vec2::new(80.0, 80.0);
+    let mut input = Input::default();
+    input.inject_cursor(press_cursor.x, press_cursor.y);
+    input.inject_mouse_button(pocket3d::winit::event::MouseButton::Left, true);
+    // The desktop host calls drag_at at the native press edge, before a later
+    // cursor move/release can change Input::cursor().
+    assert!(widget.drag_at(press_cursor));
+    input.inject_cursor(release_cursor.x, release_cursor.y);
+    input.inject_mouse_button(pocket3d::winit::event::MouseButton::Left, false);
+
+    widget.frame(0.0, &input);
+    input.end_frame();
+    widget.frame(0.0, &input);
+
+    assert_eq!(widget.pending_menu_pointer.len(), 1);
+    let frame = widget.pending_menu_pointer[0];
+    assert_eq!(frame.press_cursor, Some(press_cursor));
+    assert_eq!(frame.cursor, Some(release_cursor));
+    assert!(frame.pressed_edge);
+    assert!(!frame.button_down);
+    assert_eq!(widget.pending_character_clicks, 1);
+}
+
+#[test]
+fn focus_loss_buffers_cancellation_and_clears_pending_character_click() {
+    let mut widget = test_widget();
+    let cursor = Vec2::new(24.0, 520.0);
+    let mut input = Input::default();
+    input.inject_cursor(cursor.x, cursor.y);
+    input.inject_mouse_button(pocket3d::winit::event::MouseButton::Left, true);
+    assert!(widget.drag_at(cursor));
+    widget.frame(0.0, &input);
+
+    input.end_frame();
+    input.clear();
+    widget.frame(0.0, &input);
+
+    assert_eq!(widget.pending_character_clicks, 0);
+    assert!(!widget.menu_pointer_owned);
+    assert_eq!(widget.pending_menu_pointer.len(), 2);
+    assert!(widget.pending_menu_pointer[1].cancelled);
+}
+
+#[test]
+fn multiple_outside_presses_preserve_character_click_count_across_zero_tick_frames() {
+    let mut widget = test_widget();
+    let cursor = Vec2::new(24.0, 520.0);
+    let mut input = Input::default();
+
+    for _ in 0..2 {
+        input.inject_cursor(cursor.x, cursor.y);
+        input.inject_mouse_button(pocket3d::winit::event::MouseButton::Left, true);
+        assert!(widget.drag_at(cursor));
+        widget.frame(0.0, &input);
+        input.end_frame();
+
+        input.inject_mouse_button(pocket3d::winit::event::MouseButton::Left, false);
+        widget.frame(0.0, &input);
+        input.end_frame();
+    }
+
+    assert_eq!(widget.pending_character_clicks, 2);
+}
+
+#[test]
+fn unhealthy_menu_discards_pointer_buffer_and_stops_recording_frames() {
+    let mut widget = test_widget();
+    widget.pending_menu_pointer.push(MenuPointerFrame {
+        cursor: Some(Vec2::new(10.0, 10.0)),
+        press_cursor: Some(Vec2::new(10.0, 10.0)),
+        pressed_edge: true,
+        button_down: true,
+        cancelled: false,
+    });
+    widget.pending_menu_press = Some(MenuPress {
+        cursor: Vec2::new(10.0, 10.0),
+        owned: true,
+    });
+    widget.latch_menu_failure("test", anyhow::anyhow!("terminal"));
+
+    assert!(widget.pending_menu_pointer.is_empty());
+    assert!(widget.pending_menu_press.is_none());
+
+    let mut input = Input::default();
+    input.inject_cursor(80.0, 80.0);
+    widget.frame(0.0, &input);
+    assert!(widget.pending_menu_pointer.is_empty());
 }
 
 #[test]

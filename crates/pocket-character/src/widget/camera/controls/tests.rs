@@ -267,6 +267,26 @@ fn f8_q_and_e_adjust_fov_without_other_camera_actions() {
 }
 
 #[test]
+fn discrete_menu_steps_match_one_keyboard_control_tick() {
+    let fov_decrement = camera_adjustments_after_keys(&[KeyCode::KeyQ]);
+    let fov_increment = camera_adjustments_after_keys(&[KeyCode::KeyE]);
+    approx_eq(fov_decrement.fov_delta_deg, base_fov_after_step(0.0, -1));
+    approx_eq(fov_increment.fov_delta_deg, base_fov_after_step(0.0, 1));
+
+    let distance_decrement = camera_adjustments_after_keys(&[KeyCode::ShiftLeft, KeyCode::ArrowUp]);
+    let distance_increment =
+        camera_adjustments_after_keys(&[KeyCode::ShiftLeft, KeyCode::ArrowDown]);
+    approx_eq(
+        distance_decrement.distance_scale_delta,
+        base_distance_after_step(0.0, -1),
+    );
+    approx_eq(
+        distance_increment.distance_scale_delta,
+        base_distance_after_step(0.0, 1),
+    );
+}
+
+#[test]
 fn f8_fov_bracket_aliases_match_q_and_e() {
     let q = camera_adjustments_after_keys(&[KeyCode::KeyQ]);
     let left_bracket = camera_adjustments_after_keys(&[KeyCode::BracketLeft]);

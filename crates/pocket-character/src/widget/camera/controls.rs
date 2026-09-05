@@ -6,6 +6,12 @@ use super::{CameraPanContext, CameraRuntimeAdjustments, finite_value};
 
 const CAMERA_FOV_RATE_DEG_PER_SEC: f32 = 45.0;
 const CAMERA_DISTANCE_RATE_PER_SEC: f32 = 0.75;
+/// The fixed 60 Hz host tick makes one discrete menu step equal to one
+/// keyboard-control tick. Keeping the derivation here means the menu never
+/// owns camera tuning constants.
+const CAMERA_CONTROL_TICK_HZ: f32 = 60.0;
+pub(crate) const CAMERA_FOV_STEP_DEG: f32 = CAMERA_FOV_RATE_DEG_PER_SEC / CAMERA_CONTROL_TICK_HZ;
+pub(crate) const CAMERA_DISTANCE_STEP: f32 = CAMERA_DISTANCE_RATE_PER_SEC / CAMERA_CONTROL_TICK_HZ;
 /// Temporary keyboard tuning in rest-center NDC units per second. This
 /// approximately preserves the previous manual pan feel for the default
 /// character frame and is deliberately separate from the safety boundary.
@@ -52,6 +58,14 @@ fn fov_axis(input: &Input) -> f32 {
     let increase = input.key_down(KeyCode::KeyE) || input.key_down(KeyCode::BracketRight);
     let decrease = input.key_down(KeyCode::KeyQ) || input.key_down(KeyCode::BracketLeft);
     (increase as i8 - decrease as i8) as f32
+}
+
+pub(crate) fn base_fov_after_step(base_fov_deg: f32, direction: i8) -> f32 {
+    base_fov_deg + direction as f32 * CAMERA_FOV_STEP_DEG
+}
+
+pub(crate) fn base_distance_after_step(base_distance_scale: f32, direction: i8) -> f32 {
+    base_distance_scale + direction as f32 * CAMERA_DISTANCE_STEP
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
