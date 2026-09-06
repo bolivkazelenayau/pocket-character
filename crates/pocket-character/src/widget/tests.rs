@@ -1,7 +1,7 @@
 use super::*;
 use crate::menu_guest::MenuAction;
 use crate::settings::{AntiAliasingPreference, AppSettings, RenderSettings};
-use glam::Vec2;
+use glam::{Vec2, Vec3};
 use tempfile::tempdir;
 
 fn test_widget() -> Widget {
@@ -22,6 +22,65 @@ fn test_config() -> WidgetConfig {
 
 fn approx_eq(actual: f32, expected: f32) {
     assert!((actual - expected).abs() < 1.0e-5, "{actual} != {expected}");
+}
+
+fn canonical_test_aabb() -> (Vec3, Vec3) {
+    (Vec3::new(-0.4, 0.0, -0.2), Vec3::new(0.6, 1.8, 0.4))
+}
+
+fn resolved_camera_for_widget(
+    widget: &Widget,
+    aabb: (Vec3, Vec3),
+    aspect: f32,
+) -> super::camera::CameraParameters {
+    super::camera::resolve_camera_parameters_with_aspect(
+        aabb,
+        widget.settings.camera,
+        widget.camera_controls.adjustments(),
+        aspect,
+    )
+}
+
+fn assert_widget_cameras_equivalent(
+    actual: super::camera::CameraParameters,
+    expected: super::camera::CameraParameters,
+    aspect: f32,
+) {
+    super::camera::assert_resolved_camera_equivalent(actual, expected, aspect);
+}
+
+fn assert_save_reset_reload_preserves_camera(
+    runtime: CameraRuntimeAdjustments,
+    expected_fov: f32,
+    expected_distance: f32,
+) {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let mut widget =
+        Widget::new_with_settings_path(test_config(), AppSettings::default(), Some(path.clone()));
+    widget.set_camera_adjustments(runtime);
+
+    let aabb = canonical_test_aabb();
+    let aspect = DEFAULT_VIEWPORT_ASPECT;
+    let before_save = resolved_camera_for_widget(&widget, aabb, aspect);
+    widget.apply_control_action(ControlAction::SaveCamera);
+    let after_save = resolved_camera_for_widget(&widget, aabb, aspect);
+    assert_widget_cameras_equivalent(after_save, before_save, aspect);
+
+    widget.apply_control_action(ControlAction::ResetRuntimeCamera);
+    let after_reset = resolved_camera_for_widget(&widget, aabb, aspect);
+    assert_widget_cameras_equivalent(after_reset, after_save, aspect);
+
+    let reloaded_settings = AppSettings::load_from_path(&path);
+    let reloaded_widget = Widget::new_with_settings_path(test_config(), reloaded_settings, None);
+    let reloaded = resolved_camera_for_widget(&reloaded_widget, aabb, aspect);
+    assert_widget_cameras_equivalent(reloaded, after_save, aspect);
+    assert_eq!(widget.settings.camera.fov_deg, expected_fov);
+    approx_eq(widget.settings.camera.distance_scale, expected_distance);
+    assert_eq!(
+        widget.camera_controls.adjustments(),
+        CameraRuntimeAdjustments::default()
+    );
 }
 
 #[test]
@@ -80,6 +139,78 @@ fn live_camera_values_are_available_before_model_load() {
 }
 
 #[test]
+fn exact_effective_fov_edit_changes_live_camera_without_rebasing_saved_camera() {
+    let mut widget = test_widget();
+    widget.apply_control_action(ControlAction::SetEffectiveFov(55.0));
+
+    let snapshot = widget.apply_control_action(ControlAction::SetEffectiveFov(70.0));
+
+    assert_eq!(widget.settings.camera.fov_deg, 40.0);
+    assert_eq!(widget.settings.camera.distance_scale, 0.6);
+    assert_eq!(widget.camera_controls.adjustments().fov_delta_deg, 30.0);
+    assert_eq!(snapshot.effective_fov_deg(), 70.0);
+    assert_eq!(snapshot.effective_distance_scale(), 0.6);
+    assert_eq!(widget.save_count, 0);
+}
+
+#[test]
+fn exact_effective_distance_edit_changes_live_camera_without_rebasing_saved_camera() {
+    let mut widget = test_widget();
+    widget.apply_control_action(ControlAction::SetEffectiveDistance(2.0));
+
+    let snapshot = widget.apply_control_action(ControlAction::SetEffectiveDistance(9.5));
+
+    assert_eq!(widget.settings.camera.fov_deg, 40.0);
+    assert_eq!(widget.settings.camera.distance_scale, 0.6);
+    approx_eq(
+        widget.camera_controls.adjustments().distance_scale_delta,
+        8.9,
+    );
+    assert_eq!(snapshot.effective_fov_deg(), 40.0);
+    assert_eq!(snapshot.effective_distance_scale(), 9.5);
+    assert_eq!(widget.save_count, 0);
+}
+
+#[test]
+fn direct_camera_edits_use_authoritative_clamps_and_save_once() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let mut widget =
+        Widget::new_with_settings_path(test_config(), AppSettings::default(), Some(path.clone()));
+
+    let fov = widget.apply_control_action(ControlAction::SetEffectiveFov(999.0));
+    let distance = widget.apply_control_action(ControlAction::SetEffectiveDistance(-999.0));
+    assert_eq!(fov.effective_fov_deg(), 179.0);
+    assert_eq!(distance.effective_distance_scale(), 0.1);
+    assert_eq!(widget.settings.camera.fov_deg, 40.0);
+    assert_eq!(widget.settings.camera.distance_scale, 0.6);
+    assert_eq!(widget.save_count, 0);
+
+    let saved = widget.apply_control_action(ControlAction::SaveCamera);
+    assert_eq!(saved.effective_fov_deg(), 179.0);
+    assert_eq!(saved.effective_distance_scale(), 0.1);
+    assert_eq!(widget.save_count, 1);
+    let persisted = AppSettings::load_from_path(&path);
+    assert_eq!(persisted.camera.fov_deg, 179.0);
+    assert_eq!(persisted.camera.distance_scale, 0.1);
+}
+
+#[test]
+fn reset_after_an_unsaved_direct_camera_edit_restores_saved_values() {
+    let mut widget = test_widget();
+    widget.apply_control_action(ControlAction::SetEffectiveFov(70.0));
+    widget.apply_control_action(ControlAction::SetEffectiveDistance(2.0));
+
+    let snapshot = widget.apply_control_action(ControlAction::ResetRuntimeCamera);
+
+    assert_eq!(snapshot.effective_fov_deg(), 40.0);
+    assert_eq!(snapshot.effective_distance_scale(), 0.6);
+    assert_eq!(widget.settings.camera.fov_deg, 40.0);
+    assert_eq!(widget.settings.camera.distance_scale, 0.6);
+    assert_eq!(widget.save_count, 0);
+}
+
+#[test]
 fn discrete_menu_actions_map_to_live_camera_actions() {
     let mut widget = test_widget();
     widget.settings.camera.fov_deg = 55.0;
@@ -100,6 +231,14 @@ fn discrete_menu_actions_map_to_live_camera_actions() {
     assert_eq!(
         widget.menu_control_action(MenuAction::DistanceIncrement),
         ControlAction::AdjustDistance(1)
+    );
+    assert_eq!(
+        widget.menu_control_action(MenuAction::SetEffectiveFov(70.0)),
+        ControlAction::SetEffectiveFov(70.0)
+    );
+    assert_eq!(
+        widget.menu_control_action(MenuAction::SetEffectiveDistance(2.0)),
+        ControlAction::SetEffectiveDistance(2.0)
     );
     assert_eq!(
         widget.menu_control_action(MenuAction::ResetRuntimeCamera),
@@ -1137,48 +1276,150 @@ fn keyboard_and_pocket_ui_distance_steps_share_the_effective_camera_path() {
 }
 
 #[test]
-fn save_camera_rebases_optics_without_a_visible_jump() {
+fn save_camera_rebase_preserves_resolved_camera() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("settings.json");
-    let settings = AppSettings {
-        camera: CameraSettings {
-            fov_deg: 55.0,
-            distance_scale: 0.8,
-            ..CameraSettings::default()
-        },
-        ..AppSettings::default()
-    };
+    let settings = AppSettings::default();
     let mut widget = Widget::new_with_settings_path(test_config(), settings, Some(path.clone()));
-    widget.set_camera_adjustments(CameraRuntimeAdjustments {
-        fov_delta_deg: 6.0,
-        distance_scale_delta: -0.1,
-        pan_ndc: Vec2::new(0.03, -0.02),
+    let runtime = CameraRuntimeAdjustments {
+        fov_delta_deg: 130.0,
+        distance_scale_delta: 1.4,
+        pan_ndc: Vec2::new(0.04, -0.03),
         yaw_deg: 12.0,
         roll_deg: -8.0,
         pitch_deg: 5.0,
-    });
-    let before = widget.effective_camera_values();
+    };
+    widget.set_camera_adjustments(runtime);
+    let aabb = canonical_test_aabb();
+    let aspect = DEFAULT_VIEWPORT_ASPECT;
+    let before = resolved_camera_for_widget(&widget, aabb, aspect);
 
     let snapshot = widget.apply_control_action(ControlAction::SaveCamera);
-    let after = widget.effective_camera_values();
+    let after = resolved_camera_for_widget(&widget, aabb, aspect);
 
-    assert_eq!(after, before);
-    assert_eq!(widget.settings.camera.fov_deg, 61.0);
-    approx_eq(widget.settings.camera.distance_scale, 0.7);
+    assert_widget_cameras_equivalent(after, before, aspect);
+    assert_eq!(widget.settings.camera.fov_deg, 170.0);
+    approx_eq(widget.settings.camera.distance_scale, 2.0);
     assert_eq!(widget.camera_controls.adjustments().fov_delta_deg, 0.0);
     assert_eq!(
         widget.camera_controls.adjustments().distance_scale_delta,
         0.0
     );
-    assert_eq!(widget.camera_controls.adjustments().pan_ndc, before.pan_ndc);
-    assert_eq!(widget.camera_controls.adjustments().yaw_deg, before.yaw_deg);
-    assert_eq!(snapshot.effective_fov_deg(), 61.0);
-    approx_eq(snapshot.effective_distance_scale(), 0.7);
+    assert_eq!(
+        widget.camera_controls.adjustments().pan_ndc,
+        runtime.pan_ndc
+    );
+    assert_eq!(
+        widget.camera_controls.adjustments().yaw_deg,
+        runtime.yaw_deg
+    );
+    assert_eq!(snapshot.effective_fov_deg(), 170.0);
+    approx_eq(snapshot.effective_distance_scale(), 2.0);
     assert_eq!(widget.save_count, 1);
 
     let persisted = AppSettings::load_from_path(&path);
-    assert_eq!(persisted.camera.fov_deg, 61.0);
-    approx_eq(persisted.camera.distance_scale, 0.7);
+    assert_eq!(persisted.camera.fov_deg, 170.0);
+    approx_eq(persisted.camera.distance_scale, 2.0);
+}
+
+#[test]
+fn fov_save_reset_and_reload_preserve_resolved_camera() {
+    assert_save_reset_reload_preserves_camera(
+        CameraRuntimeAdjustments {
+            fov_delta_deg: 49.9,
+            ..CameraRuntimeAdjustments::default()
+        },
+        89.9,
+        0.6,
+    );
+}
+
+#[test]
+fn distance_save_reset_and_reload_preserve_resolved_camera() {
+    assert_save_reset_reload_preserves_camera(
+        CameraRuntimeAdjustments {
+            distance_scale_delta: 1.4,
+            ..CameraRuntimeAdjustments::default()
+        },
+        40.0,
+        2.0,
+    );
+}
+
+#[test]
+fn reset_immediately_after_save_preserves_resolved_camera() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let mut widget =
+        Widget::new_with_settings_path(test_config(), AppSettings::default(), Some(path));
+    widget.set_camera_adjustments(CameraRuntimeAdjustments {
+        fov_delta_deg: 130.0,
+        distance_scale_delta: 1.4,
+        ..CameraRuntimeAdjustments::default()
+    });
+
+    widget.apply_control_action(ControlAction::SaveCamera);
+    let after_save =
+        resolved_camera_for_widget(&widget, canonical_test_aabb(), DEFAULT_VIEWPORT_ASPECT);
+    widget.apply_control_action(ControlAction::ResetRuntimeCamera);
+    let after_reset =
+        resolved_camera_for_widget(&widget, canonical_test_aabb(), DEFAULT_VIEWPORT_ASPECT);
+
+    assert_widget_cameras_equivalent(after_reset, after_save, DEFAULT_VIEWPORT_ASPECT);
+    assert_eq!(
+        widget.camera_controls.adjustments(),
+        CameraRuntimeAdjustments::default()
+    );
+    assert_eq!(widget.settings.camera.fov_deg, 170.0);
+    approx_eq(widget.settings.camera.distance_scale, 2.0);
+    assert_eq!(widget.save_count, 1);
+}
+
+#[test]
+fn persisted_reload_matches_pre_save_live_camera() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let mut widget =
+        Widget::new_with_settings_path(test_config(), AppSettings::default(), Some(path.clone()));
+    widget.set_camera_adjustments(CameraRuntimeAdjustments {
+        fov_delta_deg: 130.0,
+        distance_scale_delta: 1.4,
+        ..CameraRuntimeAdjustments::default()
+    });
+    let before_save =
+        resolved_camera_for_widget(&widget, canonical_test_aabb(), DEFAULT_VIEWPORT_ASPECT);
+
+    widget.apply_control_action(ControlAction::SaveCamera);
+    let reloaded_settings = AppSettings::load_from_path(&path);
+    let reloaded_widget = Widget::new_with_settings_path(test_config(), reloaded_settings, None);
+    let reloaded = resolved_camera_for_widget(
+        &reloaded_widget,
+        canonical_test_aabb(),
+        DEFAULT_VIEWPORT_ASPECT,
+    );
+
+    assert_widget_cameras_equivalent(reloaded, before_save, DEFAULT_VIEWPORT_ASPECT);
+}
+
+#[test]
+fn reset_without_save_returns_to_canonical_saved_camera() {
+    let mut widget = test_widget();
+    let saved = resolved_camera_for_widget(&widget, canonical_test_aabb(), DEFAULT_VIEWPORT_ASPECT);
+    widget.set_camera_adjustments(CameraRuntimeAdjustments {
+        fov_delta_deg: 130.0,
+        distance_scale_delta: 1.4,
+        pan_ndc: Vec2::new(0.04, -0.03),
+        yaw_deg: 12.0,
+        roll_deg: -8.0,
+        pitch_deg: 5.0,
+    });
+
+    widget.apply_control_action(ControlAction::ResetRuntimeCamera);
+    let reset = resolved_camera_for_widget(&widget, canonical_test_aabb(), DEFAULT_VIEWPORT_ASPECT);
+
+    assert_widget_cameras_equivalent(reset, saved, DEFAULT_VIEWPORT_ASPECT);
+    assert_eq!(widget.settings.camera, CameraSettings::default());
+    assert_eq!(widget.save_count, 0);
 }
 
 #[test]

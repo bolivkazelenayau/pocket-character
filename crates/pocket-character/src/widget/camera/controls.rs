@@ -2,6 +2,8 @@ use glam::Vec2;
 use pocket3d::input::Input;
 use pocket3d::winit::keyboard::KeyCode;
 
+use crate::settings::CameraSettings;
+
 use super::{CameraPanContext, CameraRuntimeAdjustments, finite_value};
 
 const CAMERA_FOV_RATE_DEG_PER_SEC: f32 = 45.0;
@@ -418,6 +420,33 @@ impl CameraControls {
         next.roll_deg = roll_deg;
         self.camera_adjustments = next.sanitized();
         self.camera_adjustments.roll_deg
+    }
+
+    /// Set an effective optic without rebasing the persisted camera. The
+    /// runtime delta is derived from the sanitized base so Save remains the
+    /// only operation that changes AppSettings.camera.
+    pub(crate) fn set_effective_fov_deg(&mut self, fov_deg: f32, base: CameraSettings) -> f32 {
+        let base = base.sanitized();
+        let mut next = self.camera_adjustments;
+        next.fov_delta_deg = fov_deg - base.fov_deg;
+        self.camera_adjustments = next.sanitized();
+        self.camera_adjustments.effective(base).settings.fov_deg
+    }
+
+    /// Set an effective distance scale without touching persisted settings.
+    pub(crate) fn set_effective_distance_scale(
+        &mut self,
+        distance_scale: f32,
+        base: CameraSettings,
+    ) -> f32 {
+        let base = base.sanitized();
+        let mut next = self.camera_adjustments;
+        next.distance_scale_delta = distance_scale - base.distance_scale;
+        self.camera_adjustments = next.sanitized();
+        self.camera_adjustments
+            .effective(base)
+            .settings
+            .distance_scale
     }
 
     pub(crate) fn clear_fov_delta(&mut self) {

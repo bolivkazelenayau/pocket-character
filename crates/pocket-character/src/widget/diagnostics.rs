@@ -113,7 +113,7 @@ pub(super) fn format_debug_hud(
                 "Cam distance: {:.3}x height",
                 camera.settings.distance_scale
             ),
-            format!("Cam headroom: {:.3}", camera.settings.headroom),
+            format!("Cam authored headroom: {:.3}", camera.settings.headroom),
             format!("Cam pan X: {:.3} NDC", camera.pan_ndc.x),
             format!("Cam pan Y: {:.3} NDC", camera.pan_ndc.y),
             format!("Cam yaw: {:.1} deg", camera.yaw_deg),

@@ -27,6 +27,8 @@ use crate::settings::AntiAliasingPreference;
 pub(crate) enum ControlAction {
     AdjustDistance(i8),
     AdjustFov(i8),
+    SetEffectiveDistance(f32),
+    SetEffectiveFov(f32),
     SetYaw(f32),
     SetPitch(f32),
     SetRoll(f32),

@@ -118,7 +118,9 @@ impl<'de> Deserialize<'de> for AntiAliasingPreference {
 /// Character-specific camera framing policy.
 ///
 /// `distance_scale` is relative to the model's AABB height, while `headroom`
-/// is the normalized fraction of the vertical viewport below its top edge.
+/// is authored/reference-frame vertical composition from the viewport top to
+/// the framed model top. It is not exact current screen-space headroom when
+/// optics change.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CameraSettings {
     #[serde(default = "default_fov_deg", deserialize_with = "deserialize_fov_deg")]

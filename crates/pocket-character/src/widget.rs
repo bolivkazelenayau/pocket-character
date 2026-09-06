@@ -575,6 +575,8 @@ impl Widget {
             MenuAction::DistanceIncrement => ControlAction::AdjustDistance(1),
             MenuAction::FovDecrement => ControlAction::AdjustFov(-1),
             MenuAction::FovIncrement => ControlAction::AdjustFov(1),
+            MenuAction::SetEffectiveDistance(value) => ControlAction::SetEffectiveDistance(value),
+            MenuAction::SetEffectiveFov(value) => ControlAction::SetEffectiveFov(value),
             MenuAction::SaveCamera => ControlAction::SaveCamera,
             MenuAction::ResetRuntimeCamera => ControlAction::ResetRuntimeCamera,
         }
@@ -595,11 +597,9 @@ impl Widget {
         self.settings.camera = saved.sanitized();
         self.camera_controls.clear_fov_delta();
         self.camera_controls.clear_distance_delta();
-        // The live camera already contains the effective FOV/distance. Do not
-        // re-resolve the bounds-derived baseline here: rebasing the persisted
-        // optics would otherwise recompute headroom and visibly move the
-        // camera on the Save action. The next normal camera change/reset can
-        // resolve against the new saved baseline.
+        // The live camera already contains the effective optics. Clearing
+        // these deltas leaves the same effective settings, so Save remains
+        // visually inert without another camera application.
         self.persist_settings();
     }
 
@@ -621,6 +621,16 @@ impl Widget {
                 if self.camera_controls.adjust_distance_step(direction) {
                     self.reapply_camera();
                 }
+            }
+            ControlAction::SetEffectiveFov(value) => {
+                self.camera_controls
+                    .set_effective_fov_deg(value, self.settings.camera);
+                self.reapply_camera();
+            }
+            ControlAction::SetEffectiveDistance(value) => {
+                self.camera_controls
+                    .set_effective_distance_scale(value, self.settings.camera);
+                self.reapply_camera();
             }
             ControlAction::SetYaw(yaw_deg) => {
                 self.camera_controls.set_yaw_deg(yaw_deg);

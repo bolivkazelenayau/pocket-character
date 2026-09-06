@@ -160,12 +160,14 @@ fn decode_text_input_state(line: &str) -> Option<MenuTextInputCapture> {
 /// Discrete intents accepted from the PocketUI controls guest. The guest only
 /// names an operation; the widget applies it to the authoritative live camera
 /// or routes an explicit Save through the persistence boundary.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum MenuAction {
     DistanceDecrement,
     DistanceIncrement,
     FovDecrement,
     FovIncrement,
+    SetEffectiveDistance(f32),
+    SetEffectiveFov(f32),
     SaveCamera,
     ResetRuntimeCamera,
 }
@@ -177,6 +179,7 @@ pub(crate) enum MenuAction {
 struct MenuActionWire {
     t: String,
     action: String,
+    value: Option<f32>,
 }
 
 fn decode_menu_action(line: &str) -> Option<MenuAction> {
@@ -189,6 +192,14 @@ fn decode_menu_action(line: &str) -> Option<MenuAction> {
         "distance_increment" => Some(MenuAction::DistanceIncrement),
         "fov_decrement" => Some(MenuAction::FovDecrement),
         "fov_increment" => Some(MenuAction::FovIncrement),
+        "set_effective_distance" => wire
+            .value
+            .filter(|value| value.is_finite())
+            .map(MenuAction::SetEffectiveDistance),
+        "set_effective_fov" => wire
+            .value
+            .filter(|value| value.is_finite())
+            .map(MenuAction::SetEffectiveFov),
         "save_camera" => Some(MenuAction::SaveCamera),
         "reset_runtime_camera" => Some(MenuAction::ResetRuntimeCamera),
         _ => None,
@@ -514,6 +525,14 @@ mod tests {
                 MenuAction::FovIncrement,
             ),
             (
+                r#"{"t":"action","action":"set_effective_distance","value":9.5}"#,
+                MenuAction::SetEffectiveDistance(9.5),
+            ),
+            (
+                r#"{"t":"action","action":"set_effective_fov","value":120.2}"#,
+                MenuAction::SetEffectiveFov(120.2),
+            ),
+            (
                 r#"{"t":"action","action":"save_camera"}"#,
                 MenuAction::SaveCamera,
             ),
@@ -537,6 +556,8 @@ mod tests {
             r#"{"t":"action"}"#,
             r#"{"t":"action","action":null}"#,
             r#"{"t":"action","action":"future_value"}"#,
+            r#"{"t":"action","action":"set_effective_fov"}"#,
+            r#"{"t":"action","action":"set_effective_distance","value":null}"#,
         ] {
             assert_eq!(decode_menu_action(line), None, "{line}");
         }

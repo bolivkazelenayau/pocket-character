@@ -9,6 +9,13 @@ const MIN_MODEL_HEIGHT: f32 = 0.001;
 const MAX_MODEL_BOUND: f32 = 100_000.0;
 /// Rest-pose AABBs can omit a small animated excursion from hair/accessories.
 const TOP_SAFETY_MARGIN: f32 = 0.02;
+/// Frozen authored framing scale, calibrated from the historical default
+/// camera: `2 * 0.60 * tan(40deg / 2)`.
+///
+/// This is deliberately an explicit model-relative constant rather than a
+/// value derived from `CameraSettings::default()`. Product defaults may
+/// change without changing the authored/reference frame.
+pub(super) const REFERENCE_VIEW_HEIGHT_PER_MODEL_HEIGHT: f32 = 0.436_764_3;
 pub(super) const DEFAULT_VIEWPORT_ASPECT: f32 = 0.75;
 const MAX_RUNTIME_FOV_DELTA_DEG: f32 = 178.0;
 const MAX_RUNTIME_DISTANCE_DELTA: f32 = 10.0;
@@ -190,24 +197,35 @@ pub(super) fn finite_value(value: f32, fallback: f32) -> f32 {
     if value.is_finite() { value } else { fallback }
 }
 
-/// Resolve character-owned framing settings against model bounds.
-///
-/// The top of the model (including the safety margin) is placed at the
-/// requested normalized headroom below the top of the vertical viewport.
-fn resolve_camera_frame(aabb: (Vec3, Vec3), settings: CameraSettings) -> CameraFrame {
-    let settings = settings.sanitized();
+/// Resolve the authored/reference-frame composition target against model
+/// bounds. FOV and distance intentionally do not participate in this math.
+fn resolve_authored_target(aabb: (Vec3, Vec3), headroom: f32) -> (Vec3, f32) {
     let (min, max) = sanitize_model_aabb(aabb);
     let min_y = min.y.min(max.y);
     let max_y = min.y.max(max.y);
     let height = (max_y - min_y).clamp(MIN_MODEL_HEIGHT, MAX_MODEL_BOUND);
+    let framed_top = max_y + height * TOP_SAFETY_MARGIN;
+    let reference_view_height = height * REFERENCE_VIEW_HEIGHT_PER_MODEL_HEIGHT;
+    let target_y = framed_top - (0.5 - headroom) * reference_view_height;
+
+    (
+        Vec3::new((min.x + max.x) * 0.5, target_y, (min.z + max.z) * 0.5),
+        height,
+    )
+}
+
+/// Resolve a complete camera frame from authored composition settings and
+/// the actual optics. `target` is authored against the frozen reference
+/// frame; distance, FOV, and view height are actual effective optics.
+fn resolve_camera_frame(aabb: (Vec3, Vec3), settings: CameraSettings) -> CameraFrame {
+    let settings = settings.sanitized();
+    let (target, height) = resolve_authored_target(aabb, settings.headroom);
     let distance = height * settings.distance_scale;
     let fov_y = settings.fov_deg.to_radians();
     let view_height = 2.0 * distance * (fov_y * 0.5).tan();
-    let framed_top = max_y + height * TOP_SAFETY_MARGIN;
-    let target_y = framed_top - (0.5 - settings.headroom) * view_height;
 
     CameraFrame {
-        target: Vec3::new((min.x + max.x) * 0.5, target_y, (min.z + max.z) * 0.5),
+        target,
         distance,
         fov_y,
         view_height,
@@ -308,20 +326,14 @@ fn resolve_camera_orientation(
 ) -> CameraOrientation {
     let base_settings = base_settings.sanitized();
     let effective = adjustments.effective(base_settings);
-    let authored_frame = resolve_camera_frame(aabb, base_settings);
-    let effective_distance = authored_frame.distance
-        * (effective.settings.distance_scale / base_settings.distance_scale);
-    let effective_fov_y = effective.settings.fov_deg.to_radians();
-    let baseline_frame = CameraFrame {
-        target: authored_frame.target,
-        distance: effective_distance,
-        fov_y: effective_fov_y,
-        view_height: 2.0 * effective_distance * (effective_fov_y * 0.5).tan(),
-    };
-    let baseline_target = baseline_frame.target;
-    let base_position = baseline_target + Vec3::new(0.0, 0.0, -baseline_frame.distance);
+    // `resolve_camera_frame` resolves the target through the authored
+    // headroom/reference frame; its optical fields are the effective lens
+    // and orbit values supplied here.
+    let frame = resolve_camera_frame(aabb, effective.settings);
+    let baseline_target = frame.target;
+    let base_position = baseline_target + Vec3::new(0.0, 0.0, -frame.distance);
     let mut base_camera = Camera::default();
-    base_camera.fov_y = baseline_frame.fov_y;
+    base_camera.fov_y = frame.fov_y;
     base_camera.znear = 0.05;
     base_camera.pos = base_position;
     base_camera.look_at(baseline_target);
@@ -335,12 +347,12 @@ fn resolve_camera_orientation(
     orientation.yaw = yaw_deg.to_radians();
     orientation.roll = roll_deg.to_radians();
     orientation.pitch = pitch_deg.to_radians();
-    orientation.pos = baseline_target - orientation.forward() * baseline_frame.distance;
+    orientation.pos = baseline_target - orientation.forward() * frame.distance;
 
     let distance = (baseline_target - orientation.pos).length();
 
     CameraOrientation {
-        frame: baseline_frame,
+        frame,
         baseline_target,
         camera: orientation,
         distance,
@@ -403,6 +415,64 @@ fn camera_for_parameters(parameters: CameraParameters) -> Camera {
     camera.fov_y = parameters.frame.fov_y;
     camera.znear = 0.05;
     camera
+}
+
+#[cfg(test)]
+pub(super) fn assert_resolved_camera_equivalent(
+    actual: CameraParameters,
+    expected: CameraParameters,
+    aspect: f32,
+) {
+    fn approx_mat4(actual: glam::Mat4, expected: glam::Mat4) {
+        let actual = actual.to_cols_array();
+        let expected = expected.to_cols_array();
+        assert!(
+            actual
+                .into_iter()
+                .zip(expected)
+                .map(|(actual, expected)| (actual - expected).abs())
+                .fold(0.0, f32::max)
+                < 1.0e-5,
+            "{actual:?} != {expected:?}"
+        );
+    }
+
+    fn approx_vec2(actual: Vec2, expected: Vec2) {
+        assert!(
+            (actual - expected).abs().max_element() < 1.0e-4,
+            "{actual:?} != {expected:?}"
+        );
+    }
+
+    fn approx_vec3(actual: Vec3, expected: Vec3) {
+        assert!(
+            (actual - expected).abs().max_element() < 1.0e-5,
+            "{actual:?} != {expected:?}"
+        );
+    }
+
+    fn approx_scalar(actual: f32, expected: f32) {
+        assert!((actual - expected).abs() < 1.0e-5, "{actual} != {expected}");
+    }
+
+    approx_vec3(actual.baseline_target, expected.baseline_target);
+    approx_vec3(actual.frame.target, expected.frame.target);
+    approx_scalar(actual.frame.distance, expected.frame.distance);
+    approx_scalar(actual.frame.fov_y, expected.frame.fov_y);
+    approx_scalar(actual.frame.view_height, expected.frame.view_height);
+    approx_vec3(actual.position, expected.position);
+    approx_scalar(actual.yaw_deg, expected.yaw_deg);
+    approx_scalar(actual.pitch_deg, expected.pitch_deg);
+    approx_scalar(actual.roll_deg, expected.roll_deg);
+    approx_vec2(actual.pan_ndc, expected.pan_ndc);
+
+    let actual_camera = camera_for_parameters(actual);
+    let expected_camera = camera_for_parameters(expected);
+    approx_mat4(actual_camera.view(), expected_camera.view());
+    approx_mat4(
+        actual_camera.view_proj(aspect),
+        expected_camera.view_proj(aspect),
+    );
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
