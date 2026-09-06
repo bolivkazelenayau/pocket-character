@@ -278,6 +278,22 @@ fn discrete_menu_actions_map_to_live_camera_actions() {
         ControlAction::SetRoll(7.25)
     );
     assert_eq!(
+        widget.menu_control_action(MenuAction::SetHeadroom(0.12)),
+        ControlAction::SetHeadroom(0.12)
+    );
+    assert_eq!(
+        widget.menu_control_action(MenuAction::SetYawSnap(7.5)),
+        ControlAction::SetYawSnap(7.5)
+    );
+    assert_eq!(
+        widget.menu_control_action(MenuAction::SetPitchSnap(22.5)),
+        ControlAction::SetPitchSnap(22.5)
+    );
+    assert_eq!(
+        widget.menu_control_action(MenuAction::SetRollSnap(30.0)),
+        ControlAction::SetRollSnap(30.0)
+    );
+    assert_eq!(
         widget.menu_control_action(MenuAction::ResetRuntimeCamera),
         ControlAction::ResetRuntimeCamera
     );
@@ -1677,6 +1693,115 @@ fn menu_orientation_actions_use_the_session_camera_path_without_persistence() {
     assert_eq!(snapshot.pitch_deg(), 0.0);
     assert_eq!(snapshot.roll_deg(), 0.0);
     assert_eq!(widget.save_count, 0);
+}
+
+#[test]
+fn menu_headroom_updates_live_framing_and_persists_without_rebasing_optics() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let settings = AppSettings::default();
+    std::fs::write(&path, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+    let mut widget = Widget::new_with_settings_path(test_config(), settings, Some(path.clone()));
+    widget.set_camera_adjustments(CameraRuntimeAdjustments {
+        fov_delta_deg: 5.0,
+        distance_scale_delta: 0.2,
+        yaw_deg: 30.0,
+        ..CameraRuntimeAdjustments::default()
+    });
+
+    let aabb = canonical_test_aabb();
+    let before = resolved_camera_for_widget(&widget, aabb, DEFAULT_VIEWPORT_ASPECT);
+    let snapshot = widget.apply_menu_action(MenuAction::SetHeadroom(0.20));
+    let after = resolved_camera_for_widget(&widget, aabb, DEFAULT_VIEWPORT_ASPECT);
+
+    assert_eq!(snapshot.headroom(), 0.20);
+    assert_eq!(widget.settings.camera.headroom, 0.20);
+    assert!((after.baseline_target - before.baseline_target).length() > 1.0e-4);
+    assert_eq!(after.frame.fov_y, before.frame.fov_y);
+    approx_eq(
+        (after.position - after.baseline_target).length(),
+        (before.position - before.baseline_target).length(),
+    );
+    assert_eq!(after.yaw_deg, before.yaw_deg);
+    assert_eq!(after.pitch_deg, before.pitch_deg);
+    assert_eq!(after.roll_deg, before.roll_deg);
+    assert_eq!(widget.save_count, 1);
+    assert_eq!(AppSettings::load_from_path(&path).camera.headroom, 0.20);
+
+    let snapshot = widget.apply_menu_action(MenuAction::SetHeadroom(2.0));
+    assert_eq!(snapshot.headroom(), 0.49);
+    assert_eq!(widget.settings.camera.headroom, 0.49);
+    assert_eq!(AppSettings::load_from_path(&path).camera.headroom, 0.49);
+
+    let snapshot = widget.apply_menu_action(MenuAction::SetHeadroom(-1.0));
+    assert_eq!(snapshot.headroom(), 0.0);
+    assert_eq!(widget.settings.camera.headroom, 0.0);
+    assert_eq!(AppSettings::load_from_path(&path).camera.headroom, 0.0);
+
+    widget.apply_control_action(ControlAction::SetEffectiveFov(55.0));
+    widget.apply_control_action(ControlAction::SetEffectiveDistance(0.9));
+    widget.apply_control_action(ControlAction::SaveCamera);
+    assert_eq!(widget.settings.camera.headroom, 0.0);
+    assert_eq!(AppSettings::load_from_path(&path).camera.headroom, 0.0);
+
+    widget.apply_menu_action(MenuAction::ResetRuntimeCamera);
+    assert_eq!(widget.controls_snapshot().headroom(), 0.0);
+    let reloaded = AppSettings::load_from_path(&path);
+    assert_eq!(reloaded.camera.headroom, 0.0);
+}
+
+#[test]
+fn menu_snap_actions_persist_authoritative_steps_without_moving_pose() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let settings = AppSettings::default();
+    std::fs::write(&path, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+    let mut widget = Widget::new_with_settings_path(test_config(), settings, Some(path.clone()));
+    let existing_adjustments = CameraRuntimeAdjustments {
+        yaw_deg: 20.0,
+        pitch_deg: -8.0,
+        roll_deg: 13.0,
+        ..CameraRuntimeAdjustments::default()
+    };
+    widget.set_camera_adjustments(existing_adjustments);
+
+    let snapshot = widget.apply_menu_action(MenuAction::SetYawSnap(7.5));
+    assert_eq!(snapshot.yaw_snap_deg(), 7.5);
+    let snapshot = widget.apply_menu_action(MenuAction::SetPitchSnap(22.5));
+    assert_eq!(snapshot.pitch_snap_deg(), 22.5);
+    let snapshot = widget.apply_menu_action(MenuAction::SetRollSnap(30.0));
+    assert_eq!(snapshot.roll_snap_deg(), 30.0);
+    assert_eq!(widget.camera_controls.adjustments(), existing_adjustments);
+    assert_eq!(widget.save_count, 3);
+
+    let persisted = AppSettings::load_from_path(&path);
+    assert_eq!(persisted.camera.yaw_snap_deg, 7.5);
+    assert_eq!(persisted.camera.pitch_snap_deg, 22.5);
+    assert_eq!(persisted.camera.roll_snap_deg, 30.0);
+
+    // The next keyboard yaw snap uses the newly persisted step immediately.
+    let mut input = Input::default();
+    input.inject_key(KeyCode::F8, true);
+    widget.frame(0.0, &input);
+    input.inject_key(KeyCode::F8, false);
+    input.inject_key(KeyCode::AltLeft, true);
+    input.inject_key(KeyCode::ShiftLeft, true);
+    input.inject_key(KeyCode::ArrowLeft, true);
+    input.end_frame();
+    widget.frame(0.0, &input);
+    assert_eq!(widget.camera_controls.adjustments().yaw_deg, 22.5);
+
+    widget.apply_control_action(ControlAction::SaveCamera);
+    assert_eq!(AppSettings::load_from_path(&path).camera.yaw_snap_deg, 7.5);
+    widget.apply_menu_action(MenuAction::ResetRuntimeCamera);
+    assert_eq!(widget.controls_snapshot().yaw_snap_deg(), 7.5);
+    assert_eq!(widget.controls_snapshot().pitch_snap_deg(), 22.5);
+    assert_eq!(widget.controls_snapshot().roll_snap_deg(), 30.0);
+
+    let reloaded = AppSettings::load_from_path(&path);
+    assert_eq!(reloaded.camera.yaw_snap_deg, 7.5);
+    assert_eq!(reloaded.camera.pitch_snap_deg, 22.5);
+    assert_eq!(reloaded.camera.roll_snap_deg, 30.0);
 }
 
 #[test]

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { formatCompactFov, formatDegrees } from "./camera-value-format";
+import { formatCompactDecimal, formatCompactFov, formatDegrees } from "./camera-value-format";
 
 describe("compact FOV idle formatting", () => {
   test.each([
@@ -20,5 +20,15 @@ describe("compact camera degree idle formatting", () => {
     [90, "90°"],
   ])("formats %s as %s", (value, expected) => {
     expect(formatDegrees(value)).toBe(expected);
+  });
+});
+
+describe("compact scalar camera formatting", () => {
+  test.each([
+    [0.05, "0.05"],
+    [0.125, "0.13"],
+    [0.4, "0.4"],
+  ])("formats %s as %s", (value, expected) => {
+    expect(formatCompactDecimal(value)).toBe(expected);
   });
 });

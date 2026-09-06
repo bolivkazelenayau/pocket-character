@@ -10,7 +10,7 @@ import { getOps } from "@pocketjs/framework/solid";
 import { focusNode, hitFocusable, pressNode, setActiveNode } from "@pocketjs/framework/input";
 import { onFrame } from "@pocketjs/framework/lifecycle";
 import { mount } from "@pocketjs/framework/solid";
-import { formatCompactFov, formatDegrees } from "./camera-value-format";
+import { formatCompactDecimal, formatCompactFov, formatDegrees } from "./camera-value-format";
 import {
   MSAA_OPTIONS,
   encodeMsaaRequest,
@@ -39,9 +39,13 @@ import { textInput } from "./text-input";
 interface ControlsState {
   effective_fov_deg: number;
   effective_distance_scale: number;
+  headroom: number;
   yaw_deg: number;
   pitch_deg: number;
   roll_deg: number;
+  yaw_snap_deg: number;
+  pitch_snap_deg: number;
+  roll_snap_deg: number;
   requested_msaa: MsaaPreference;
   effective_msaa: number;
   requested_smaa: boolean;
@@ -57,9 +61,13 @@ type ActionName =
   | "fov_increment"
   | "set_effective_fov"
   | "set_effective_distance"
+  | "set_headroom"
   | "set_yaw"
   | "set_pitch"
   | "set_roll"
+  | "set_yaw_snap"
+  | "set_pitch_snap"
+  | "set_roll_snap"
   | "save_camera"
   | "reset_runtime_camera";
 
@@ -71,9 +79,13 @@ const [activePage, setActivePage] = createSignal<SettingsPage>("camera");
 const CAMERA_VALUE_X = 152;
 const CAMERA_DISTANCE_VALUE_Y = 519;
 const CAMERA_FOV_VALUE_Y = 539;
-const CAMERA_YAW_VALUE_Y = 605;
-const CAMERA_PITCH_VALUE_Y = 625;
-const CAMERA_ROLL_VALUE_Y = 645;
+const CAMERA_HEADROOM_VALUE_Y = 559;
+const CAMERA_YAW_VALUE_Y = 625;
+const CAMERA_PITCH_VALUE_Y = 645;
+const CAMERA_ROLL_VALUE_Y = 665;
+const CAMERA_YAW_SNAP_VALUE_Y = 707;
+const CAMERA_PITCH_SNAP_VALUE_Y = 727;
+const CAMERA_ROLL_SNAP_VALUE_Y = 747;
 
 // Pointer ownership follows the framework's focusable hit target. The
 // release compares against the latched down target, so one physical press can
@@ -179,9 +191,13 @@ function pollControls(): void {
           t?: unknown;
           effective_fov_deg?: unknown;
           effective_distance_scale?: unknown;
+          headroom?: unknown;
           yaw_deg?: unknown;
           pitch_deg?: unknown;
           roll_deg?: unknown;
+          yaw_snap_deg?: unknown;
+          pitch_snap_deg?: unknown;
+          roll_snap_deg?: unknown;
           requested_msaa?: unknown;
           effective_msaa?: unknown;
           requested_smaa?: unknown;
@@ -196,9 +212,13 @@ function pollControls(): void {
           if (
             typeof msg.effective_fov_deg !== "number" ||
             typeof msg.effective_distance_scale !== "number" ||
+            typeof msg.headroom !== "number" ||
             typeof msg.yaw_deg !== "number" ||
             typeof msg.pitch_deg !== "number" ||
             typeof msg.roll_deg !== "number" ||
+            typeof msg.yaw_snap_deg !== "number" ||
+            typeof msg.pitch_snap_deg !== "number" ||
+            typeof msg.roll_snap_deg !== "number" ||
             typeof msg.requested_msaa !== "string" ||
             !MSAA_OPTIONS.some((option) => option.preference === msg.requested_msaa) ||
             typeof msg.effective_msaa !== "number" ||
@@ -210,17 +230,25 @@ function pollControls(): void {
             typeof msg.smaa_pending !== "boolean" ||
             !Number.isFinite(msg.effective_fov_deg) ||
             !Number.isFinite(msg.effective_distance_scale) ||
+            !Number.isFinite(msg.headroom) ||
             !Number.isFinite(msg.yaw_deg) ||
             !Number.isFinite(msg.pitch_deg) ||
             !Number.isFinite(msg.roll_deg) ||
+            !Number.isFinite(msg.yaw_snap_deg) ||
+            !Number.isFinite(msg.pitch_snap_deg) ||
+            !Number.isFinite(msg.roll_snap_deg) ||
             !Number.isFinite(msg.effective_msaa)
           ) continue;
           setControls({
             effective_fov_deg: msg.effective_fov_deg,
             effective_distance_scale: msg.effective_distance_scale,
+            headroom: msg.headroom,
             yaw_deg: msg.yaw_deg,
             pitch_deg: msg.pitch_deg,
             roll_deg: msg.roll_deg,
+            yaw_snap_deg: msg.yaw_snap_deg,
+            pitch_snap_deg: msg.pitch_snap_deg,
+            roll_snap_deg: msg.roll_snap_deg,
             requested_msaa: msg.requested_msaa as MsaaPreference,
             effective_msaa: msg.effective_msaa,
             requested_smaa: msg.requested_smaa,
@@ -315,10 +343,18 @@ function inlineNumberCaretFromPointer(x: number, draft: string): number {
   return Math.round((x - CAMERA_VALUE_X - textLeft) / INLINE_NUMBER_CHAR_WIDTH);
 }
 
-function OrientationRow(props: {
+function CameraNumberRow(props: {
   label: string;
   value: () => number | null;
-  commitAction: "set_yaw" | "set_pitch" | "set_roll";
+  format?: (value: number) => string;
+  commitAction:
+    | "set_yaw"
+    | "set_pitch"
+    | "set_roll"
+    | "set_headroom"
+    | "set_yaw_snap"
+    | "set_pitch_snap"
+    | "set_roll_snap";
   captureY: number;
   debugName: string;
 }) {
@@ -329,7 +365,7 @@ function OrientationRow(props: {
         id={`${props.debugName}Value`}
         debugName={`${props.debugName}Value`}
         value={props.value}
-        format={formatDegrees}
+        format={props.format ?? formatDegrees}
         editFormat={(value) => value.toString()}
         onCommit={(value) => sendAction(props.commitAction, value)}
         captureArea={(caret, draft) => inlineNumberCaptureArea(props.captureY, caret, draft)}
@@ -508,6 +544,14 @@ function CameraPanel() {
           decrement={() => sendAction("fov_decrement")}
           increment={() => sendAction("fov_increment")}
         />
+        <CameraNumberRow
+          label="Headroom"
+          value={() => controls()?.headroom ?? null}
+          format={formatCompactDecimal}
+          commitAction="set_headroom"
+          captureY={CAMERA_HEADROOM_VALUE_Y}
+          debugName="Headroom"
+        />
       </View>
       <View class="mt-[6] flex-row items-center justify-end gap-[4]">
         <Focusable
@@ -529,26 +573,52 @@ function CameraPanel() {
         <Text class="text-xs font-bold text-[#7fd0ff]">ORIENTATION</Text>
       </View>
       <View class="mt-[0] flex-col gap-[2]">
-        <OrientationRow
+        <CameraNumberRow
           label="Yaw"
           value={() => controls()?.yaw_deg ?? null}
           commitAction="set_yaw"
           captureY={CAMERA_YAW_VALUE_Y}
           debugName="Yaw"
         />
-        <OrientationRow
+        <CameraNumberRow
           label="Pitch"
           value={() => controls()?.pitch_deg ?? null}
           commitAction="set_pitch"
           captureY={CAMERA_PITCH_VALUE_Y}
           debugName="Pitch"
         />
-        <OrientationRow
+        <CameraNumberRow
           label="Roll"
           value={() => controls()?.roll_deg ?? null}
           commitAction="set_roll"
           captureY={CAMERA_ROLL_VALUE_Y}
           debugName="Roll"
+        />
+      </View>
+      <View class="mt-[8] h-[16] flex-row items-center">
+        <Text class="text-xs font-bold text-[#7fd0ff]">SNAPPING</Text>
+      </View>
+      <View class="mt-[0] flex-col gap-[2]">
+        <CameraNumberRow
+          label="Yaw step"
+          value={() => controls()?.yaw_snap_deg ?? null}
+          commitAction="set_yaw_snap"
+          captureY={CAMERA_YAW_SNAP_VALUE_Y}
+          debugName="YawSnap"
+        />
+        <CameraNumberRow
+          label="Pitch step"
+          value={() => controls()?.pitch_snap_deg ?? null}
+          commitAction="set_pitch_snap"
+          captureY={CAMERA_PITCH_SNAP_VALUE_Y}
+          debugName="PitchSnap"
+        />
+        <CameraNumberRow
+          label="Roll step"
+          value={() => controls()?.roll_snap_deg ?? null}
+          commitAction="set_roll_snap"
+          captureY={CAMERA_ROLL_SNAP_VALUE_Y}
+          debugName="RollSnap"
         />
       </View>
     </SettingsFrame>

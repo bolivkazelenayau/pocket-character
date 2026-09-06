@@ -173,6 +173,10 @@ pub(crate) enum MenuAction {
     SetYaw(f32),
     SetPitch(f32),
     SetRoll(f32),
+    SetHeadroom(f32),
+    SetYawSnap(f32),
+    SetPitchSnap(f32),
+    SetRollSnap(f32),
     SaveCamera,
     ResetRuntimeCamera,
     RequestMsaa(AntiAliasingPreference),
@@ -224,6 +228,26 @@ fn decode_menu_action(line: &str) -> Option<MenuAction> {
             .as_ref()
             .and_then(finite_f32_value)
             .map(MenuAction::SetRoll),
+        "set_headroom" => wire
+            .value
+            .as_ref()
+            .and_then(finite_f32_value)
+            .map(MenuAction::SetHeadroom),
+        "set_yaw_snap" => wire
+            .value
+            .as_ref()
+            .and_then(finite_f32_value)
+            .map(MenuAction::SetYawSnap),
+        "set_pitch_snap" => wire
+            .value
+            .as_ref()
+            .and_then(finite_f32_value)
+            .map(MenuAction::SetPitchSnap),
+        "set_roll_snap" => wire
+            .value
+            .as_ref()
+            .and_then(finite_f32_value)
+            .map(MenuAction::SetRollSnap),
         "save_camera" => Some(MenuAction::SaveCamera),
         "reset_runtime_camera" => Some(MenuAction::ResetRuntimeCamera),
         "request_msaa" => wire
@@ -261,11 +285,15 @@ struct MenuState {
     t: &'static str,
     base_fov_deg: f32,
     base_distance_scale: f32,
+    headroom: f32,
     effective_fov_deg: f32,
     effective_distance_scale: f32,
     yaw_deg: f32,
     pitch_deg: f32,
     roll_deg: f32,
+    yaw_snap_deg: f32,
+    pitch_snap_deg: f32,
+    roll_snap_deg: f32,
     requested_msaa: AntiAliasingPreference,
     effective_msaa: u32,
     requested_smaa: bool,
@@ -339,11 +367,15 @@ impl MenuGuest {
         &self,
         base_fov_deg: f32,
         base_distance_scale: f32,
+        headroom: f32,
         effective_fov_deg: f32,
         effective_distance_scale: f32,
         yaw_deg: f32,
         pitch_deg: f32,
         roll_deg: f32,
+        yaw_snap_deg: f32,
+        pitch_snap_deg: f32,
+        roll_snap_deg: f32,
         requested_msaa: AntiAliasingPreference,
         effective_msaa: u32,
         requested_smaa: bool,
@@ -355,11 +387,15 @@ impl MenuGuest {
             t: "state",
             base_fov_deg,
             base_distance_scale,
+            headroom,
             effective_fov_deg,
             effective_distance_scale,
             yaw_deg,
             pitch_deg,
             roll_deg,
+            yaw_snap_deg,
+            pitch_snap_deg,
+            roll_snap_deg,
             requested_msaa,
             effective_msaa,
             requested_smaa,
@@ -555,11 +591,15 @@ mod tests {
             t: "state",
             base_fov_deg: 40.0,
             base_distance_scale: 0.6,
+            headroom: 0.05,
             effective_fov_deg: 44.0,
             effective_distance_scale: 0.55,
             yaw_deg: 7.5,
             pitch_deg: 22.5,
             roll_deg: 30.0,
+            yaw_snap_deg: 7.5,
+            pitch_snap_deg: 22.5,
+            roll_snap_deg: 30.0,
             requested_msaa: AntiAliasingPreference::X8,
             effective_msaa: 4,
             requested_smaa: true,
@@ -572,11 +612,15 @@ mod tests {
         for (name, expected) in [
             ("base_fov_deg", 40.0),
             ("base_distance_scale", 0.6),
+            ("headroom", 0.05),
             ("effective_fov_deg", 44.0),
             ("effective_distance_scale", 0.55),
             ("yaw_deg", 7.5),
             ("pitch_deg", 22.5),
             ("roll_deg", 30.0),
+            ("yaw_snap_deg", 7.5),
+            ("pitch_snap_deg", 22.5),
+            ("roll_snap_deg", 30.0),
         ] {
             let actual = value[name].as_f64().unwrap();
             assert!(
@@ -632,6 +676,22 @@ mod tests {
                 MenuAction::SetRoll(15.75),
             ),
             (
+                r#"{"t":"action","action":"set_headroom","value":0.12}"#,
+                MenuAction::SetHeadroom(0.12),
+            ),
+            (
+                r#"{"t":"action","action":"set_yaw_snap","value":7.5}"#,
+                MenuAction::SetYawSnap(7.5),
+            ),
+            (
+                r#"{"t":"action","action":"set_pitch_snap","value":22.5}"#,
+                MenuAction::SetPitchSnap(22.5),
+            ),
+            (
+                r#"{"t":"action","action":"set_roll_snap","value":30.0}"#,
+                MenuAction::SetRollSnap(30.0),
+            ),
+            (
                 r#"{"t":"action","action":"save_camera"}"#,
                 MenuAction::SaveCamera,
             ),
@@ -668,6 +728,11 @@ mod tests {
             r#"{"t":"action","action":"set_yaw","value":null}"#,
             r#"{"t":"action","action":"set_pitch","value":"89"}"#,
             r#"{"t":"action","action":"set_roll","value":1e309}"#,
+            r#"{"t":"action","action":"set_headroom","value":null}"#,
+            r#"{"t":"action","action":"set_headroom","value":"0.12"}"#,
+            r#"{"t":"action","action":"set_yaw_snap","value":null}"#,
+            r#"{"t":"action","action":"set_pitch_snap","value":"15"}"#,
+            r#"{"t":"action","action":"set_roll_snap","value":1e309}"#,
             r#"{"t":"action","action":"request_msaa","value":3}"#,
             r#"{"t":"action","action":"request_smaa","value":"on"}"#,
         ] {

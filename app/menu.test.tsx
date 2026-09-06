@@ -10,9 +10,13 @@ const BTN_DOWN = 0x0040;
 const BTN_CIRCLE = 0x2000;
 
 interface TestCameraState {
+  headroom: number;
   yaw: number;
   pitch: number;
   roll: number;
+  yawSnap: number;
+  pitchSnap: number;
+  rollSnap: number;
 }
 
 function testHost(
@@ -54,14 +58,28 @@ function testHost(
   };
 }
 
-function stateLine(state: TestCameraState = { yaw: 22.5, pitch: -7.5, roll: 15 }): string {
+function stateLine(
+  state: TestCameraState = {
+    headroom: 0.05,
+    yaw: 22.5,
+    pitch: -7.5,
+    roll: 15,
+    yawSnap: 15,
+    pitchSnap: 15,
+    rollSnap: 15,
+  },
+): string {
   return JSON.stringify({
     t: "state",
     effective_fov_deg: 40,
     effective_distance_scale: 0.6,
+    headroom: state.headroom,
     yaw_deg: state.yaw,
     pitch_deg: state.pitch,
     roll_deg: state.roll,
+    yaw_snap_deg: state.yawSnap,
+    pitch_snap_deg: state.pitchSnap,
+    roll_snap_deg: state.rollSnap,
     requested_msaa: "4x",
     effective_msaa: 4,
     requested_smaa: false,
@@ -77,6 +95,7 @@ describe("PocketUI camera menu snap regression", () => {
     const settingsPath = join(directory, "settings.json");
     const settings = {
       camera: {
+        headroom: 0.05,
         yaw_snap_deg: 15,
         pitch_snap_deg: 15,
         roll_snap_deg: 15,
@@ -90,7 +109,15 @@ describe("PocketUI camera menu snap regression", () => {
     const snapMutations: unknown[] = [];
     const textUpdates: string[] = [];
     const focusState = { id: 0 };
-    const cameraState: TestCameraState = { yaw: 22.5, pitch: -7.5, roll: 15 };
+    const cameraState: TestCameraState = {
+      headroom: 0.05,
+      yaw: 22.5,
+      pitch: -7.5,
+      roll: 15,
+      yawSnap: 15,
+      pitchSnap: 15,
+      rollSnap: 15,
+    };
     const host = testHost(incoming, outgoing, textUpdates, (message) => {
       if (
         typeof message === "object" &&
@@ -107,12 +134,25 @@ describe("PocketUI camera menu snap regression", () => {
       if (action === "set_yaw" && typeof actionMessage.value === "number") cameraState.yaw = actionMessage.value;
       if (action === "set_pitch" && typeof actionMessage.value === "number") cameraState.pitch = actionMessage.value;
       if (action === "set_roll" && typeof actionMessage.value === "number") cameraState.roll = actionMessage.value;
+      if (action === "set_headroom" && typeof actionMessage.value === "number") cameraState.headroom = actionMessage.value;
+      if (action === "set_yaw_snap" && typeof actionMessage.value === "number") cameraState.yawSnap = actionMessage.value;
+      if (action === "set_pitch_snap" && typeof actionMessage.value === "number") cameraState.pitchSnap = actionMessage.value;
+      if (action === "set_roll_snap" && typeof actionMessage.value === "number") cameraState.rollSnap = actionMessage.value;
       if (action === "reset_runtime_camera") {
         cameraState.yaw = 0;
         cameraState.pitch = 0;
         cameraState.roll = 0;
       }
-      if (action === "set_yaw" || action === "set_pitch" || action === "set_roll" || action === "reset_runtime_camera") {
+      if (
+        action === "set_yaw" ||
+        action === "set_pitch" ||
+        action === "set_roll" ||
+        action === "set_headroom" ||
+        action === "set_yaw_snap" ||
+        action === "set_pitch_snap" ||
+        action === "set_roll_snap" ||
+        action === "reset_runtime_camera"
+      ) {
         incoming.push(stateLine(cameraState));
       }
     }, focusState);
@@ -137,6 +177,14 @@ describe("PocketUI camera menu snap regression", () => {
       expect(textUpdates).toEqual(
         expect.arrayContaining(["ORIENTATION", "22.5°", "-7.5°", "15°"]),
       );
+      expect(textUpdates).toEqual(expect.arrayContaining(["FRAMING", "Headroom", "0.05"]));
+
+      // A non-default authoritative snapshot must be rendered as-is; the
+      // guest has no local 15° fallback for the persisted step sizes.
+      Object.assign(cameraState, { headroom: 0.12, yawSnap: 7.5, pitchSnap: 22.5, rollSnap: 30 });
+      incoming.push(stateLine(cameraState));
+      frame!(0);
+      expect(textUpdates).toEqual(expect.arrayContaining(["Headroom", "0.12", "SNAPPING", "Yaw step", "7.5°", "Pitch step", "22.5°", "Roll step", "30°"]));
 
       // Traverse the actual focus order: Camera → Graphics → Camera. The
       // tabs are the only interaction; no snap-setting action is sent.
@@ -157,20 +205,20 @@ describe("PocketUI camera menu snap regression", () => {
       for (let i = 0; i < 8; i++) frame!(0);
 
       expect(textUpdates).toContain("ORIENTATION");
-      expect(runtimeSnaps).toEqual({ yaw_snap_deg: 15, pitch_snap_deg: 15, roll_snap_deg: 15 });
+      expect(runtimeSnaps).toEqual({ headroom: 0.05, yaw_snap_deg: 15, pitch_snap_deg: 15, roll_snap_deg: 15 });
       expect(snapMutations).toEqual([]);
       expect(await readFile(settingsPath, "utf8")).toBe(persistedBefore);
       expect(outgoing).toEqual([]);
 
       // From the focused Camera tab, walk the actual focus order to YawValue,
       // click it through the host hit-test bridge, then commit a precise edit.
-      for (let i = 0; i < 10; i++) {
+      for (let i = 0; i < 11; i++) {
         frame!(BTN_DOWN);
         frame!(0);
       }
-      incoming.push(JSON.stringify({ t: "mouse", x: 170, y: 605, d: true }));
+      incoming.push(JSON.stringify({ t: "mouse", x: 170, y: 625, d: true }));
       frame!(0);
-      incoming.push(JSON.stringify({ t: "mouse", x: 170, y: 605, d: false }));
+      incoming.push(JSON.stringify({ t: "mouse", x: 170, y: 625, d: false }));
       frame!(0);
       incoming.push(
         JSON.stringify({
@@ -203,12 +251,12 @@ describe("PocketUI camera menu snap regression", () => {
             "t" in message &&
             message.t === "text-input-state" &&
             "active" in message &&
-            message.active === true &&
+             message.active === true &&
             "cursor_area_logical_px" in message &&
             typeof message.cursor_area_logical_px === "object" &&
             message.cursor_area_logical_px !== null &&
             "y" in message.cursor_area_logical_px &&
-            message.cursor_area_logical_px.y === 605,
+             message.cursor_area_logical_px.y === 625,
         ),
       ).toBe(true);
       expect(textUpdates).toContain("45.25°");
@@ -222,6 +270,75 @@ describe("PocketUI camera menu snap regression", () => {
       frame!(0);
       expect(outgoing).toContainEqual({ t: "action", action: "reset_runtime_camera" });
       expect(textUpdates).toEqual(expect.arrayContaining(["0°"]));
+
+      // The new SNAPPING fields are after the unchanged orientation rows.
+      // Commit one explicit step edit and verify it does not touch the pose.
+      for (let i = 0; i < 4; i++) {
+        frame!(BTN_DOWN);
+        frame!(0);
+      }
+      incoming.push(JSON.stringify({ t: "mouse", x: 170, y: 707, d: true }));
+      frame!(0);
+      incoming.push(JSON.stringify({ t: "mouse", x: 170, y: 707, d: false }));
+      frame!(0);
+      incoming.push(
+        JSON.stringify({
+          t: "input",
+          edits: [{ kind: "char", text: "12.5" }],
+          ime: [],
+          modifiers: { shift: false, control: false, alt: false, super: false },
+          cancelled: false,
+        }),
+      );
+      frame!(0);
+      incoming.push(
+        JSON.stringify({
+          t: "input",
+          edits: [{ kind: "key", key: "enter" }],
+          ime: [],
+          modifiers: { shift: false, control: false, alt: false, super: false },
+          cancelled: false,
+        }),
+      );
+      frame!(0);
+      frame!(0);
+      expect(outgoing).toContainEqual({ t: "action", action: "set_yaw_snap", value: 12.5 });
+      expect(textUpdates).toContain("12.5°");
+      expect(cameraState).toMatchObject({ headroom: 0.12, yaw: 0, pitch: 0, roll: 0, yawSnap: 12.5 });
+
+      // Headroom is the only editable scalar in FRAMING; it uses the same
+      // authoritative action path while leaving the runtime pose untouched.
+      for (let i = 0; i < 6; i++) {
+        frame!(BTN_UP);
+        frame!(0);
+      }
+      incoming.push(JSON.stringify({ t: "mouse", x: 170, y: 559, d: true }));
+      frame!(0);
+      incoming.push(JSON.stringify({ t: "mouse", x: 170, y: 559, d: false }));
+      frame!(0);
+      incoming.push(
+        JSON.stringify({
+          t: "input",
+          edits: [{ kind: "char", text: "0.2" }],
+          ime: [],
+          modifiers: { shift: false, control: false, alt: false, super: false },
+          cancelled: false,
+        }),
+      );
+      frame!(0);
+      incoming.push(
+        JSON.stringify({
+          t: "input",
+          edits: [{ kind: "key", key: "enter" }],
+          ime: [],
+          modifiers: { shift: false, control: false, alt: false, super: false },
+          cancelled: false,
+        }),
+      );
+      frame!(0);
+      frame!(0);
+      expect(outgoing).toContainEqual({ t: "action", action: "set_headroom", value: 0.2 });
+      expect(cameraState).toMatchObject({ headroom: 0.2, yaw: 0, pitch: 0, roll: 0, yawSnap: 12.5 });
       expect(await readFile(settingsPath, "utf8")).toBe(persistedBefore);
     } finally {
       delete global.frame;

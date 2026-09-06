@@ -580,6 +580,10 @@ impl Widget {
             MenuAction::SetYaw(value) => ControlAction::SetYaw(value),
             MenuAction::SetPitch(value) => ControlAction::SetPitch(value),
             MenuAction::SetRoll(value) => ControlAction::SetRoll(value),
+            MenuAction::SetHeadroom(value) => ControlAction::SetHeadroom(value),
+            MenuAction::SetYawSnap(value) => ControlAction::SetYawSnap(value),
+            MenuAction::SetPitchSnap(value) => ControlAction::SetPitchSnap(value),
+            MenuAction::SetRollSnap(value) => ControlAction::SetRollSnap(value),
             MenuAction::SaveCamera => ControlAction::SaveCamera,
             MenuAction::ResetRuntimeCamera => ControlAction::ResetRuntimeCamera,
             MenuAction::RequestMsaa(preference) => ControlAction::RequestMsaa(preference),
@@ -649,6 +653,16 @@ impl Widget {
                 self.camera_controls.set_roll_deg(roll_deg);
                 self.reapply_camera();
             }
+            ControlAction::SetHeadroom(headroom) => {
+                let mut candidate = self.settings.camera;
+                candidate.headroom = headroom;
+                let sanitized = candidate.sanitized();
+                if sanitized != self.settings.camera {
+                    self.settings.camera = sanitized;
+                    self.reapply_camera();
+                    self.persist_settings();
+                }
+            }
             ControlAction::SaveCamera => self.save_camera(),
             ControlAction::ResetRuntimeCamera => self.reset_runtime_camera(),
             // Snap increments affect only future detents. Persist the
@@ -716,6 +730,7 @@ impl Widget {
         ControlsSnapshot::new(
             base.fov_deg,
             base.distance_scale,
+            base.headroom,
             adjustments.sanitized().yaw_deg,
             adjustments.sanitized().pitch_deg,
             adjustments.sanitized().roll_deg,
@@ -1114,11 +1129,15 @@ impl Game for Widget {
                         menu.push_state(
                             snapshot.base_fov_deg(),
                             snapshot.base_distance_scale(),
+                            snapshot.headroom(),
                             snapshot.effective_fov_deg(),
                             snapshot.effective_distance_scale(),
                             snapshot.yaw_deg(),
                             snapshot.pitch_deg(),
                             snapshot.roll_deg(),
+                            snapshot.yaw_snap_deg(),
+                            snapshot.pitch_snap_deg(),
+                            snapshot.roll_snap_deg(),
                             snapshot.requested_msaa(),
                             snapshot.effective_msaa(),
                             snapshot.requested_smaa(),

@@ -424,6 +424,77 @@ describe("PocketUI InlineNumberField", () => {
     }
   });
 
+  test("framing and snapping fields use authoritative precision and their own capture rows", () => {
+    const input = new TestTextInput();
+    const committed: number[] = [];
+    const headroomCommitted: number[] = [];
+    let value = 7.5;
+    let headroomValue = 0.05;
+    const headroom = new InlineNumberFieldModel({
+      id: "HeadroomValue",
+      value: () => headroomValue,
+      format: (next) => next.toString(),
+      editFormat: (next) => next.toString(),
+      onCommit: (next) => {
+        headroomValue = next;
+        headroomCommitted.push(next);
+      },
+      captureArea: (caret) => ({ x: 152 + caret, y: 559, width: 1, height: 18 }),
+      input,
+    });
+    const yawSnap = new InlineNumberFieldModel({
+      id: "YawSnapValue",
+      value: () => value,
+      format: (next) => `${next}°`,
+      editFormat: (next) => next.toString(),
+      onCommit: (next) => {
+        value = next;
+        committed.push(next);
+      },
+      captureArea: (caret) => ({ x: 152 + caret, y: 707, width: 1, height: 18 }),
+      input,
+    });
+    const pitchSnap = new InlineNumberFieldModel({
+      id: "PitchSnapValue",
+      value: () => 22.5,
+      format: (next) => `${next}°`,
+      editFormat: (next) => next.toString(),
+      onCommit: () => {},
+      captureArea: (caret) => ({ x: 152 + caret, y: 727, width: 1, height: 18 }),
+      input,
+    });
+
+    try {
+      dispatchInlineNumberPointerDown("HeadroomValue", 170, 559);
+      expect(headroom.draft()).toBe("0.05");
+      expect(input.capture.cursorArea?.y).toBe(559);
+      input.dispatch(frame({ edits: [{ kind: "char", text: "0.12" }] }));
+      input.dispatch(frame({ edits: [{ kind: "key", key: "enter" }] }));
+      expect(headroomCommitted).toEqual([0.12]);
+      expect(headroomValue).toBe(0.12);
+
+      dispatchInlineNumberPointerDown("YawSnapValue", 170, 707);
+      expect(yawSnap.draft()).toBe("7.5");
+      expect(input.capture.cursorArea?.y).toBe(707);
+      input.dispatch(frame({ edits: [{ kind: "char", text: "12.5" }] }));
+      input.dispatch(frame({ edits: [{ kind: "key", key: "enter" }] }));
+      expect(committed).toEqual([12.5]);
+      expect(value).toBe(12.5);
+
+      dispatchInlineNumberPointerDown("PitchSnapValue", 170, 727);
+      expect(yawSnap.isEditing()).toBe(false);
+      expect(input.capture.cursorArea?.y).toBe(727);
+      input.dispatch(frame({ edits: [{ kind: "char", text: "30" }] }));
+      input.dispatch(frame({ edits: [{ kind: "key", key: "escape" }] }));
+      expect(committed).toEqual([12.5]);
+      expect(input.capture.active).toBe(false);
+    } finally {
+      pitchSnap.dispose();
+      yawSnap.dispose();
+      headroom.dispose();
+    }
+  });
+
   test("Backspace, Delete, caret movement, and IME preedit remain local to the draft", () => {
     const { field, input } = makeField();
     try {

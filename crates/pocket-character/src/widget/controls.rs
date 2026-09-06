@@ -32,6 +32,7 @@ pub(crate) enum ControlAction {
     SetYaw(f32),
     SetPitch(f32),
     SetRoll(f32),
+    SetHeadroom(f32),
     SaveCamera,
     ResetRuntimeCamera,
     SetYawSnap(f32),
@@ -56,6 +57,7 @@ pub(crate) enum ControlAction {
 pub(crate) struct ControlsSnapshot {
     base_fov_deg: f32,
     base_distance_scale: f32,
+    headroom: f32,
     yaw_deg: f32,
     pitch_deg: f32,
     roll_deg: f32,
@@ -77,6 +79,7 @@ impl ControlsSnapshot {
     pub(crate) fn new(
         base_fov_deg: f32,
         base_distance_scale: f32,
+        headroom: f32,
         yaw_deg: f32,
         pitch_deg: f32,
         roll_deg: f32,
@@ -95,6 +98,7 @@ impl ControlsSnapshot {
         Self {
             base_fov_deg,
             base_distance_scale,
+            headroom,
             yaw_deg,
             pitch_deg,
             roll_deg,
@@ -118,6 +122,10 @@ impl ControlsSnapshot {
 
     pub(crate) fn base_distance_scale(self) -> f32 {
         self.base_distance_scale
+    }
+
+    pub(crate) fn headroom(self) -> f32 {
+        self.headroom
     }
 
     pub(crate) fn yaw_deg(self) -> f32 {
@@ -186,6 +194,7 @@ mod tests {
         let snapshot = ControlsSnapshot::new(
             40.0,
             0.6,
+            0.05,
             0.0,
             0.0,
             0.0,
