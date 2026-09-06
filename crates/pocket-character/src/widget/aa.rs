@@ -1,3 +1,5 @@
+use crate::settings::AntiAliasingPreference;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct AaStatus {
     pub(super) requested_msaa: u32,
@@ -43,7 +45,9 @@ impl AaRuntime {
             requested_msaa,
             effective_msaa: 1,
             requested_smaa,
-            smaa_enabled: requested_smaa,
+            // The renderer has not been initialized yet, so a requested SMAA
+            // preference is not effective until init/application observes it.
+            smaa_enabled: false,
             pending_msaa_request: None,
             pending_smaa_request: None,
         }
@@ -73,6 +77,15 @@ impl AaRuntime {
         self.smaa_enabled
     }
 
+    pub(super) fn next_msaa_preference(&self) -> AntiAliasingPreference {
+        AntiAliasingPreference::from_samples(next_msaa_sample_count(self.requested_msaa))
+            .unwrap_or(AntiAliasingPreference::Off)
+    }
+
+    pub(super) fn next_smaa_enabled(&self) -> bool {
+        !self.requested_smaa
+    }
+
     pub(super) fn pending_requests(&self) -> AaRequests {
         AaRequests {
             msaa: self.pending_msaa_request,
@@ -98,11 +111,7 @@ impl AaRuntime {
         self.smaa_enabled = smaa_enabled;
     }
 
-    pub(super) fn request_next_msaa(&mut self) {
-        self.requested_msaa = next_msaa_sample_count(self.requested_msaa);
-        self.pending_msaa_request = Some(self.requested_msaa);
-    }
-
+    #[cfg(test)]
     pub(super) fn request_smaa_toggle(&mut self) {
         self.requested_smaa = !self.requested_smaa;
         self.pending_smaa_request = Some(self.requested_smaa);

@@ -1,9 +1,9 @@
 // PocketUI controls menu: a panel rendered through the MenuGuest →
 // UiSurface → UiRenderer → Pocket3D Game::overlay() path, alpha-blended
-// over the 3D character. Rust owns camera policy; this guest renders the
-// authoritative live camera values, emits semantic button intents, and
-// exposes generic text-input ownership for future editable widgets.
-import { createSignal } from "solid-js";
+// over the 3D character. Rust owns camera and AA policy; this guest renders
+// authoritative snapshots, emits semantic button intents, and exposes
+// generic text-input ownership for future editable widgets.
+import { createSignal, type JSX } from "solid-js";
 import { Focusable, Text, View } from "@pocketjs/framework/components";
 import { virtualNow } from "@pocketjs/framework/clock";
 import { getOps } from "@pocketjs/framework/solid";
@@ -11,6 +11,16 @@ import { focusNode, hitFocusable, pressNode, setActiveNode } from "@pocketjs/fra
 import { onFrame } from "@pocketjs/framework/lifecycle";
 import { mount } from "@pocketjs/framework/solid";
 import { formatCompactFov } from "./camera-value-format";
+import {
+  MSAA_OPTIONS,
+  encodeMsaaRequest,
+  encodeSmaaRequest,
+  effectiveMsaaLabel,
+  formatMsaaStatus,
+  formatSmaaStatus,
+  smaaStateLabel,
+  type MsaaPreference,
+} from "./graphics-settings";
 import {
   INLINE_NUMBER_CELL_HEIGHT,
   INLINE_NUMBER_CELL_WIDTH,
@@ -22,12 +32,19 @@ import {
 import { PointerRepeat, type RepeatAction } from "./menu-repeat";
 import { textInput } from "./text-input";
 
-/// Authoritative camera facts pushed by the Rust host (MenuState in
-/// crates/pocket-character/src/menu_guest.rs). This compact panel displays the
-/// live/effective optics; persistence is an explicit Save action.
+/// Authoritative facts pushed by the Rust host (MenuState in
+/// crates/pocket-character/src/menu_guest.rs). Requested and effective AA are
+/// intentionally separate: the guest only renders these facts and never
+/// predicts whether a renderer request will apply.
 interface ControlsState {
   effective_fov_deg: number;
   effective_distance_scale: number;
+  requested_msaa: MsaaPreference;
+  effective_msaa: number;
+  requested_smaa: boolean;
+  effective_smaa: boolean;
+  msaa_pending: boolean;
+  smaa_pending: boolean;
 }
 
 type ActionName =
@@ -42,6 +59,9 @@ type ActionName =
 
 // Latest host facts, or null before the first svc line arrives.
 const [controls, setControls] = createSignal<ControlsState | null>(null);
+type SettingsPage = "camera" | "graphics";
+// Ephemeral presentation state only; it is never serialized or sent to Rust.
+const [activePage, setActivePage] = createSignal<SettingsPage>("camera");
 const CAMERA_VALUE_X = 152;
 const CAMERA_DISTANCE_VALUE_Y = 519;
 const CAMERA_FOV_VALUE_Y = 539;
@@ -58,6 +78,20 @@ function sendAction(action: ActionName, value?: number): boolean {
   const ops = getOps();
   if (!ops.svcOpen || !ops.svcSend || !ops.svcOpen("controls")) return false;
   ops.svcSend(JSON.stringify({ t: "action", action, ...(value === undefined ? {} : { value }) }));
+  return true;
+}
+
+function sendSmaaAction(enabled: boolean): boolean {
+  const ops = getOps();
+  if (!ops.svcOpen || !ops.svcSend || !ops.svcOpen("controls")) return false;
+  ops.svcSend(JSON.stringify(encodeSmaaRequest(enabled)));
+  return true;
+}
+
+function sendMsaaAction(preference: MsaaPreference): boolean {
+  const ops = getOps();
+  if (!ops.svcOpen || !ops.svcSend || !ops.svcOpen("controls")) return false;
+  ops.svcSend(JSON.stringify(encodeMsaaRequest(preference)));
   return true;
 }
 
@@ -128,6 +162,12 @@ function pollControls(): void {
           t?: unknown;
           effective_fov_deg?: unknown;
           effective_distance_scale?: unknown;
+          requested_msaa?: unknown;
+          effective_msaa?: unknown;
+          requested_smaa?: unknown;
+          effective_smaa?: unknown;
+          msaa_pending?: unknown;
+          smaa_pending?: unknown;
           x?: unknown;
           y?: unknown;
           d?: unknown;
@@ -136,12 +176,28 @@ function pollControls(): void {
           if (
             typeof msg.effective_fov_deg !== "number" ||
             typeof msg.effective_distance_scale !== "number" ||
+            typeof msg.requested_msaa !== "string" ||
+            !MSAA_OPTIONS.some((option) => option.preference === msg.requested_msaa) ||
+            typeof msg.effective_msaa !== "number" ||
+            !Number.isSafeInteger(msg.effective_msaa) ||
+            msg.effective_msaa < 1 ||
+            typeof msg.requested_smaa !== "boolean" ||
+            typeof msg.effective_smaa !== "boolean" ||
+            typeof msg.msaa_pending !== "boolean" ||
+            typeof msg.smaa_pending !== "boolean" ||
             !Number.isFinite(msg.effective_fov_deg) ||
-            !Number.isFinite(msg.effective_distance_scale)
+            !Number.isFinite(msg.effective_distance_scale) ||
+            !Number.isFinite(msg.effective_msaa)
           ) continue;
           setControls({
             effective_fov_deg: msg.effective_fov_deg,
             effective_distance_scale: msg.effective_distance_scale,
+            requested_msaa: msg.requested_msaa as MsaaPreference,
+            effective_msaa: msg.effective_msaa,
+            requested_smaa: msg.requested_smaa,
+            effective_smaa: msg.effective_smaa,
+            msaa_pending: msg.msaa_pending,
+            smaa_pending: msg.smaa_pending,
           });
         } else if (
           msg.t === "mouse" &&
@@ -226,20 +282,155 @@ function Row(props: {
   );
 }
 
-export default function ControlsMenu() {
-  onFrame(pollControls);
-  // Display formatting only. Rust computes the next value and applies all
-  // safety/persistence semantics after receiving the semantic action.
+function msaaStatusText(state: ControlsState | null): string {
+  if (!state) return "Waiting for host";
+  return formatMsaaStatus(state.requested_msaa, state.effective_msaa, state.msaa_pending);
+}
+
+function smaaStatusText(state: ControlsState | null): string {
+  if (!state) return "Waiting for host";
+  return formatSmaaStatus(state.requested_smaa, state.effective_smaa, state.smaa_pending);
+}
+
+function SelectorOption(props: {
+  preference: MsaaPreference;
+  label: string;
+  selected: boolean;
+  onPress: () => void;
+}) {
   return (
-    <View
-      debugName="ControlsMenu"
-      class="absolute left-[14] top-[474] w-[216] flex-col rounded-md bg-[#0b1420b4] p-[16]"
+    <Focusable
+      debugName={`Msaa${props.preference}`}
+      class={
+        props.selected
+          ? "h-[18] w-[28] flex-col items-center justify-center rounded-sm bg-[#2b5167]"
+          : "h-[18] w-[28] flex-col items-center justify-center rounded-sm bg-[#172b3b] focus:bg-[#2b5167] active:bg-[#3a6f88]"
+      }
+      onPress={props.onPress}
     >
-      <View class="h-[18] flex-row items-center">
-        <Text class="text-xs font-bold tracking-wide text-[#7fd0ff]">CAMERA</Text>
+      <Text class="text-xs text-[#e8f1f8]">{props.label}</Text>
+    </Focusable>
+  );
+}
+
+function PageTabs() {
+  const tabClass = (page: SettingsPage): string =>
+    activePage() === page
+      ? "h-[24] flex-1 flex-col items-center justify-center rounded-sm bg-[#2b5167]"
+      : "h-[24] flex-1 flex-col items-center justify-center rounded-sm bg-[#172b3b] focus:bg-[#2b5167] active:bg-[#3a6f88]";
+
+  return (
+    <View debugName="SettingsTabs" class="h-[24] w-full flex-row gap-[4]">
+      <Focusable debugName="CameraTab" class={tabClass("camera")} onPress={() => setActivePage("camera")}>
+        <Text class="text-sm text-[#e8f1f8]">CAMERA</Text>
+      </Focusable>
+      <Focusable debugName="GraphicsTab" class={tabClass("graphics")} onPress={() => setActivePage("graphics")}>
+        <Text class="text-sm text-[#e8f1f8]">GRAPHICS</Text>
+      </Focusable>
+    </View>
+  );
+}
+
+function SettingsFrame(props: { panelClass: string; children: JSX.Element }) {
+  return (
+    <View debugName="SettingsFrame" class={props.panelClass}>
+      <PageTabs />
+      <View class="relative top-[2] mt-[4] h-[1] w-full bg-[#33c6ff4d]" />
+      {props.children}
+    </View>
+  );
+}
+
+function GraphicsPanel() {
+  const state = () => controls();
+  return (
+    <SettingsFrame panelClass="w-[216] flex-col rounded-md bg-[#0b1420e8] p-[16]">
+      <View class="mt-[6] flex-col">
+        <View class="h-[18] flex-row items-center">
+          <Text class="text-xs font-bold text-[#7fd0ff]">MSAA</Text>
+        </View>
+        <View class="mt-[4] h-[18] flex-row items-center">
+          <View class="w-[60] shrink-0">
+            <Text class="text-xs text-[#9fb3c8]">Requested</Text>
+          </View>
+          <View class="w-[6] shrink-0" />
+          <View class="flex-row gap-[2]">
+            {MSAA_OPTIONS.map((option) => (
+              <SelectorOption
+                preference={option.preference}
+                label={option.label}
+                selected={state()?.requested_msaa === option.preference}
+                onPress={() => sendMsaaAction(option.preference)}
+              />
+            ))}
+          </View>
+        </View>
+        <View class="mt-[2] h-[18] flex-row items-center">
+          <View class="w-[60] shrink-0">
+            <Text class="text-xs text-[#9fb3c8]">Effective</Text>
+          </View>
+          <View class="w-[6] shrink-0" />
+          <Text class="text-xs text-[#e8f1f8]">{effectiveMsaaLabel(state()?.effective_msaa ?? null)}</Text>
+        </View>
+        {msaaStatusText(state()) ? (
+          <View class="flex-row items-center">
+            <View class="w-[60] shrink-0" />
+            <View class="w-[6] shrink-0" />
+            <Text class="h-[11] text-[9] text-[#8fa8bc]">{msaaStatusText(state())}</Text>
+          </View>
+        ) : null}
+        <View class="mt-[8] h-[18] flex-row items-center">
+          <Text class="text-xs font-bold text-[#7fd0ff]">SMAA</Text>
+        </View>
+        <View class="mt-[4] h-[18] flex-row items-center">
+          <View class="w-[60] shrink-0">
+            <Text class="text-xs text-[#9fb3c8]">Requested</Text>
+          </View>
+          <View class="w-[6] shrink-0" />
+          <Focusable
+            debugName="SmaaToggle"
+            class={
+              state()?.requested_smaa
+                ? "h-[18] w-[38] flex-col items-center justify-center rounded-sm bg-[#2b5167]"
+                : "h-[18] w-[38] flex-col items-center justify-center rounded-sm bg-[#172b3b] focus:bg-[#2b5167] active:bg-[#3a6f88]"
+            }
+            onPress={() => {
+              const current = state();
+              if (current) sendSmaaAction(!current.requested_smaa);
+            }}
+          >
+            <Text class="text-xs text-[#e8f1f8]">{smaaStateLabel(state()?.requested_smaa ?? null)}</Text>
+          </Focusable>
+        </View>
+        <View class="mt-[2] h-[18] flex-row items-center">
+          <View class="w-[60] shrink-0">
+            <Text class="text-xs text-[#9fb3c8]">Effective</Text>
+          </View>
+          <View class="w-[6] shrink-0" />
+          <Text class="text-xs text-[#e8f1f8]">{smaaStateLabel(state()?.effective_smaa ?? null)}</Text>
+        </View>
+        {smaaStatusText(state()) ? (
+          <View class="flex-row items-center">
+            <View class="w-[60] shrink-0" />
+            <View class="w-[6] shrink-0" />
+            <Text class="h-[11] text-[9] text-[#8fa8bc]">{smaaStatusText(state())}</Text>
+          </View>
+        ) : null}
       </View>
-      <View class="mt-[4] h-[1] w-full bg-[#33c6ff4d]" />
-      <View class="mt-[6] flex-col gap-[2]">
+    </SettingsFrame>
+  );
+}
+
+function CameraPanel() {
+  // The shared divider is directly below the tabs. The heading's compacted
+  // slot offsets the taller tabs, preserving camera field, button, and native
+  // capture geometry.
+  return (
+    <SettingsFrame panelClass="w-[216] flex-col rounded-md bg-[#0b1420b4] p-[16]">
+      <View class="mt-[6] h-[16] flex-row items-center">
+        <Text class="text-xs font-bold text-[#7fd0ff]">FRAMING</Text>
+      </View>
+      <View class="mt-[0] flex-col gap-[2]">
         <Row
           label="Distance"
           value={() => controls()?.effective_distance_scale ?? null}
@@ -277,6 +468,17 @@ export default function ControlsMenu() {
           <Text class="text-xs text-[#e8f1f8]">Reset Camera</Text>
         </Focusable>
       </View>
+    </SettingsFrame>
+  );
+}
+
+export default function ControlsMenu() {
+  onFrame(pollControls);
+  // Display formatting only. Rust computes the next value and applies all
+  // safety/persistence semantics after receiving the semantic action.
+  return (
+    <View debugName="ControlsMenu" class="absolute left-[14] top-[456]">
+      {activePage() === "camera" ? <CameraPanel /> : <GraphicsPanel />}
     </View>
   );
 }

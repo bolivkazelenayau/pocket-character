@@ -579,6 +579,8 @@ impl Widget {
             MenuAction::SetEffectiveFov(value) => ControlAction::SetEffectiveFov(value),
             MenuAction::SaveCamera => ControlAction::SaveCamera,
             MenuAction::ResetRuntimeCamera => ControlAction::ResetRuntimeCamera,
+            MenuAction::RequestMsaa(preference) => ControlAction::RequestMsaa(preference),
+            MenuAction::RequestSmaa(enabled) => ControlAction::RequestSmaa(enabled),
         }
     }
 
@@ -966,10 +968,12 @@ impl Game for Widget {
                 self.debug_hud_enabled = !self.debug_hud_enabled;
             }
             if input.key_pressed(KeyCode::F4) {
-                self.aa.request_next_msaa();
+                let preference = self.aa.next_msaa_preference();
+                self.apply_control_action(ControlAction::RequestMsaa(preference));
             }
             if input.key_pressed(KeyCode::F5) {
-                self.aa.request_smaa_toggle();
+                let enabled = self.aa.next_smaa_enabled();
+                self.apply_control_action(ControlAction::RequestSmaa(enabled));
             }
             // Temporary F8 validation controls are never written to
             // AppSettings.
@@ -1111,6 +1115,12 @@ impl Game for Widget {
                             snapshot.base_distance_scale(),
                             snapshot.effective_fov_deg(),
                             snapshot.effective_distance_scale(),
+                            snapshot.requested_msaa(),
+                            snapshot.effective_msaa(),
+                            snapshot.requested_smaa(),
+                            snapshot.effective_smaa(),
+                            snapshot.msaa_pending(),
+                            snapshot.smaa_pending(),
                         )?;
                         for pointer_frame in pointer_frames {
                             if pointer_frame.cancelled {

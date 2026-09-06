@@ -4,7 +4,7 @@
 //! sending `ControlAction`s and rendering `ControlsSnapshot`s. It never sees
 //! runtime adjustment structs, the dynamic pan solver, projected bounds,
 //! `PAN_*` internals, or renderer internals. Snapshots expose user-facing
-//! accepted/effective state only.
+//! requested, pending, and effective state only.
 //!
 //! Link (locking yaw/pitch/roll snap sliders together) is future UI state
 //! only and is deliberately absent from persisted camera settings. The atomic
@@ -46,7 +46,7 @@ pub(crate) enum ControlAction {
     RequestSmaa(bool),
 }
 
-/// Immutable user-facing accepted/effective state for the menu.
+/// Immutable user-facing requested/pending/effective state for the menu.
 ///
 /// Requested vs. effective AA are kept independent: requested MSAA can exceed
 /// hardware-effective MSAA, and requested SMAA can differ from the

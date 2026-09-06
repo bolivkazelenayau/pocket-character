@@ -20,6 +20,8 @@ use pocket_ui_wgpu::{UiRenderer, UiSurface};
 use pocket3d::gpu::Gpu;
 use pocket3d::input::{EditKey, ImeInput};
 
+use crate::settings::AntiAliasingPreference;
+
 /// The framework bundle bakes its tick rate (build default 60) and refuses a
 /// host running another; the widget's fixed tick runs at the same rate.
 const MENU_TICK_HZ: u32 = 60;
@@ -158,8 +160,8 @@ fn decode_text_input_state(line: &str) -> Option<MenuTextInputCapture> {
 }
 
 /// Discrete intents accepted from the PocketUI controls guest. The guest only
-/// names an operation; the widget applies it to the authoritative live camera
-/// or routes an explicit Save through the persistence boundary.
+/// names an operation; the widget applies it to authoritative live camera/AA
+/// state or routes explicit Save/Reset operations through the existing path.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum MenuAction {
     DistanceDecrement,
@@ -170,6 +172,8 @@ pub(crate) enum MenuAction {
     SetEffectiveFov(f32),
     SaveCamera,
     ResetRuntimeCamera,
+    RequestMsaa(AntiAliasingPreference),
+    RequestSmaa(bool),
 }
 
 /// Private guest→host action wire type. Keep this separate from the public
@@ -179,7 +183,7 @@ pub(crate) enum MenuAction {
 struct MenuActionWire {
     t: String,
     action: String,
-    value: Option<f32>,
+    value: Option<serde_json::Value>,
 }
 
 fn decode_menu_action(line: &str) -> Option<MenuAction> {
@@ -194,25 +198,44 @@ fn decode_menu_action(line: &str) -> Option<MenuAction> {
         "fov_increment" => Some(MenuAction::FovIncrement),
         "set_effective_distance" => wire
             .value
-            .filter(|value| value.is_finite())
+            .as_ref()
+            .and_then(finite_f32_value)
             .map(MenuAction::SetEffectiveDistance),
         "set_effective_fov" => wire
             .value
-            .filter(|value| value.is_finite())
+            .as_ref()
+            .and_then(finite_f32_value)
             .map(MenuAction::SetEffectiveFov),
         "save_camera" => Some(MenuAction::SaveCamera),
         "reset_runtime_camera" => Some(MenuAction::ResetRuntimeCamera),
+        "request_msaa" => wire
+            .value
+            .as_ref()
+            .and_then(|value| value.as_u64())
+            .and_then(|samples| u32::try_from(samples).ok())
+            .and_then(AntiAliasingPreference::from_samples)
+            .map(MenuAction::RequestMsaa),
+        "request_smaa" => wire
+            .value
+            .as_ref()
+            .and_then(|value| value.as_bool())
+            .map(MenuAction::RequestSmaa),
         _ => None,
     }
 }
 
+fn finite_f32_value(value: &serde_json::Value) -> Option<f32> {
+    let value = value.as_f64()? as f32;
+    value.is_finite().then_some(value)
+}
+
 /// Host→guest controls facts for the menu.
 ///
-/// The private host→guest wire shape. Base values are persisted settings;
-/// effective values include live keyboard/session adjustments. Serialized as
-/// one JSON line per tick on the svc channel; TSX performs display formatting
-/// only, with no validation or clamping — camera policy stays canonical in
-/// Rust and is never duplicated there.
+/// The private host→guest wire shape. Base/requested values are persisted or
+/// requested settings; effective values include live renderer/session state.
+/// Serialized as one JSON line per tick on the svc channel; TSX performs
+/// display formatting only, with no validation or clamping — policy stays
+/// canonical in Rust and is never duplicated there.
 #[derive(serde::Serialize)]
 struct MenuState {
     /// Line discriminator (the channel multiplexes by `t`, per the note-app
@@ -222,6 +245,12 @@ struct MenuState {
     base_distance_scale: f32,
     effective_fov_deg: f32,
     effective_distance_scale: f32,
+    requested_msaa: AntiAliasingPreference,
+    effective_msaa: u32,
+    requested_smaa: bool,
+    effective_smaa: bool,
+    msaa_pending: bool,
+    smaa_pending: bool,
 }
 
 pub struct MenuGuest {
@@ -291,6 +320,12 @@ impl MenuGuest {
         base_distance_scale: f32,
         effective_fov_deg: f32,
         effective_distance_scale: f32,
+        requested_msaa: AntiAliasingPreference,
+        effective_msaa: u32,
+        requested_smaa: bool,
+        effective_smaa: bool,
+        msaa_pending: bool,
+        smaa_pending: bool,
     ) -> Result<()> {
         let state = MenuState {
             t: "state",
@@ -298,6 +333,12 @@ impl MenuGuest {
             base_distance_scale,
             effective_fov_deg,
             effective_distance_scale,
+            requested_msaa,
+            effective_msaa,
+            requested_smaa,
+            effective_smaa,
+            msaa_pending,
+            smaa_pending,
         };
         let line = serde_json::to_string(&state).context("serialize menu state")?;
         self.surface.svc_push(line);
@@ -477,6 +518,7 @@ mod tests {
         MenuAction, MenuInputFrame, MenuInputModifiers, MenuState, MenuTextInputCapture,
         decode_menu_action, decode_text_input_state, encode_input_frame,
     };
+    use crate::settings::AntiAliasingPreference;
     use glam::Vec2;
     use pocket3d::input::{EditKey, ImeInput};
 
@@ -488,6 +530,12 @@ mod tests {
             base_distance_scale: 0.6,
             effective_fov_deg: 44.0,
             effective_distance_scale: 0.55,
+            requested_msaa: AntiAliasingPreference::X8,
+            effective_msaa: 4,
+            requested_smaa: true,
+            effective_smaa: false,
+            msaa_pending: true,
+            smaa_pending: false,
         })
         .unwrap();
 
@@ -503,6 +551,12 @@ mod tests {
                 "{name}: {actual} != {expected}"
             );
         }
+        assert_eq!(value["requested_msaa"], "8x");
+        assert_eq!(value["effective_msaa"], 4);
+        assert_eq!(value["requested_smaa"], true);
+        assert_eq!(value["effective_smaa"], false);
+        assert_eq!(value["msaa_pending"], true);
+        assert_eq!(value["smaa_pending"], false);
     }
 
     #[test]
@@ -540,6 +594,14 @@ mod tests {
                 r#"{"t":"action","action":"reset_runtime_camera"}"#,
                 MenuAction::ResetRuntimeCamera,
             ),
+            (
+                r#"{"t":"action","action":"request_msaa","value":8}"#,
+                MenuAction::RequestMsaa(AntiAliasingPreference::X8),
+            ),
+            (
+                r#"{"t":"action","action":"request_smaa","value":true}"#,
+                MenuAction::RequestSmaa(true),
+            ),
         ];
 
         for (line, expected) in cases {
@@ -558,6 +620,8 @@ mod tests {
             r#"{"t":"action","action":"future_value"}"#,
             r#"{"t":"action","action":"set_effective_fov"}"#,
             r#"{"t":"action","action":"set_effective_distance","value":null}"#,
+            r#"{"t":"action","action":"request_msaa","value":3}"#,
+            r#"{"t":"action","action":"request_smaa","value":"on"}"#,
         ] {
             assert_eq!(decode_menu_action(line), None, "{line}");
         }

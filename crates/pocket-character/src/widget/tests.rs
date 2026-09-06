@@ -270,6 +270,14 @@ fn discrete_menu_actions_map_to_live_camera_actions() {
         ControlAction::ResetRuntimeCamera
     );
     assert_eq!(
+        widget.menu_control_action(MenuAction::RequestMsaa(AntiAliasingPreference::X8)),
+        ControlAction::RequestMsaa(AntiAliasingPreference::X8)
+    );
+    assert_eq!(
+        widget.menu_control_action(MenuAction::RequestSmaa(true)),
+        ControlAction::RequestSmaa(true)
+    );
+    assert_eq!(
         widget.menu_control_action(MenuAction::SaveCamera),
         ControlAction::SaveCamera
     );
@@ -979,6 +987,19 @@ fn f4_queues_one_msaa_change_per_key_press() {
 }
 
 #[test]
+fn f4_uses_the_same_explicit_msaa_request_path_as_pocket_ui() {
+    let mut keyboard = test_widget();
+    let mut pocket_ui = test_widget();
+    let mut input = Input::default();
+
+    input.inject_key(KeyCode::F4, true);
+    keyboard.frame(0.0, &input);
+    pocket_ui.apply_menu_action(MenuAction::RequestMsaa(AntiAliasingPreference::X2));
+
+    assert_eq!(keyboard.controls_snapshot(), pocket_ui.controls_snapshot());
+}
+
+#[test]
 fn f5_queues_one_smaa_change_per_key_press() {
     let mut widget = test_widget();
     let mut input = Input::default();
@@ -1004,6 +1025,42 @@ fn f5_queues_one_smaa_change_per_key_press() {
     widget.frame(0.0, &input);
     assert!(!widget.aa.requested_smaa());
     assert_eq!(widget.aa.pending_requests().smaa, Some(false));
+}
+
+#[test]
+fn f5_uses_the_same_explicit_smaa_request_path_as_pocket_ui() {
+    let mut keyboard = test_widget();
+    let mut pocket_ui = test_widget();
+    let mut input = Input::default();
+
+    input.inject_key(KeyCode::F5, true);
+    keyboard.frame(0.0, &input);
+    pocket_ui.apply_menu_action(MenuAction::RequestSmaa(true));
+
+    assert_eq!(keyboard.controls_snapshot(), pocket_ui.controls_snapshot());
+}
+
+#[test]
+fn msaa_and_smaa_can_be_requested_and_effective_together() {
+    let mut widget = test_widget();
+
+    widget.apply_control_action(ControlAction::RequestMsaa(AntiAliasingPreference::X4));
+    widget.apply_control_action(ControlAction::RequestSmaa(true));
+    let pending = widget.controls_snapshot();
+    assert_eq!(pending.requested_msaa(), AntiAliasingPreference::X4);
+    assert_eq!(pending.effective_msaa(), 1);
+    assert!(pending.requested_smaa());
+    assert!(!pending.effective_smaa());
+    assert!(pending.msaa_pending());
+    assert!(pending.smaa_pending());
+
+    widget.aa.initialize_msaa_from_renderer(4, 4);
+    widget.aa.initialize_smaa_from_renderer(true, true);
+    let active = widget.controls_snapshot();
+    assert_eq!(active.requested_msaa(), AntiAliasingPreference::X4);
+    assert_eq!(active.effective_msaa(), 4);
+    assert!(active.requested_smaa());
+    assert!(active.effective_smaa());
 }
 
 #[test]
