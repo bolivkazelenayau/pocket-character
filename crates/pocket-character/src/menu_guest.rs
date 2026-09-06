@@ -170,6 +170,9 @@ pub(crate) enum MenuAction {
     FovIncrement,
     SetEffectiveDistance(f32),
     SetEffectiveFov(f32),
+    SetYaw(f32),
+    SetPitch(f32),
+    SetRoll(f32),
     SaveCamera,
     ResetRuntimeCamera,
     RequestMsaa(AntiAliasingPreference),
@@ -206,6 +209,21 @@ fn decode_menu_action(line: &str) -> Option<MenuAction> {
             .as_ref()
             .and_then(finite_f32_value)
             .map(MenuAction::SetEffectiveFov),
+        "set_yaw" => wire
+            .value
+            .as_ref()
+            .and_then(finite_f32_value)
+            .map(MenuAction::SetYaw),
+        "set_pitch" => wire
+            .value
+            .as_ref()
+            .and_then(finite_f32_value)
+            .map(MenuAction::SetPitch),
+        "set_roll" => wire
+            .value
+            .as_ref()
+            .and_then(finite_f32_value)
+            .map(MenuAction::SetRoll),
         "save_camera" => Some(MenuAction::SaveCamera),
         "reset_runtime_camera" => Some(MenuAction::ResetRuntimeCamera),
         "request_msaa" => wire
@@ -245,6 +263,9 @@ struct MenuState {
     base_distance_scale: f32,
     effective_fov_deg: f32,
     effective_distance_scale: f32,
+    yaw_deg: f32,
+    pitch_deg: f32,
+    roll_deg: f32,
     requested_msaa: AntiAliasingPreference,
     effective_msaa: u32,
     requested_smaa: bool,
@@ -320,6 +341,9 @@ impl MenuGuest {
         base_distance_scale: f32,
         effective_fov_deg: f32,
         effective_distance_scale: f32,
+        yaw_deg: f32,
+        pitch_deg: f32,
+        roll_deg: f32,
         requested_msaa: AntiAliasingPreference,
         effective_msaa: u32,
         requested_smaa: bool,
@@ -333,6 +357,9 @@ impl MenuGuest {
             base_distance_scale,
             effective_fov_deg,
             effective_distance_scale,
+            yaw_deg,
+            pitch_deg,
+            roll_deg,
             requested_msaa,
             effective_msaa,
             requested_smaa,
@@ -530,6 +557,9 @@ mod tests {
             base_distance_scale: 0.6,
             effective_fov_deg: 44.0,
             effective_distance_scale: 0.55,
+            yaw_deg: 7.5,
+            pitch_deg: 22.5,
+            roll_deg: 30.0,
             requested_msaa: AntiAliasingPreference::X8,
             effective_msaa: 4,
             requested_smaa: true,
@@ -544,6 +574,9 @@ mod tests {
             ("base_distance_scale", 0.6),
             ("effective_fov_deg", 44.0),
             ("effective_distance_scale", 0.55),
+            ("yaw_deg", 7.5),
+            ("pitch_deg", 22.5),
+            ("roll_deg", 30.0),
         ] {
             let actual = value[name].as_f64().unwrap();
             assert!(
@@ -587,6 +620,18 @@ mod tests {
                 MenuAction::SetEffectiveFov(120.2),
             ),
             (
+                r#"{"t":"action","action":"set_yaw","value":190.25}"#,
+                MenuAction::SetYaw(190.25),
+            ),
+            (
+                r#"{"t":"action","action":"set_pitch","value":-42.5}"#,
+                MenuAction::SetPitch(-42.5),
+            ),
+            (
+                r#"{"t":"action","action":"set_roll","value":15.75}"#,
+                MenuAction::SetRoll(15.75),
+            ),
+            (
                 r#"{"t":"action","action":"save_camera"}"#,
                 MenuAction::SaveCamera,
             ),
@@ -620,6 +665,9 @@ mod tests {
             r#"{"t":"action","action":"future_value"}"#,
             r#"{"t":"action","action":"set_effective_fov"}"#,
             r#"{"t":"action","action":"set_effective_distance","value":null}"#,
+            r#"{"t":"action","action":"set_yaw","value":null}"#,
+            r#"{"t":"action","action":"set_pitch","value":"89"}"#,
+            r#"{"t":"action","action":"set_roll","value":1e309}"#,
             r#"{"t":"action","action":"request_msaa","value":3}"#,
             r#"{"t":"action","action":"request_smaa","value":"on"}"#,
         ] {

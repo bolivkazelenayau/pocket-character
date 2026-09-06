@@ -364,6 +364,66 @@ describe("PocketUI InlineNumberField", () => {
     }
   });
 
+  test("orientation fields commit raw values and transfer native capture ownership", () => {
+    const input = new TestTextInput();
+    const committed: Array<{ id: string; value: number }> = [];
+    const authoritative = new Map([
+      ["YawValue", 22.5],
+      ["PitchValue", -7.5],
+      ["RollValue", 15],
+    ]);
+    const fields = [
+      { id: "YawValue", captureY: 605 },
+      { id: "PitchValue", captureY: 625 },
+      { id: "RollValue", captureY: 645 },
+    ].map(({ id, captureY }) => {
+      const field = new InlineNumberFieldModel({
+        id,
+        value: () => authoritative.get(id) ?? null,
+        format: (value) => `${value.toFixed(1)}°`,
+        editFormat: (value) => value.toString(),
+        onCommit: (value) => {
+          authoritative.set(id, value);
+          committed.push({ id, value });
+        },
+        captureArea: (caret) => ({ x: 152 + caret, y: captureY, width: 1, height: 18 }),
+        input,
+      });
+      return { field, id };
+    });
+
+    try {
+      dispatchInlineNumberPointerDown("YawValue", 170, 605);
+      expect(input.capture.cursorArea?.y).toBe(605);
+      input.dispatch(frame({ edits: [{ kind: "char", text: "190.25" }] }));
+      input.dispatch(frame({ edits: [{ kind: "key", key: "enter" }] }));
+
+      dispatchInlineNumberPointerDown("PitchValue", 170, 625);
+      expect(fields[0].field.isEditing()).toBe(false);
+      expect(input.capture.cursorArea?.y).toBe(625);
+      input.dispatch(frame({ edits: [{ kind: "char", text: "100" }] }));
+      input.dispatch(frame({ edits: [{ kind: "key", key: "escape" }] }));
+
+      dispatchInlineNumberPointerDown("RollValue", 170, 645);
+      input.dispatch(frame({ edits: [{ kind: "char", text: "-190" }] }));
+      dispatchInlineNumberPointerDown("YawValue", 170, 605);
+
+      expect(committed).toEqual([
+        { id: "YawValue", value: 190.25 },
+        { id: "RollValue", value: -190 },
+      ]);
+      expect(authoritative.get("YawValue")).toBe(190.25);
+      expect(authoritative.get("PitchValue")).toBe(-7.5);
+      expect(authoritative.get("RollValue")).toBe(-190);
+      expect(input.capture).toEqual({
+        active: true,
+        cursorArea: { x: 158, y: 605, width: 1, height: 18 },
+      });
+    } finally {
+      for (const { field } of fields.reverse()) field.dispose();
+    }
+  });
+
   test("Backspace, Delete, caret movement, and IME preedit remain local to the draft", () => {
     const { field, input } = makeField();
     try {

@@ -577,6 +577,9 @@ impl Widget {
             MenuAction::FovIncrement => ControlAction::AdjustFov(1),
             MenuAction::SetEffectiveDistance(value) => ControlAction::SetEffectiveDistance(value),
             MenuAction::SetEffectiveFov(value) => ControlAction::SetEffectiveFov(value),
+            MenuAction::SetYaw(value) => ControlAction::SetYaw(value),
+            MenuAction::SetPitch(value) => ControlAction::SetPitch(value),
+            MenuAction::SetRoll(value) => ControlAction::SetRoll(value),
             MenuAction::SaveCamera => ControlAction::SaveCamera,
             MenuAction::ResetRuntimeCamera => ControlAction::ResetRuntimeCamera,
             MenuAction::RequestMsaa(preference) => ControlAction::RequestMsaa(preference),
@@ -648,13 +651,14 @@ impl Widget {
             }
             ControlAction::SaveCamera => self.save_camera(),
             ControlAction::ResetRuntimeCamera => self.reset_runtime_camera(),
+            // Snap increments affect only future detents. Persist the
+            // accepted value without reapplying the current camera pose.
             ControlAction::SetYawSnap(snap_deg) => {
                 let mut candidate = self.settings.camera;
                 candidate.yaw_snap_deg = snap_deg;
                 let sanitized = candidate.sanitized();
                 if sanitized != self.settings.camera {
                     self.settings.camera = sanitized;
-                    self.reapply_camera();
                     self.persist_settings();
                 }
             }
@@ -664,7 +668,6 @@ impl Widget {
                 let sanitized = candidate.sanitized();
                 if sanitized != self.settings.camera {
                     self.settings.camera = sanitized;
-                    self.reapply_camera();
                     self.persist_settings();
                 }
             }
@@ -674,7 +677,6 @@ impl Widget {
                 let sanitized = candidate.sanitized();
                 if sanitized != self.settings.camera {
                     self.settings.camera = sanitized;
-                    self.reapply_camera();
                     self.persist_settings();
                 }
             }
@@ -690,7 +692,6 @@ impl Widget {
                 let sanitized = candidate.sanitized();
                 if sanitized != self.settings.camera {
                     self.settings.camera = sanitized;
-                    self.reapply_camera();
                     self.persist_settings();
                 }
             }
@@ -1115,6 +1116,9 @@ impl Game for Widget {
                             snapshot.base_distance_scale(),
                             snapshot.effective_fov_deg(),
                             snapshot.effective_distance_scale(),
+                            snapshot.yaw_deg(),
+                            snapshot.pitch_deg(),
+                            snapshot.roll_deg(),
                             snapshot.requested_msaa(),
                             snapshot.effective_msaa(),
                             snapshot.requested_smaa(),

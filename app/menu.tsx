@@ -10,7 +10,7 @@ import { getOps } from "@pocketjs/framework/solid";
 import { focusNode, hitFocusable, pressNode, setActiveNode } from "@pocketjs/framework/input";
 import { onFrame } from "@pocketjs/framework/lifecycle";
 import { mount } from "@pocketjs/framework/solid";
-import { formatCompactFov } from "./camera-value-format";
+import { formatCompactFov, formatDegrees } from "./camera-value-format";
 import {
   MSAA_OPTIONS,
   encodeMsaaRequest,
@@ -39,6 +39,9 @@ import { textInput } from "./text-input";
 interface ControlsState {
   effective_fov_deg: number;
   effective_distance_scale: number;
+  yaw_deg: number;
+  pitch_deg: number;
+  roll_deg: number;
   requested_msaa: MsaaPreference;
   effective_msaa: number;
   requested_smaa: boolean;
@@ -54,6 +57,9 @@ type ActionName =
   | "fov_increment"
   | "set_effective_fov"
   | "set_effective_distance"
+  | "set_yaw"
+  | "set_pitch"
+  | "set_roll"
   | "save_camera"
   | "reset_runtime_camera";
 
@@ -65,6 +71,9 @@ const [activePage, setActivePage] = createSignal<SettingsPage>("camera");
 const CAMERA_VALUE_X = 152;
 const CAMERA_DISTANCE_VALUE_Y = 519;
 const CAMERA_FOV_VALUE_Y = 539;
+const CAMERA_YAW_VALUE_Y = 605;
+const CAMERA_PITCH_VALUE_Y = 625;
+const CAMERA_ROLL_VALUE_Y = 645;
 
 // Pointer ownership follows the framework's focusable hit target. The
 // release compares against the latched down target, so one physical press can
@@ -118,6 +127,14 @@ function cancelPointerInteraction(): void {
   setActiveNode(null);
 }
 
+function switchPage(page: SettingsPage): void {
+  // A page switch can be activated by a d-pad press without going through
+  // the pointer bridge. Release native text-input capture before the current
+  // panel is replaced.
+  cancelInlineNumberFields();
+  setActivePage(page);
+}
+
 function handleMouse(x: number, y: number, down: boolean): void {
   const target = hitFocusable(x, y);
   focusNode(target);
@@ -162,6 +179,9 @@ function pollControls(): void {
           t?: unknown;
           effective_fov_deg?: unknown;
           effective_distance_scale?: unknown;
+          yaw_deg?: unknown;
+          pitch_deg?: unknown;
+          roll_deg?: unknown;
           requested_msaa?: unknown;
           effective_msaa?: unknown;
           requested_smaa?: unknown;
@@ -176,6 +196,9 @@ function pollControls(): void {
           if (
             typeof msg.effective_fov_deg !== "number" ||
             typeof msg.effective_distance_scale !== "number" ||
+            typeof msg.yaw_deg !== "number" ||
+            typeof msg.pitch_deg !== "number" ||
+            typeof msg.roll_deg !== "number" ||
             typeof msg.requested_msaa !== "string" ||
             !MSAA_OPTIONS.some((option) => option.preference === msg.requested_msaa) ||
             typeof msg.effective_msaa !== "number" ||
@@ -187,11 +210,17 @@ function pollControls(): void {
             typeof msg.smaa_pending !== "boolean" ||
             !Number.isFinite(msg.effective_fov_deg) ||
             !Number.isFinite(msg.effective_distance_scale) ||
+            !Number.isFinite(msg.yaw_deg) ||
+            !Number.isFinite(msg.pitch_deg) ||
+            !Number.isFinite(msg.roll_deg) ||
             !Number.isFinite(msg.effective_msaa)
           ) continue;
           setControls({
             effective_fov_deg: msg.effective_fov_deg,
             effective_distance_scale: msg.effective_distance_scale,
+            yaw_deg: msg.yaw_deg,
+            pitch_deg: msg.pitch_deg,
+            roll_deg: msg.roll_deg,
             requested_msaa: msg.requested_msaa as MsaaPreference,
             effective_msaa: msg.effective_msaa,
             requested_smaa: msg.requested_smaa,
@@ -260,24 +289,52 @@ function Row(props: {
           format={props.format}
           editFormat={(value) => value.toString()}
           onCommit={(value) => sendAction(props.commitAction, value)}
-          captureArea={(caret, draft) => {
-            const textWidth = Math.min(INLINE_NUMBER_CELL_WIDTH, draft.length * INLINE_NUMBER_CHAR_WIDTH);
-            const textLeft = Math.max(0, (INLINE_NUMBER_CELL_WIDTH - textWidth) / 2);
-            return {
-              x: CAMERA_VALUE_X + Math.min(INLINE_NUMBER_CELL_WIDTH - 1, textLeft + caret * INLINE_NUMBER_CHAR_WIDTH),
-              y: props.captureY,
-              width: 1,
-              height: INLINE_NUMBER_CELL_HEIGHT,
-            };
-          }}
-          caretFromPointer={(x, draft) => {
-            const textWidth = Math.min(INLINE_NUMBER_CELL_WIDTH, draft.length * INLINE_NUMBER_CHAR_WIDTH);
-            const textLeft = Math.max(0, (INLINE_NUMBER_CELL_WIDTH - textWidth) / 2);
-            return Math.round((x - CAMERA_VALUE_X - textLeft) / INLINE_NUMBER_CHAR_WIDTH);
-          }}
+          captureArea={(caret, draft) => inlineNumberCaptureArea(props.captureY, caret, draft)}
+          caretFromPointer={inlineNumberCaretFromPointer}
         />
         <Button label="+" debugName={`${props.debugName}Increment`} onPress={props.increment} />
       </View>
+    </View>
+  );
+}
+
+function inlineNumberCaptureArea(captureY: number, caret: number, draft: string) {
+  const textWidth = Math.min(INLINE_NUMBER_CELL_WIDTH, draft.length * INLINE_NUMBER_CHAR_WIDTH);
+  const textLeft = Math.max(0, (INLINE_NUMBER_CELL_WIDTH - textWidth) / 2);
+  return {
+    x: CAMERA_VALUE_X + Math.min(INLINE_NUMBER_CELL_WIDTH - 1, textLeft + caret * INLINE_NUMBER_CHAR_WIDTH),
+    y: captureY,
+    width: 1,
+    height: INLINE_NUMBER_CELL_HEIGHT,
+  };
+}
+
+function inlineNumberCaretFromPointer(x: number, draft: string): number {
+  const textWidth = Math.min(INLINE_NUMBER_CELL_WIDTH, draft.length * INLINE_NUMBER_CHAR_WIDTH);
+  const textLeft = Math.max(0, (INLINE_NUMBER_CELL_WIDTH - textWidth) / 2);
+  return Math.round((x - CAMERA_VALUE_X - textLeft) / INLINE_NUMBER_CHAR_WIDTH);
+}
+
+function OrientationRow(props: {
+  label: string;
+  value: () => number | null;
+  commitAction: "set_yaw" | "set_pitch" | "set_roll";
+  captureY: number;
+  debugName: string;
+}) {
+  return (
+    <View debugName={`${props.debugName}Row`} class="h-[18] flex-row items-center">
+      <Text class="min-w-[48] flex-1 text-xs text-[#9fb3c8]">{props.label}</Text>
+      <InlineNumberField
+        id={`${props.debugName}Value`}
+        debugName={`${props.debugName}Value`}
+        value={props.value}
+        format={formatDegrees}
+        editFormat={(value) => value.toString()}
+        onCommit={(value) => sendAction(props.commitAction, value)}
+        captureArea={(caret, draft) => inlineNumberCaptureArea(props.captureY, caret, draft)}
+        caretFromPointer={inlineNumberCaretFromPointer}
+      />
     </View>
   );
 }
@@ -321,10 +378,10 @@ function PageTabs() {
 
   return (
     <View debugName="SettingsTabs" class="h-[24] w-full flex-row gap-[4]">
-      <Focusable debugName="CameraTab" class={tabClass("camera")} onPress={() => setActivePage("camera")}>
+      <Focusable debugName="CameraTab" class={tabClass("camera")} onPress={() => switchPage("camera")}>
         <Text class="text-sm text-[#e8f1f8]">CAMERA</Text>
       </Focusable>
-      <Focusable debugName="GraphicsTab" class={tabClass("graphics")} onPress={() => setActivePage("graphics")}>
+      <Focusable debugName="GraphicsTab" class={tabClass("graphics")} onPress={() => switchPage("graphics")}>
         <Text class="text-sm text-[#e8f1f8]">GRAPHICS</Text>
       </Focusable>
     </View>
@@ -467,6 +524,32 @@ function CameraPanel() {
         >
           <Text class="text-xs text-[#e8f1f8]">Reset Camera</Text>
         </Focusable>
+      </View>
+      <View class="mt-[8] h-[16] flex-row items-center">
+        <Text class="text-xs font-bold text-[#7fd0ff]">ORIENTATION</Text>
+      </View>
+      <View class="mt-[0] flex-col gap-[2]">
+        <OrientationRow
+          label="Yaw"
+          value={() => controls()?.yaw_deg ?? null}
+          commitAction="set_yaw"
+          captureY={CAMERA_YAW_VALUE_Y}
+          debugName="Yaw"
+        />
+        <OrientationRow
+          label="Pitch"
+          value={() => controls()?.pitch_deg ?? null}
+          commitAction="set_pitch"
+          captureY={CAMERA_PITCH_VALUE_Y}
+          debugName="Pitch"
+        />
+        <OrientationRow
+          label="Roll"
+          value={() => controls()?.roll_deg ?? null}
+          commitAction="set_roll"
+          captureY={CAMERA_ROLL_VALUE_Y}
+          debugName="Roll"
+        />
       </View>
     </SettingsFrame>
   );

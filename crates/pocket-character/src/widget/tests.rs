@@ -266,6 +266,18 @@ fn discrete_menu_actions_map_to_live_camera_actions() {
         ControlAction::SetEffectiveDistance(2.0)
     );
     assert_eq!(
+        widget.menu_control_action(MenuAction::SetYaw(45.0)),
+        ControlAction::SetYaw(45.0)
+    );
+    assert_eq!(
+        widget.menu_control_action(MenuAction::SetPitch(-12.5)),
+        ControlAction::SetPitch(-12.5)
+    );
+    assert_eq!(
+        widget.menu_control_action(MenuAction::SetRoll(7.25)),
+        ControlAction::SetRoll(7.25)
+    );
+    assert_eq!(
         widget.menu_control_action(MenuAction::ResetRuntimeCamera),
         ControlAction::ResetRuntimeCamera
     );
@@ -1640,6 +1652,34 @@ fn yaw_pitch_roll_actions_return_authoritative_accepted_values() {
 }
 
 #[test]
+fn menu_orientation_actions_use_the_session_camera_path_without_persistence() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let settings = AppSettings::default();
+    std::fs::write(&path, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
+    let mut widget = Widget::new_with_settings_path(test_config(), settings, Some(path.clone()));
+
+    let snapshot = widget.apply_menu_action(MenuAction::SetYaw(190.0));
+    assert_eq!(snapshot.yaw_deg(), -170.0);
+    let snapshot = widget.apply_menu_action(MenuAction::SetPitch(100.0));
+    assert_eq!(snapshot.pitch_deg(), 89.0);
+    let snapshot = widget.apply_menu_action(MenuAction::SetRoll(-190.0));
+    assert_eq!(snapshot.roll_deg(), 170.0);
+
+    assert_eq!(widget.save_count, 0);
+    let persisted = AppSettings::load_from_path(&path);
+    assert_eq!(persisted.camera.yaw_snap_deg, 15.0);
+    assert_eq!(persisted.camera.pitch_snap_deg, 15.0);
+    assert_eq!(persisted.camera.roll_snap_deg, 15.0);
+
+    let snapshot = widget.apply_menu_action(MenuAction::ResetRuntimeCamera);
+    assert_eq!(snapshot.yaw_deg(), 0.0);
+    assert_eq!(snapshot.pitch_deg(), 0.0);
+    assert_eq!(snapshot.roll_deg(), 0.0);
+    assert_eq!(widget.save_count, 0);
+}
+
+#[test]
 fn reset_restores_saved_framing_without_resetting_snaps_or_aa() {
     let settings = AppSettings {
         camera: CameraSettings {
@@ -1754,6 +1794,41 @@ fn malformed_values_are_sanitized_through_authoritative_policy() {
     assert_eq!(all.yaw_snap_deg(), 15.0);
     assert_eq!(all.pitch_snap_deg(), 15.0);
     assert_eq!(all.roll_snap_deg(), 0.1);
+}
+
+#[test]
+fn snap_setting_edits_preserve_the_current_camera_pose() {
+    let mut widget = test_widget();
+    let runtime = CameraRuntimeAdjustments {
+        fov_delta_deg: 4.0,
+        distance_scale_delta: -0.1,
+        pan_ndc: Vec2::new(0.03, 0.02),
+        yaw_deg: 24.0,
+        roll_deg: -13.0,
+        pitch_deg: 8.0,
+    };
+    widget.set_camera_adjustments(runtime);
+    let before =
+        resolved_camera_for_widget(&widget, canonical_test_aabb(), DEFAULT_VIEWPORT_ASPECT);
+
+    let snapshot = widget.apply_control_action(ControlAction::SetYawSnap(7.0));
+    let after_yaw =
+        resolved_camera_for_widget(&widget, canonical_test_aabb(), DEFAULT_VIEWPORT_ASPECT);
+    assert_widget_cameras_equivalent(after_yaw, before, DEFAULT_VIEWPORT_ASPECT);
+    assert_eq!(widget.camera_controls.adjustments(), runtime);
+    assert_eq!(snapshot.yaw_snap_deg(), 7.0);
+
+    let snapshot = widget.apply_control_action(ControlAction::SetPitchSnap(9.0));
+    let after_pitch =
+        resolved_camera_for_widget(&widget, canonical_test_aabb(), DEFAULT_VIEWPORT_ASPECT);
+    assert_widget_cameras_equivalent(after_pitch, before, DEFAULT_VIEWPORT_ASPECT);
+    assert_eq!(snapshot.pitch_snap_deg(), 9.0);
+
+    let snapshot = widget.apply_control_action(ControlAction::SetRollSnap(11.0));
+    let after_roll =
+        resolved_camera_for_widget(&widget, canonical_test_aabb(), DEFAULT_VIEWPORT_ASPECT);
+    assert_widget_cameras_equivalent(after_roll, before, DEFAULT_VIEWPORT_ASPECT);
+    assert_eq!(snapshot.roll_snap_deg(), 11.0);
 }
 
 #[test]
