@@ -36,13 +36,23 @@ fn explicit_max_fps(args: &[String]) -> Option<f32> {
         .filter(|value: &f32| value.is_finite())
 }
 
-fn apply_cli_overrides(mut settings: AppSettings, args: &[String]) -> AppSettings {
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct EffectiveLaunchSettings {
+    // Process-local effective state. This is intentionally separate from
+    // AppSettings so it cannot be included in settings persistence.
+    max_fps: f32,
+}
+
+fn apply_cli_overrides(persisted: &AppSettings, args: &[String]) -> EffectiveLaunchSettings {
     // `--max-fps` is the only existing CLI option equivalent to a persisted
     // setting. Unlike a parser default, this is only applied when present.
+    let mut rendering = persisted.rendering.clone();
     if let Some(max_fps) = explicit_max_fps(args) {
-        settings.rendering.max_fps = max_fps;
+        rendering.max_fps = max_fps;
     }
-    settings.sanitized()
+    EffectiveLaunchSettings {
+        max_fps: rendering.sanitized().max_fps,
+    }
 }
 
 fn main() -> Result<()> {
@@ -93,22 +103,29 @@ fn main() -> Result<()> {
     // Headless verification has a fixed 1x renderer and must not inherit a
     // user's interactive AA preferences from %APPDATA%.
     let settings_path = AppSettings::path();
-    let settings = apply_cli_overrides(AppSettings::load(), &args);
-    cfg.size = (settings.window.width, settings.window.height);
-    let widget = Widget::new_with_settings_path(cfg, settings.clone(), settings_path);
+    let persisted_settings = AppSettings::load();
+    let effective_settings = apply_cli_overrides(&persisted_settings, &args);
+    cfg.size = (
+        persisted_settings.window.width,
+        persisted_settings.window.height,
+    );
+    let widget = Widget::new_with_settings_path(cfg, persisted_settings.clone(), settings_path);
     pocket3d::app::run(
         AppConfig {
             title: "pocket-character".into(),
-            size: (settings.window.width, settings.window.height),
+            size: (
+                persisted_settings.window.width,
+                persisted_settings.window.height,
+            ),
             tick_hz: TICK_HZ,
             capture_mouse: false,
             transparent: true,
             decorations: false,
-            always_on_top: settings.window.always_on_top,
-            resizable: settings.window.resizable,
-            max_fps: Some(settings.rendering.max_fps),
+            always_on_top: persisted_settings.window.always_on_top,
+            resizable: persisted_settings.window.resizable,
+            max_fps: Some(effective_settings.max_fps),
             drag_window: true,
-            requested_sample_count: settings.rendering.msaa.samples().unwrap_or(1),
+            requested_sample_count: persisted_settings.rendering.msaa.samples().unwrap_or(1),
         },
         widget,
     )
@@ -202,33 +219,35 @@ mod tests {
     fn persisted_max_fps_wins_when_cli_is_absent() {
         let persisted = AppSettings {
             rendering: RenderSettings {
-                max_fps: 30.0,
+                max_fps: 60.0,
                 ..RenderSettings::default()
             },
             ..AppSettings::default()
         };
 
-        let merged = apply_cli_overrides(persisted, &[]);
-        assert_eq!(merged.rendering.max_fps, 30.0);
+        let effective = apply_cli_overrides(&persisted, &[]);
+        assert_eq!(effective.max_fps, 60.0);
+        assert_eq!(persisted.rendering.max_fps, 60.0);
     }
 
     #[test]
     fn explicit_max_fps_overrides_persisted_and_default_values() {
         let persisted = AppSettings {
             rendering: RenderSettings {
-                max_fps: 30.0,
+                max_fps: 60.0,
                 ..RenderSettings::default()
             },
             ..AppSettings::default()
         };
 
-        let merged = apply_cli_overrides(
-            persisted,
+        let effective = apply_cli_overrides(
+            &persisted,
             &["pocket-character".into(), "--max-fps".into(), "120".into()],
         );
-        assert_eq!(merged.rendering.max_fps, 120.0);
+        assert_eq!(effective.max_fps, 120.0);
+        assert_eq!(persisted.rendering.max_fps, 60.0);
 
-        let defaults = apply_cli_overrides(AppSettings::default(), &[]);
-        assert_eq!(defaults.rendering.max_fps, 60.0);
+        let defaults = apply_cli_overrides(&AppSettings::default(), &[]);
+        assert_eq!(defaults.max_fps, 60.0);
     }
 }

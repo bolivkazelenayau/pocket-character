@@ -24,6 +24,31 @@ fn approx_eq(actual: f32, expected: f32) {
     assert!((actual - expected).abs() < 1.0e-5, "{actual} != {expected}");
 }
 
+#[test]
+fn cli_max_fps_override_does_not_leak_into_camera_save() {
+    let persisted = AppSettings {
+        rendering: RenderSettings {
+            max_fps: 60.0,
+            ..RenderSettings::default()
+        },
+        ..AppSettings::default()
+    };
+    let effective = crate::apply_cli_overrides(
+        &persisted,
+        &["pocket-character".into(), "--max-fps".into(), "120".into()],
+    );
+    assert_eq!(effective.max_fps, 120.0);
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let mut widget =
+        Widget::new_with_settings_path(test_config(), persisted.clone(), Some(path.clone()));
+    widget.apply_control_action(ControlAction::SaveCamera);
+
+    assert_eq!(AppSettings::load_from_path(&path).rendering.max_fps, 60.0);
+    assert_eq!(persisted.rendering.max_fps, 60.0);
+}
+
 fn canonical_test_aabb() -> (Vec3, Vec3) {
     (Vec3::new(-0.4, 0.0, -0.2), Vec3::new(0.6, 1.8, 0.4))
 }

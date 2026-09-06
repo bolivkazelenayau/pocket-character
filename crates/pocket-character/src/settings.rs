@@ -299,7 +299,7 @@ impl Default for RenderSettings {
 }
 
 impl RenderSettings {
-    fn sanitized(self) -> Self {
+    pub(crate) fn sanitized(self) -> Self {
         let max_fps = if self.max_fps.is_finite() {
             self.max_fps.clamp(MIN_MAX_FPS, MAX_MAX_FPS)
         } else {
