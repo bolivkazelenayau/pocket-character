@@ -2,6 +2,7 @@ use super::*;
 use crate::menu_guest::MenuAction;
 use crate::settings::{AntiAliasingPreference, AppSettings, RenderSettings};
 use glam::{Vec2, Vec3};
+use pocket3d::app::{Game, WindowRuntimeRequest, WindowRuntimeState};
 use tempfile::tempdir;
 
 fn test_widget() -> Widget {
@@ -47,6 +48,37 @@ fn cli_max_fps_override_does_not_leak_into_camera_save() {
 
     assert_eq!(AppSettings::load_from_path(&path).rendering.max_fps, 60.0);
     assert_eq!(persisted.rendering.max_fps, 60.0);
+}
+
+#[test]
+fn guest_max_fps_is_a_live_request_and_not_a_persisted_setting() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let persisted = AppSettings::default();
+    let mut widget =
+        Widget::new_with_settings_path(test_config(), persisted.clone(), Some(path.clone()));
+
+    widget.set_window_runtime_request(WindowRuntimeRequest {
+        max_fps: Some(Some(90.0)),
+        ..WindowRuntimeRequest::default()
+    });
+    assert_eq!(widget.window_runtime_request().max_fps, Some(Some(90.0)));
+
+    widget.apply_commands(vec![Command::SetMaxFps(120.0)]);
+
+    assert_eq!(widget.window_runtime_request().max_fps, Some(Some(120.0)));
+    assert_eq!(widget.settings.rendering.max_fps, persisted.rendering.max_fps);
+    assert_eq!(AppSettings::load_from_path(&path), AppSettings::default());
+
+    let runtime_state = WindowRuntimeState {
+        inner_size_px: (900, 1200),
+        scale_factor: 2.0,
+        resizable: true,
+        always_on_top: false,
+        max_fps: Some(120.0),
+    };
+    <Widget as Game>::window_runtime_state(&mut widget, runtime_state);
+    assert_eq!(widget.observed_window_runtime_state(), Some(runtime_state));
 }
 
 fn canonical_test_aabb() -> (Vec3, Vec3) {

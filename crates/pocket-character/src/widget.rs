@@ -15,7 +15,7 @@ use glam::{Mat4, Vec3};
 use pocket_character_core::{CharacterSim, TrackingMode};
 use pocket_vrm::{SpringSolver, VrmDoc};
 use pocket3d::anim::NodeTrs;
-use pocket3d::app::{Game, TextInputRequest};
+use pocket3d::app::{Game, TextInputRequest, WindowRuntimeRequest, WindowRuntimeState};
 use pocket3d::camera::Camera;
 use pocket3d::gpu::Gpu;
 use pocket3d::hud::Hud;
@@ -212,6 +212,8 @@ pub struct Widget {
     /// Physical window metrics supplied by the Pocket3D desktop host.
     window_physical_size: Option<(u32, u32)>,
     window_scale_factor: f64,
+    window_runtime_state: Option<WindowRuntimeState>,
+    window_runtime_request: WindowRuntimeRequest,
     settings: AppSettings,
     settings_path: Option<PathBuf>,
     #[cfg(test)]
@@ -311,6 +313,8 @@ impl Widget {
             viewport_size: None,
             window_physical_size: None,
             window_scale_factor: DEFAULT_WINDOW_SCALE_FACTOR,
+            window_runtime_state: None,
+            window_runtime_request: WindowRuntimeRequest::default(),
             settings,
             settings_path,
             #[cfg(test)]
@@ -591,6 +595,24 @@ impl Widget {
         }
     }
 
+    /// Set process-local native window/pacing changes for Pocket3D to apply.
+    /// This deliberately does not touch `AppSettings`; the future WINDOW page
+    /// can persist its preference separately and use this as its live request.
+    #[allow(dead_code)]
+    pub fn set_window_runtime_request(&mut self, request: WindowRuntimeRequest) {
+        self.window_runtime_request = request;
+    }
+
+    #[allow(dead_code)]
+    pub fn window_runtime_request(&self) -> WindowRuntimeRequest {
+        self.window_runtime_request
+    }
+
+    #[allow(dead_code)]
+    pub fn observed_window_runtime_state(&self) -> Option<WindowRuntimeState> {
+        self.window_runtime_state
+    }
+
     fn apply_menu_action(&mut self, action: MenuAction) -> ControlsSnapshot {
         self.apply_control_action(self.menu_control_action(action))
     }
@@ -799,10 +821,14 @@ impl Widget {
                         log::warn!("character.playClip: unknown clip '{name}'");
                     }
                 }
-                Command::SetMaxFps(_fps) => {
-                    // The app loop owns pacing; a runtime-adjustable cap needs
-                    // an AppConfig hook (candidate follow-up).
-                    log::warn!("character.setMaxFps: fixed at launch for now");
+                Command::SetMaxFps(fps) => {
+                    // Pacing remains authoritative in Pocket3D; this is a
+                    // process-local desired value and is never persisted.
+                    if fps.is_finite() {
+                        self.window_runtime_request.max_fps = Some(Some(fps));
+                    } else {
+                        log::warn!("character.setMaxFps: ignoring non-finite value");
+                    }
                 }
                 Command::Quit => self.exit = true,
             }
@@ -830,9 +856,19 @@ fn apply_expression(vrm: &VrmDoc, model: &Arc<ModelAsset>, scene: &mut Scene, na
 }
 
 impl Game for Widget {
+    fn window_runtime_state(&mut self, state: WindowRuntimeState) {
+        self.window_runtime_state = Some(state);
+        self.window_physical_size = Some(state.inner_size_px);
+        self.window_scale_factor = normalized_scale_factor(state.scale_factor);
+    }
+
     fn window_metrics(&mut self, physical_size: (u32, u32), scale_factor: f64) {
         self.window_physical_size = Some(physical_size);
         self.window_scale_factor = normalized_scale_factor(scale_factor);
+    }
+
+    fn window_runtime_request(&self) -> WindowRuntimeRequest {
+        self.window_runtime_request
     }
 
     fn text_input_request(&self) -> TextInputRequest {
