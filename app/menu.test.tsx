@@ -68,6 +68,7 @@ function stateLine(
     pitchSnap: 15,
     rollSnap: 15,
   },
+  observedSize: [number, number] = [720, 700],
 ): string {
   return JSON.stringify({
     t: "state",
@@ -86,6 +87,19 @@ function stateLine(
     effective_smaa: false,
     msaa_pending: false,
     smaa_pending: false,
+    window: {
+      configured_width: 450,
+      configured_height: 600,
+      configured_resizable: false,
+      configured_always_on_top: true,
+      configured_max_fps: 60,
+      current_width_logical: observedSize[0],
+      current_height_logical: observedSize[1],
+      applied_resizable: false,
+      applied_always_on_top: true,
+      effective_max_fps: 60,
+      cli_max_fps_override: null,
+    },
   });
 }
 
@@ -104,7 +118,7 @@ describe("PocketUI camera menu snap regression", () => {
     await writeFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`);
     const persistedBefore = await readFile(settingsPath, "utf8");
     const runtimeSnaps = { ...settings.camera };
-    const incoming = [stateLine()];
+    const incoming = [stateLine(undefined, [720, 700])];
     const outgoing: unknown[] = [];
     const snapMutations: unknown[] = [];
     const textUpdates: string[] = [];
@@ -212,7 +226,7 @@ describe("PocketUI camera menu snap regression", () => {
 
       // From the focused Camera tab, walk the actual focus order to YawValue,
       // click it through the host hit-test bridge, then commit a precise edit.
-      for (let i = 0; i < 11; i++) {
+      for (let i = 0; i < 12; i++) {
         frame!(BTN_DOWN);
         frame!(0);
       }
@@ -339,6 +353,83 @@ describe("PocketUI camera menu snap regression", () => {
       frame!(0);
       expect(outgoing).toContainEqual({ t: "action", action: "set_headroom", value: 0.2 });
       expect(cameraState).toMatchObject({ headroom: 0.2, yaw: 0, pitch: 0, roll: 0, yawSnap: 12.5 });
+
+      // The third tab is present in the retained focus order and uses the
+      // same inline editor path for its logical-size fields.
+      for (let i = 0; i < 7; i++) {
+        frame!(BTN_UP);
+        frame!(0);
+      }
+      frame!(BTN_CIRCLE);
+      frame!(0);
+      expect(textUpdates).toContain("SIZE");
+      expect(textUpdates).toEqual(expect.arrayContaining(["Width", "720", "Height", "700"]));
+
+      for (let i = 0; i < 3; i++) {
+        frame!(BTN_DOWN);
+        frame!(0);
+      }
+      incoming.push(JSON.stringify({ t: "mouse", x: 170, y: 519, d: true }));
+      frame!(0);
+      incoming.push(JSON.stringify({ t: "mouse", x: 170, y: 519, d: false }));
+      frame!(0);
+      incoming.push(
+        JSON.stringify({
+          t: "input",
+          edits: [{ kind: "char", text: "720" }],
+          ime: [],
+          modifiers: { shift: false, control: false, alt: false, super: false },
+          cancelled: false,
+        }),
+      );
+      frame!(0);
+      incoming.push(
+        JSON.stringify({
+          t: "input",
+          edits: [{ kind: "key", key: "enter" }],
+          ime: [],
+          modifiers: { shift: false, control: false, alt: false, super: false },
+          cancelled: false,
+        }),
+      );
+      frame!(0);
+      expect(outgoing).toContainEqual({ t: "action", action: "set_window_width", value: 720 });
+
+      frame!(BTN_DOWN);
+      frame!(0);
+      incoming.push(JSON.stringify({ t: "mouse", x: 170, y: 539, d: true }));
+      frame!(0);
+      incoming.push(JSON.stringify({ t: "mouse", x: 170, y: 539, d: false }));
+      frame!(0);
+      expect(
+        outgoing.some(
+          (message) =>
+            typeof message === "object" &&
+            message !== null &&
+            "t" in message &&
+            message.t === "text-input-state" &&
+            "active" in message &&
+            message.active === true,
+        ),
+      ).toBe(true);
+      for (let i = 0; i < 4; i++) {
+        frame!(BTN_UP);
+        frame!(0);
+      }
+      frame!(BTN_CIRCLE);
+      frame!(0);
+      expect(
+        outgoing.some(
+          (message) =>
+            typeof message === "object" &&
+            message !== null &&
+            "t" in message &&
+            message.t === "text-input-state" &&
+            "active" in message &&
+            message.active === false,
+        ),
+      ).toBe(true);
+
       expect(await readFile(settingsPath, "utf8")).toBe(persistedBefore);
     } finally {
       delete global.frame;

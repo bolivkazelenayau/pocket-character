@@ -179,6 +179,11 @@ pub(crate) enum MenuAction {
     SetRollSnap(f32),
     SaveCamera,
     ResetRuntimeCamera,
+    SetWindowWidth(f32),
+    SetWindowHeight(f32),
+    SetWindowResizable(bool),
+    SetWindowAlwaysOnTop(bool),
+    SetMaxFps(f32),
     RequestMsaa(AntiAliasingPreference),
     RequestSmaa(bool),
 }
@@ -250,6 +255,31 @@ fn decode_menu_action(line: &str) -> Option<MenuAction> {
             .map(MenuAction::SetRollSnap),
         "save_camera" => Some(MenuAction::SaveCamera),
         "reset_runtime_camera" => Some(MenuAction::ResetRuntimeCamera),
+        "set_window_width" => wire
+            .value
+            .as_ref()
+            .and_then(finite_f32_value)
+            .map(MenuAction::SetWindowWidth),
+        "set_window_height" => wire
+            .value
+            .as_ref()
+            .and_then(finite_f32_value)
+            .map(MenuAction::SetWindowHeight),
+        "set_window_resizable" => wire
+            .value
+            .as_ref()
+            .and_then(|value| value.as_bool())
+            .map(MenuAction::SetWindowResizable),
+        "set_window_always_on_top" => wire
+            .value
+            .as_ref()
+            .and_then(|value| value.as_bool())
+            .map(MenuAction::SetWindowAlwaysOnTop),
+        "set_max_fps" => wire
+            .value
+            .as_ref()
+            .and_then(finite_f32_value)
+            .map(MenuAction::SetMaxFps),
         "request_msaa" => wire
             .value
             .as_ref()
@@ -300,6 +330,41 @@ struct MenuState {
     effective_smaa: bool,
     msaa_pending: bool,
     smaa_pending: bool,
+    window: MenuWindowState,
+}
+
+/// Host-authoritative persisted/runtime window facts rendered by the WINDOW
+/// page. Configured values are persisted preferences; current values are
+/// observed/runtime values and may differ while a request is pending or after
+/// a manual resize. The current logical size is derived from the native
+/// physical-size observation and scale factor. Applied window flags are the
+/// values Pocket3D last requested through winit, not platform confirmation. A
+/// CLI FPS override is present only while it still owns the process-local
+/// effective cap.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+pub(crate) struct MenuWindowState {
+    /// Persisted logical client-area width requested by the user.
+    pub(crate) configured_width: u32,
+    /// Persisted logical client-area height requested by the user.
+    pub(crate) configured_height: u32,
+    /// Persisted resizable preference sent to Pocket3D when it changes.
+    pub(crate) configured_resizable: bool,
+    /// Persisted always-on-top window hint sent to Pocket3D when it changes.
+    pub(crate) configured_always_on_top: bool,
+    /// Persisted pacing preference; a CLI override may supersede it at launch.
+    pub(crate) configured_max_fps: f32,
+    /// Logical width derived from the observed native physical size and scale.
+    pub(crate) current_width_logical: Option<u32>,
+    /// Logical height derived from the observed native physical size and scale.
+    pub(crate) current_height_logical: Option<u32>,
+    /// Last resizable value applied/requested by Pocket3D through winit.
+    pub(crate) applied_resizable: Option<bool>,
+    /// Last always-on-top value applied/requested by Pocket3D through winit.
+    pub(crate) applied_always_on_top: Option<bool>,
+    /// Effective pacing cap reported by Pocket3D's frame-pacing loop.
+    pub(crate) effective_max_fps: Option<f32>,
+    /// Active process-local CLI cap, while it still owns effective pacing.
+    pub(crate) cli_max_fps_override: Option<f32>,
 }
 
 pub struct MenuGuest {
@@ -382,6 +447,7 @@ impl MenuGuest {
         effective_smaa: bool,
         msaa_pending: bool,
         smaa_pending: bool,
+        window: MenuWindowState,
     ) -> Result<()> {
         let state = MenuState {
             t: "state",
@@ -402,6 +468,7 @@ impl MenuGuest {
             effective_smaa,
             msaa_pending,
             smaa_pending,
+            window,
         };
         let line = serde_json::to_string(&state).context("serialize menu state")?;
         self.surface.svc_push(line);
@@ -579,7 +646,7 @@ pub fn load_menu_assets(
 mod tests {
     use super::{
         MenuAction, MenuInputFrame, MenuInputModifiers, MenuState, MenuTextInputCapture,
-        decode_menu_action, decode_text_input_state, encode_input_frame,
+        MenuWindowState, decode_menu_action, decode_text_input_state, encode_input_frame,
     };
     use crate::settings::AntiAliasingPreference;
     use glam::Vec2;
@@ -606,6 +673,19 @@ mod tests {
             effective_smaa: false,
             msaa_pending: true,
             smaa_pending: false,
+            window: MenuWindowState {
+                configured_width: 450,
+                configured_height: 600,
+                configured_resizable: false,
+                configured_always_on_top: true,
+                configured_max_fps: 60.0,
+                current_width_logical: Some(450),
+                current_height_logical: Some(600),
+                applied_resizable: Some(false),
+                applied_always_on_top: Some(true),
+                effective_max_fps: Some(60.0),
+                cli_max_fps_override: None,
+            },
         })
         .unwrap();
 
@@ -634,6 +714,9 @@ mod tests {
         assert_eq!(value["effective_smaa"], false);
         assert_eq!(value["msaa_pending"], true);
         assert_eq!(value["smaa_pending"], false);
+        assert_eq!(value["window"]["configured_width"], 450);
+        assert_eq!(value["window"]["current_width_logical"], 450);
+        assert_eq!(value["window"]["applied_always_on_top"], true);
     }
 
     #[test]
@@ -700,6 +783,26 @@ mod tests {
                 MenuAction::ResetRuntimeCamera,
             ),
             (
+                r#"{"t":"action","action":"set_window_width","value":720}"#,
+                MenuAction::SetWindowWidth(720.0),
+            ),
+            (
+                r#"{"t":"action","action":"set_window_height","value":900}"#,
+                MenuAction::SetWindowHeight(900.0),
+            ),
+            (
+                r#"{"t":"action","action":"set_window_resizable","value":true}"#,
+                MenuAction::SetWindowResizable(true),
+            ),
+            (
+                r#"{"t":"action","action":"set_window_always_on_top","value":false}"#,
+                MenuAction::SetWindowAlwaysOnTop(false),
+            ),
+            (
+                r#"{"t":"action","action":"set_max_fps","value":120}"#,
+                MenuAction::SetMaxFps(120.0),
+            ),
+            (
                 r#"{"t":"action","action":"request_msaa","value":8}"#,
                 MenuAction::RequestMsaa(AntiAliasingPreference::X8),
             ),
@@ -733,6 +836,11 @@ mod tests {
             r#"{"t":"action","action":"set_yaw_snap","value":null}"#,
             r#"{"t":"action","action":"set_pitch_snap","value":"15"}"#,
             r#"{"t":"action","action":"set_roll_snap","value":1e309}"#,
+            r#"{"t":"action","action":"set_window_width"}"#,
+            r#"{"t":"action","action":"set_window_height","value":null}"#,
+            r#"{"t":"action","action":"set_window_resizable","value":1}"#,
+            r#"{"t":"action","action":"set_window_always_on_top","value":"yes"}"#,
+            r#"{"t":"action","action":"set_max_fps","value":1e309}"#,
             r#"{"t":"action","action":"request_msaa","value":3}"#,
             r#"{"t":"action","action":"request_smaa","value":"on"}"#,
         ] {

@@ -80,6 +80,7 @@ fn main() -> Result<()> {
             .map(PathBuf::from)
             .unwrap_or_else(|| root.join("dist/menu.pak")),
         size: SIZE,
+        cli_max_fps_override: None,
         frames: flag(&args, "--frames").and_then(|value| value.parse().ok()),
     };
 
@@ -105,6 +106,7 @@ fn main() -> Result<()> {
     let settings_path = AppSettings::path();
     let persisted_settings = AppSettings::load();
     let effective_settings = apply_cli_overrides(&persisted_settings, &args);
+    cfg.cli_max_fps_override = explicit_max_fps(&args).map(|_| effective_settings.max_fps);
     cfg.size = (
         persisted_settings.window.width,
         persisted_settings.window.height,

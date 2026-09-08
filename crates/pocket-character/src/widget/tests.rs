@@ -1,6 +1,6 @@
 use super::*;
 use crate::menu_guest::MenuAction;
-use crate::settings::{AntiAliasingPreference, AppSettings, RenderSettings};
+use crate::settings::{AntiAliasingPreference, AppSettings, RenderSettings, WindowSettings};
 use glam::{Vec2, Vec3};
 use pocket3d::app::{Game, WindowRuntimeRequest, WindowRuntimeState};
 use tempfile::tempdir;
@@ -17,6 +17,7 @@ fn test_config() -> WidgetConfig {
         menu_bundle_path: PathBuf::new(),
         menu_pak_path: PathBuf::new(),
         size: (450, 600),
+        cli_max_fps_override: None,
         frames: None,
     }
 }
@@ -67,7 +68,10 @@ fn guest_max_fps_is_a_live_request_and_not_a_persisted_setting() {
     widget.apply_commands(vec![Command::SetMaxFps(120.0)]);
 
     assert_eq!(widget.window_runtime_request().max_fps, Some(Some(120.0)));
-    assert_eq!(widget.settings.rendering.max_fps, persisted.rendering.max_fps);
+    assert_eq!(
+        widget.settings.rendering.max_fps,
+        persisted.rendering.max_fps
+    );
     assert_eq!(AppSettings::load_from_path(&path), AppSettings::default());
 
     let runtime_state = WindowRuntimeState {
@@ -79,6 +83,162 @@ fn guest_max_fps_is_a_live_request_and_not_a_persisted_setting() {
     };
     <Widget as Game>::window_runtime_state(&mut widget, runtime_state);
     assert_eq!(widget.observed_window_runtime_state(), Some(runtime_state));
+}
+
+#[test]
+fn window_settings_snapshot_uses_observed_size_and_actions_keep_configured_values_separate() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let persisted = AppSettings {
+        window: WindowSettings {
+            width: 500,
+            height: 700,
+            resizable: true,
+            always_on_top: false,
+        },
+        rendering: RenderSettings {
+            max_fps: 90.0,
+            ..RenderSettings::default()
+        },
+        ..AppSettings::default()
+    };
+    let mut widget =
+        Widget::new_with_settings_path(test_config(), persisted.clone(), Some(path.clone()));
+
+    let runtime_state = WindowRuntimeState {
+        inner_size_px: (1800, 1200),
+        scale_factor: 2.0,
+        resizable: true,
+        always_on_top: false,
+        max_fps: Some(90.0),
+    };
+    <Widget as Game>::window_runtime_state(&mut widget, runtime_state);
+    let snapshot = widget.menu_window_state();
+    assert_eq!(snapshot.configured_width, 500);
+    assert_eq!(snapshot.configured_height, 700);
+    assert_eq!(snapshot.current_width_logical, Some(900));
+    assert_eq!(snapshot.current_height_logical, Some(600));
+    assert_eq!(snapshot.applied_resizable, Some(true));
+    assert_eq!(snapshot.applied_always_on_top, Some(false));
+    assert_eq!(snapshot.effective_max_fps, Some(90.0));
+    assert_eq!(snapshot.cli_max_fps_override, None);
+
+    // A later manual resize updates the observed physical size without
+    // rewriting the configured logical request.
+    <Widget as Game>::window_runtime_state(
+        &mut widget,
+        WindowRuntimeState {
+            inner_size_px: (1400, 1000),
+            scale_factor: 2.0,
+            resizable: true,
+            always_on_top: false,
+            max_fps: Some(90.0),
+        },
+    );
+    let manually_resized = widget.menu_window_state();
+    assert_eq!(manually_resized.configured_width, 500);
+    assert_eq!(manually_resized.configured_height, 700);
+    assert_eq!(manually_resized.current_width_logical, Some(700));
+    assert_eq!(manually_resized.current_height_logical, Some(500));
+
+    widget.apply_control_action(ControlAction::SetWindowWidth(720.0));
+    assert_eq!(widget.settings.window.width, 720);
+    assert_eq!(widget.window_runtime_request().inner_size, Some((720, 500)));
+
+    // The runtime reports the accepted width before the next explicit edit,
+    // so the following height request preserves that observed width.
+    <Widget as Game>::window_runtime_state(
+        &mut widget,
+        WindowRuntimeState {
+            inner_size_px: (1440, 1000),
+            scale_factor: 2.0,
+            resizable: true,
+            always_on_top: false,
+            max_fps: Some(90.0),
+        },
+    );
+    widget.apply_control_action(ControlAction::SetWindowHeight(800.0));
+    assert_eq!(widget.settings.window.height, 800);
+    assert_eq!(widget.window_runtime_request().inner_size, Some((720, 800)));
+    widget.apply_control_action(ControlAction::SetWindowResizable(false));
+    widget.apply_control_action(ControlAction::SetWindowAlwaysOnTop(true));
+    assert_eq!(widget.window_runtime_request().resizable, Some(false));
+    assert_eq!(widget.window_runtime_request().always_on_top, Some(true));
+    widget.apply_control_action(ControlAction::SetMaxFps(120.0));
+    assert_eq!(widget.window_runtime_request().max_fps, Some(Some(120.0)));
+
+    let saved = AppSettings::load_from_path(&path);
+    assert_eq!(saved.window.width, 720);
+    assert_eq!(saved.window.height, 800);
+    assert!(!saved.window.resizable);
+    assert!(saved.window.always_on_top);
+    assert_eq!(saved.rendering.max_fps, 120.0);
+
+    // Observe the accepted pair before testing Rust's dimension
+    // sanitization, so each request still uses the current counterpart.
+    <Widget as Game>::window_runtime_state(
+        &mut widget,
+        WindowRuntimeState {
+            inner_size_px: (1440, 1600),
+            scale_factor: 2.0,
+            resizable: false,
+            always_on_top: true,
+            max_fps: Some(120.0),
+        },
+    );
+    widget.apply_control_action(ControlAction::SetWindowWidth(1.0));
+    assert_eq!(
+        widget.window_runtime_request().inner_size,
+        Some((160, 800)),
+        "width requests use the accepted width and observed height"
+    );
+    <Widget as Game>::window_runtime_state(
+        &mut widget,
+        WindowRuntimeState {
+            inner_size_px: (320, 1600),
+            scale_factor: 2.0,
+            resizable: false,
+            always_on_top: true,
+            max_fps: Some(120.0),
+        },
+    );
+    widget.apply_control_action(ControlAction::SetWindowHeight(99999.0));
+    widget.apply_control_action(ControlAction::SetMaxFps(0.0));
+    assert_eq!(widget.settings.window.width, 160);
+    assert_eq!(widget.settings.window.height, 4320);
+    assert_eq!(widget.settings.rendering.max_fps, 1.0);
+    assert_eq!(
+        widget.window_runtime_request().inner_size,
+        Some((160, 4320)),
+        "height requests use the observed width and accepted height"
+    );
+}
+
+#[test]
+fn cli_max_fps_override_is_visible_until_a_window_edit_supersedes_it() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let mut config = test_config();
+    config.cli_max_fps_override = Some(120.0);
+    let mut widget =
+        Widget::new_with_settings_path(config, AppSettings::default(), Some(path.clone()));
+    <Widget as Game>::window_runtime_state(
+        &mut widget,
+        WindowRuntimeState {
+            inner_size_px: (450, 600),
+            scale_factor: 1.0,
+            resizable: false,
+            always_on_top: true,
+            max_fps: Some(120.0),
+        },
+    );
+    assert_eq!(widget.menu_window_state().cli_max_fps_override, Some(120.0));
+
+    widget.apply_control_action(ControlAction::SetMaxFps(90.0));
+    assert_eq!(widget.settings.rendering.max_fps, 90.0);
+    assert_eq!(widget.window_runtime_request().max_fps, Some(Some(90.0)));
+    assert_eq!(widget.menu_window_state().cli_max_fps_override, None);
+    assert_eq!(AppSettings::load_from_path(&path).rendering.max_fps, 90.0);
 }
 
 fn canonical_test_aabb() -> (Vec3, Vec3) {

@@ -28,6 +28,7 @@ use pocket3d::winit::keyboard::KeyCode;
 use crate::guest::{CharacterGuest, Command, TickEvent, TickState};
 use crate::menu_guest::{
     MenuAction, MenuGuest, MenuInputFrame, MenuInputModifiers, MenuTextInputCapture,
+    MenuWindowState,
 };
 use crate::settings::{AntiAliasingPreference, AppSettings, CameraSettings};
 
@@ -56,6 +57,9 @@ pub struct WidgetConfig {
     /// Generated PocketUI menu pak (`dist/menu.pak`).
     pub menu_pak_path: PathBuf,
     pub size: (u32, u32),
+    /// Launch-effective CLI FPS override, if `--max-fps` was explicitly set.
+    /// This is process-local and must never be persisted through AppSettings.
+    pub cli_max_fps_override: Option<f32>,
     /// Render N frames then exit (verification runs).
     pub frames: Option<u32>,
 }
@@ -105,6 +109,14 @@ fn logical_viewport_for(physical_size: (u32, u32), scale_factor: f64) -> (f32, f
         ((physical_size.0 as f64 / scale_factor).round().max(1.0)) as f32,
         ((physical_size.1 as f64 / scale_factor).round().max(1.0)) as f32,
     )
+}
+
+fn sanitized_window_dimension(value: f32, current: u32) -> u32 {
+    if value.is_finite() {
+        value.max(0.0).round() as u32
+    } else {
+        current
+    }
 }
 
 fn native_drag_allowed_for_menu_pointer(menu_pointer_owned: bool) -> bool {
@@ -214,6 +226,8 @@ pub struct Widget {
     window_scale_factor: f64,
     window_runtime_state: Option<WindowRuntimeState>,
     window_runtime_request: WindowRuntimeRequest,
+    cli_max_fps_override: Option<f32>,
+    cli_max_fps_active: bool,
     settings: AppSettings,
     settings_path: Option<PathBuf>,
     #[cfg(test)]
@@ -286,6 +300,7 @@ impl Widget {
         // settings. `CameraControls` holds runtime/session adjustments.
         // `reapply_camera()` is the common application path.
         let settings = settings.sanitized();
+        let cli_max_fps_override = cfg.cli_max_fps_override;
         // Seed fixed for reproducible measurement runs; behavior parity is
         // distributional, not per-run.
         let sim = CharacterSim::new(0x0c9a_11e0, Vec3::ZERO);
@@ -315,6 +330,8 @@ impl Widget {
             window_scale_factor: DEFAULT_WINDOW_SCALE_FACTOR,
             window_runtime_state: None,
             window_runtime_request: WindowRuntimeRequest::default(),
+            cli_max_fps_override,
+            cli_max_fps_active: cli_max_fps_override.is_some(),
             settings,
             settings_path,
             #[cfg(test)]
@@ -592,12 +609,17 @@ impl Widget {
             MenuAction::ResetRuntimeCamera => ControlAction::ResetRuntimeCamera,
             MenuAction::RequestMsaa(preference) => ControlAction::RequestMsaa(preference),
             MenuAction::RequestSmaa(enabled) => ControlAction::RequestSmaa(enabled),
+            MenuAction::SetWindowWidth(value) => ControlAction::SetWindowWidth(value),
+            MenuAction::SetWindowHeight(value) => ControlAction::SetWindowHeight(value),
+            MenuAction::SetWindowResizable(value) => ControlAction::SetWindowResizable(value),
+            MenuAction::SetWindowAlwaysOnTop(value) => ControlAction::SetWindowAlwaysOnTop(value),
+            MenuAction::SetMaxFps(value) => ControlAction::SetMaxFps(value),
         }
     }
 
     /// Set process-local native window/pacing changes for Pocket3D to apply.
-    /// This deliberately does not touch `AppSettings`; the future WINDOW page
-    /// can persist its preference separately and use this as its live request.
+    /// This deliberately does not touch `AppSettings`; the WINDOW page
+    /// persists its preference separately and uses this as its live request.
     #[allow(dead_code)]
     pub fn set_window_runtime_request(&mut self, request: WindowRuntimeRequest) {
         self.window_runtime_request = request;
@@ -738,6 +760,71 @@ impl Widget {
             ControlAction::RequestSmaa(enabled) => {
                 self.aa.request_smaa(enabled);
             }
+            ControlAction::SetWindowWidth(value) => {
+                let mut candidate = self.settings.window.clone();
+                candidate.width = sanitized_window_dimension(value, candidate.width);
+                let sanitized = candidate.sanitized();
+                if sanitized != self.settings.window {
+                    self.settings.window = sanitized;
+                    self.persist_settings();
+                }
+                let observed_height = self
+                    .observed_window_logical_size()
+                    .map(|(_, height)| height)
+                    .unwrap_or(self.settings.window.height);
+                self.window_runtime_request.inner_size =
+                    Some((self.settings.window.width, observed_height));
+            }
+            ControlAction::SetWindowHeight(value) => {
+                let mut candidate = self.settings.window.clone();
+                candidate.height = sanitized_window_dimension(value, candidate.height);
+                let sanitized = candidate.sanitized();
+                if sanitized != self.settings.window {
+                    self.settings.window = sanitized;
+                    self.persist_settings();
+                }
+                let observed_width = self
+                    .observed_window_logical_size()
+                    .map(|(width, _)| width)
+                    .unwrap_or(self.settings.window.width);
+                self.window_runtime_request.inner_size =
+                    Some((observed_width, self.settings.window.height));
+            }
+            ControlAction::SetWindowResizable(value) => {
+                let mut candidate = self.settings.window.clone();
+                candidate.resizable = value;
+                let sanitized = candidate.sanitized();
+                if sanitized != self.settings.window {
+                    self.settings.window = sanitized;
+                    self.persist_settings();
+                }
+                self.window_runtime_request.resizable = Some(self.settings.window.resizable);
+            }
+            ControlAction::SetWindowAlwaysOnTop(value) => {
+                let mut candidate = self.settings.window.clone();
+                candidate.always_on_top = value;
+                let sanitized = candidate.sanitized();
+                if sanitized != self.settings.window {
+                    self.settings.window = sanitized;
+                    self.persist_settings();
+                }
+                self.window_runtime_request.always_on_top =
+                    Some(self.settings.window.always_on_top);
+            }
+            ControlAction::SetMaxFps(value) => {
+                let mut candidate = self.settings.rendering.clone();
+                candidate.max_fps = value;
+                let sanitized = candidate.sanitized();
+                if sanitized != self.settings.rendering {
+                    self.settings.rendering = sanitized;
+                    self.persist_settings();
+                }
+                self.window_runtime_request.max_fps = Some(Some(self.settings.rendering.max_fps));
+                // A valid WINDOW edit takes ownership of the current process's
+                // pacing request. It does not alter future launches, where an
+                // explicit --max-fps still wins during startup.
+                self.cli_max_fps_active = false;
+            }
         }
         self.controls_snapshot()
     }
@@ -768,6 +855,39 @@ impl Widget {
             pending.msaa.is_some(),
             pending.smaa.is_some(),
         )
+    }
+
+    fn observed_window_logical_size(&self) -> Option<(u32, u32)> {
+        self.window_runtime_state.and_then(|state| {
+            (state.inner_size_px.0 != 0 && state.inner_size_px.1 != 0).then(|| {
+                let (width, height) = logical_viewport_for(state.inner_size_px, state.scale_factor);
+                (width as u32, height as u32)
+            })
+        })
+    }
+
+    fn menu_window_state(&self) -> MenuWindowState {
+        let observed = self.observed_window_logical_size();
+        let cli_max_fps_override = self.cli_max_fps_override.filter(|override_fps| {
+            self.cli_max_fps_active
+                && self
+                    .window_runtime_state
+                    .is_some_and(|state| state.max_fps == Some(*override_fps))
+        });
+
+        MenuWindowState {
+            configured_width: self.settings.window.width,
+            configured_height: self.settings.window.height,
+            configured_resizable: self.settings.window.resizable,
+            configured_always_on_top: self.settings.window.always_on_top,
+            configured_max_fps: self.settings.rendering.max_fps,
+            current_width_logical: observed.map(|(width, _)| width),
+            current_height_logical: observed.map(|(_, height)| height),
+            applied_resizable: self.window_runtime_state.map(|state| state.resizable),
+            applied_always_on_top: self.window_runtime_state.map(|state| state.always_on_top),
+            effective_max_fps: self.window_runtime_state.and_then(|state| state.max_fps),
+            cli_max_fps_override,
+        }
     }
 
     fn persist_settings(&mut self) {
@@ -826,6 +946,7 @@ impl Widget {
                     // process-local desired value and is never persisted.
                     if fps.is_finite() {
                         self.window_runtime_request.max_fps = Some(Some(fps));
+                        self.cli_max_fps_active = false;
                     } else {
                         log::warn!("character.setMaxFps: ignoring non-finite value");
                     }
@@ -1155,6 +1276,7 @@ impl Game for Widget {
         // for the next tick. This is one fixed-tick reconciliation delay.
         if self.menu_health.is_healthy() {
             let snapshot = self.controls_snapshot();
+            let window_snapshot = self.menu_window_state();
             let scale_factor = self.window_scale_factor;
             let pointer_frames = std::mem::take(&mut self.pending_menu_pointer);
             let input_frames = self.take_pending_menu_input();
@@ -1180,6 +1302,7 @@ impl Game for Widget {
                             snapshot.effective_smaa(),
                             snapshot.msaa_pending(),
                             snapshot.smaa_pending(),
+                            window_snapshot,
                         )?;
                         for pointer_frame in pointer_frames {
                             if pointer_frame.cancelled {

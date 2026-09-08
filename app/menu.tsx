@@ -52,6 +52,21 @@ interface ControlsState {
   effective_smaa: boolean;
   msaa_pending: boolean;
   smaa_pending: boolean;
+  window: WindowControlsState;
+}
+
+interface WindowControlsState {
+  configured_width: number;
+  configured_height: number;
+  configured_resizable: boolean;
+  configured_always_on_top: boolean;
+  configured_max_fps: number;
+  current_width_logical: number | null;
+  current_height_logical: number | null;
+  applied_resizable: boolean | null;
+  applied_always_on_top: boolean | null;
+  effective_max_fps: number | null;
+  cli_max_fps_override: number | null;
 }
 
 type ActionName =
@@ -69,11 +84,16 @@ type ActionName =
   | "set_pitch_snap"
   | "set_roll_snap"
   | "save_camera"
-  | "reset_runtime_camera";
+  | "reset_runtime_camera"
+  | "set_window_width"
+  | "set_window_height"
+  | "set_window_resizable"
+  | "set_window_always_on_top"
+  | "set_max_fps";
 
 // Latest host facts, or null before the first svc line arrives.
 const [controls, setControls] = createSignal<ControlsState | null>(null);
-type SettingsPage = "camera" | "graphics";
+type SettingsPage = "camera" | "graphics" | "window";
 // Ephemeral presentation state only; it is never serialized or sent to Rust.
 const [activePage, setActivePage] = createSignal<SettingsPage>("camera");
 const CAMERA_VALUE_X = 152;
@@ -95,7 +115,7 @@ let pressedTarget: ReturnType<typeof hitFocusable> = null;
 type PointerTarget = NonNullable<ReturnType<typeof hitFocusable>>;
 const pointerRepeat = new PointerRepeat<PointerTarget>();
 
-function sendAction(action: ActionName, value?: number): boolean {
+function sendAction(action: ActionName, value?: number | boolean): boolean {
   const ops = getOps();
   if (!ops.svcOpen || !ops.svcSend || !ops.svcOpen("controls")) return false;
   ops.svcSend(JSON.stringify({ t: "action", action, ...(value === undefined ? {} : { value }) }));
@@ -145,6 +165,47 @@ function switchPage(page: SettingsPage): void {
   // panel is replaced.
   cancelInlineNumberFields();
   setActivePage(page);
+}
+
+function decodeWindowState(value: unknown): WindowControlsState | null {
+  if (typeof value !== "object" || value === null) return null;
+  const candidate = value as Record<string, unknown>;
+  const isSafeNonNegativeInteger = (entry: unknown): entry is number =>
+    typeof entry === "number" && Number.isSafeInteger(entry) && entry >= 0;
+  const isFiniteNumber = (entry: unknown): entry is number =>
+    typeof entry === "number" && Number.isFinite(entry);
+  const isFiniteNumberOrNull = (entry: unknown): entry is number | null =>
+    entry === null || (typeof entry === "number" && Number.isFinite(entry));
+
+  if (
+    !isSafeNonNegativeInteger(candidate.configured_width) ||
+    !isSafeNonNegativeInteger(candidate.configured_height) ||
+    typeof candidate.configured_resizable !== "boolean" ||
+    typeof candidate.configured_always_on_top !== "boolean" ||
+    !isFiniteNumber(candidate.configured_max_fps) ||
+    !isFiniteNumberOrNull(candidate.current_width_logical) ||
+    !isFiniteNumberOrNull(candidate.current_height_logical) ||
+    (candidate.applied_resizable !== null && typeof candidate.applied_resizable !== "boolean") ||
+    (candidate.applied_always_on_top !== null && typeof candidate.applied_always_on_top !== "boolean") ||
+    !isFiniteNumberOrNull(candidate.effective_max_fps) ||
+    !isFiniteNumberOrNull(candidate.cli_max_fps_override)
+  ) {
+    return null;
+  }
+
+  return {
+    configured_width: candidate.configured_width,
+    configured_height: candidate.configured_height,
+    configured_resizable: candidate.configured_resizable,
+    configured_always_on_top: candidate.configured_always_on_top,
+    configured_max_fps: candidate.configured_max_fps,
+    current_width_logical: candidate.current_width_logical,
+    current_height_logical: candidate.current_height_logical,
+    applied_resizable: candidate.applied_resizable,
+    applied_always_on_top: candidate.applied_always_on_top,
+    effective_max_fps: candidate.effective_max_fps,
+    cli_max_fps_override: candidate.cli_max_fps_override,
+  };
 }
 
 function handleMouse(x: number, y: number, down: boolean): void {
@@ -204,12 +265,15 @@ function pollControls(): void {
           effective_smaa?: unknown;
           msaa_pending?: unknown;
           smaa_pending?: unknown;
+          window?: unknown;
           x?: unknown;
           y?: unknown;
           d?: unknown;
         };
         if (msg.t === "state") {
+          const window = decodeWindowState(msg.window);
           if (
+            !window ||
             typeof msg.effective_fov_deg !== "number" ||
             typeof msg.effective_distance_scale !== "number" ||
             typeof msg.headroom !== "number" ||
@@ -255,6 +319,7 @@ function pollControls(): void {
             effective_smaa: msg.effective_smaa,
             msaa_pending: msg.msaa_pending,
             smaa_pending: msg.smaa_pending,
+            window,
           });
         } else if (
           msg.t === "mouse" &&
@@ -375,6 +440,31 @@ function CameraNumberRow(props: {
   );
 }
 
+function WindowNumberRow(props: {
+  label: string;
+  value: () => number | null;
+  format: (value: number) => string;
+  commitAction: "set_window_width" | "set_window_height" | "set_max_fps";
+  captureY: number;
+  debugName: string;
+}) {
+  return (
+    <View debugName={`${props.debugName}Row`} class="h-[18] flex-row items-center">
+      <Text class="min-w-[48] flex-1 text-xs text-[#9fb3c8]">{props.label}</Text>
+      <InlineNumberField
+        id={`${props.debugName}Value`}
+        debugName={`${props.debugName}Value`}
+        value={props.value}
+        format={props.format}
+        editFormat={(value) => value.toString()}
+        onCommit={(value) => sendAction(props.commitAction, value)}
+        captureArea={(caret, draft) => inlineNumberCaptureArea(props.captureY, caret, draft)}
+        caretFromPointer={inlineNumberCaretFromPointer}
+      />
+    </View>
+  );
+}
+
 function msaaStatusText(state: ControlsState | null): string {
   if (!state) return "Waiting for host";
   return formatMsaaStatus(state.requested_msaa, state.effective_msaa, state.msaa_pending);
@@ -406,6 +496,27 @@ function SelectorOption(props: {
   );
 }
 
+function ToggleOption(props: {
+  debugName: string;
+  label: string;
+  selected: boolean;
+  onPress: () => void;
+}) {
+  return (
+    <Focusable
+      debugName={props.debugName}
+      class={
+        props.selected
+          ? "h-[18] w-[28] flex-col items-center justify-center rounded-sm bg-[#2b5167]"
+          : "h-[18] w-[28] flex-col items-center justify-center rounded-sm bg-[#172b3b] focus:bg-[#2b5167] active:bg-[#3a6f88]"
+      }
+      onPress={props.onPress}
+    >
+      <Text class="text-xs text-[#e8f1f8]">{props.label}</Text>
+    </Focusable>
+  );
+}
+
 function PageTabs() {
   const tabClass = (page: SettingsPage): string =>
     activePage() === page
@@ -420,6 +531,9 @@ function PageTabs() {
       <Focusable debugName="GraphicsTab" class={tabClass("graphics")} onPress={() => switchPage("graphics")}>
         <Text class="text-sm text-[#e8f1f8]">GRAPHICS</Text>
       </Focusable>
+      <Focusable debugName="WindowTab" class={tabClass("window")} onPress={() => switchPage("window")}>
+        <Text class="text-sm text-[#e8f1f8]">WINDOW</Text>
+      </Focusable>
     </View>
   );
 }
@@ -429,7 +543,7 @@ function SettingsFrame(props: { panelClass: string; children: JSX.Element }) {
     <View debugName="SettingsFrame" class={props.panelClass}>
       <PageTabs />
       <View class="relative top-[2] mt-[4] h-[1] w-full bg-[#33c6ff4d]" />
-      {props.children}
+      <View class="w-[184] flex-col">{props.children}</View>
     </View>
   );
 }
@@ -437,7 +551,7 @@ function SettingsFrame(props: { panelClass: string; children: JSX.Element }) {
 function GraphicsPanel() {
   const state = () => controls();
   return (
-    <SettingsFrame panelClass="w-[216] flex-col rounded-md bg-[#0b1420e8] p-[16]">
+    <SettingsFrame panelClass="w-[246] flex-col rounded-md bg-[#0b1420e8] p-[16]">
       <View class="mt-[6] flex-col">
         <View class="h-[18] flex-row items-center">
           <Text class="text-xs font-bold text-[#7fd0ff]">MSAA</Text>
@@ -519,7 +633,7 @@ function CameraPanel() {
   // slot offsets the taller tabs, preserving camera field, button, and native
   // capture geometry.
   return (
-    <SettingsFrame panelClass="w-[216] flex-col rounded-md bg-[#0b1420b4] p-[16]">
+    <SettingsFrame panelClass="w-[246] flex-col rounded-md bg-[#0b1420b4] p-[16]">
       <View class="mt-[6] h-[16] flex-row items-center">
         <Text class="text-xs font-bold text-[#7fd0ff]">FRAMING</Text>
       </View>
@@ -625,13 +739,141 @@ function CameraPanel() {
   );
 }
 
+function appliedToggleStatus(
+  configured: boolean | undefined,
+  applied: boolean | null | undefined,
+): string {
+  if (configured === undefined || applied === undefined || applied === null || configured === applied) {
+    return "";
+  }
+  return `Pocket3D applied ${applied ? "On" : "Off"}`;
+}
+
+function maxFpsStatus(state: WindowControlsState | null): string {
+  if (!state) return "Waiting for host";
+  if (state.cli_max_fps_override !== null) {
+    return `CLI override ${formatCompactDecimal(state.cli_max_fps_override)} FPS`;
+  }
+  if (
+    state.effective_max_fps !== null &&
+    state.effective_max_fps !== state.configured_max_fps
+  ) {
+    return `Running ${formatCompactDecimal(state.effective_max_fps)} FPS`;
+  }
+  return "";
+}
+
+function WindowToggleRow(props: {
+  label: string;
+  value: () => boolean | undefined;
+  applied: () => boolean | null | undefined;
+  action: "set_window_resizable" | "set_window_always_on_top";
+  debugName: string;
+}) {
+  const value = () => props.value() ?? false;
+  return (
+    <>
+      <View debugName={`${props.debugName}Row`} class="h-[18] flex-row items-center">
+        <Text class="min-w-[48] flex-1 text-xs text-[#9fb3c8]">{props.label}</Text>
+        <View class="shrink-0 flex-row gap-[2]">
+          <ToggleOption
+            debugName={`${props.debugName}Off`}
+            label="Off"
+            selected={!value()}
+            onPress={() => sendAction(props.action, false)}
+          />
+          <ToggleOption
+            debugName={`${props.debugName}On`}
+            label="On"
+            selected={value()}
+            onPress={() => sendAction(props.action, true)}
+          />
+        </View>
+      </View>
+      {appliedToggleStatus(props.value(), props.applied()) ? (
+        <View class="flex-row items-center">
+          <View class="w-[60] shrink-0" />
+          <View class="w-[6] shrink-0" />
+          <Text class="text-xs text-[#9fb3c8]">{appliedToggleStatus(props.value(), props.applied())}</Text>
+        </View>
+      ) : null}
+    </>
+  );
+}
+
+function WindowPanel() {
+  const state = () => controls()?.window ?? null;
+  return (
+    <SettingsFrame panelClass="w-[246] flex-col rounded-md bg-[#0b1420e8] p-[16]">
+      <View class="mt-[6] h-[16] flex-row items-center">
+        <Text class="text-xs font-bold text-[#7fd0ff]">SIZE</Text>
+      </View>
+      <View class="mt-[0] flex-col gap-[2]">
+        <WindowNumberRow
+          label="Width"
+          value={() => state()?.current_width_logical ?? null}
+          format={(value) => Math.round(value).toString()}
+          commitAction="set_window_width"
+          captureY={CAMERA_DISTANCE_VALUE_Y}
+          debugName="WindowWidth"
+        />
+        <WindowNumberRow
+          label="Height"
+          value={() => state()?.current_height_logical ?? null}
+          format={(value) => Math.round(value).toString()}
+          commitAction="set_window_height"
+          captureY={CAMERA_FOV_VALUE_Y}
+          debugName="WindowHeight"
+        />
+      </View>
+      <View class="mt-[8] h-[16] flex-row items-center">
+        <Text class="text-xs font-bold text-[#7fd0ff]">BEHAVIOR</Text>
+      </View>
+      <View class="mt-[0] flex-col gap-[2]">
+        <WindowToggleRow
+          label="Resizable"
+          value={() => state()?.configured_resizable}
+          applied={() => state()?.applied_resizable}
+          action="set_window_resizable"
+          debugName="Resizable"
+        />
+        <WindowToggleRow
+          label="Always on top"
+          value={() => state()?.configured_always_on_top}
+          applied={() => state()?.applied_always_on_top}
+          action="set_window_always_on_top"
+          debugName="AlwaysOnTop"
+        />
+      </View>
+      <View class="mt-[8] h-[16] flex-row items-center">
+        <Text class="text-xs font-bold text-[#7fd0ff]">FRAME LIMIT</Text>
+      </View>
+      <WindowNumberRow
+        label="Max FPS"
+        value={() => state()?.configured_max_fps ?? null}
+        format={formatCompactDecimal}
+        commitAction="set_max_fps"
+        captureY={CAMERA_ROLL_VALUE_Y}
+        debugName="MaxFps"
+      />
+      {maxFpsStatus(state()) ? (
+        <View class="flex-row items-center">
+          <View class="w-[60] shrink-0" />
+          <View class="w-[6] shrink-0" />
+          <Text class="text-xs text-[#9fb3c8]">{maxFpsStatus(state())}</Text>
+        </View>
+      ) : null}
+    </SettingsFrame>
+  );
+}
+
 export default function ControlsMenu() {
   onFrame(pollControls);
   // Display formatting only. Rust computes the next value and applies all
   // safety/persistence semantics after receiving the semantic action.
   return (
     <View debugName="ControlsMenu" class="absolute left-[14] top-[456]">
-      {activePage() === "camera" ? <CameraPanel /> : <GraphicsPanel />}
+      {activePage() === "camera" ? <CameraPanel /> : activePage() === "graphics" ? <GraphicsPanel /> : <WindowPanel />}
     </View>
   );
 }

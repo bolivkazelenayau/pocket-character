@@ -23,6 +23,8 @@ use crate::settings::AntiAliasingPreference;
 /// base framing with zero runtime pan/yaw/pitch/roll without overwriting
 /// persisted camera or rendering settings. The same semantic reset is used by
 /// the keyboard `R` shortcut and the PocketUI Reset Camera action.
+/// Window actions update persisted `AppSettings` through Rust sanitization and
+/// queue the corresponding live `WindowRuntimeRequest` for Pocket3D.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum ControlAction {
     AdjustDistance(i8),
@@ -43,6 +45,11 @@ pub(crate) enum ControlAction {
         pitch_deg: f32,
         roll_deg: f32,
     },
+    SetWindowWidth(f32),
+    SetWindowHeight(f32),
+    SetWindowResizable(bool),
+    SetWindowAlwaysOnTop(bool),
+    SetMaxFps(f32),
     RequestMsaa(AntiAliasingPreference),
     RequestSmaa(bool),
 }
