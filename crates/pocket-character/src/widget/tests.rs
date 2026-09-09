@@ -26,6 +26,26 @@ fn approx_eq(actual: f32, expected: f32) {
     assert!((actual - expected).abs() < 1.0e-5, "{actual} != {expected}");
 }
 
+fn observe_window_size(widget: &mut Widget, logical_size: (u32, u32), scale_factor: f64) {
+    let physical_size = (
+        (logical_size.0 as f64 * scale_factor).round() as u32,
+        (logical_size.1 as f64 * scale_factor).round() as u32,
+    );
+    let resizable = widget.settings.window.resizable;
+    let always_on_top = widget.settings.window.always_on_top;
+    let max_fps = widget.settings.rendering.max_fps;
+    <Widget as Game>::window_runtime_state(
+        widget,
+        WindowRuntimeState {
+            inner_size_px: physical_size,
+            scale_factor,
+            resizable,
+            always_on_top,
+            max_fps: Some(max_fps),
+        },
+    );
+}
+
 #[test]
 fn cli_max_fps_override_does_not_leak_into_camera_save() {
     let persisted = AppSettings {
@@ -83,6 +103,218 @@ fn guest_max_fps_is_a_live_request_and_not_a_persisted_setting() {
     };
     <Widget as Game>::window_runtime_state(&mut widget, runtime_state);
     assert_eq!(widget.observed_window_runtime_state(), Some(runtime_state));
+}
+
+#[test]
+fn minimum_window_settings_presentation_is_reachable_without_persisting_expansion() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let persisted = AppSettings {
+        window: WindowSettings {
+            width: 160,
+            height: 160,
+            resizable: false,
+            ..WindowSettings::default()
+        },
+        ..AppSettings::default()
+    };
+    persisted.save_to_path(&path).unwrap();
+
+    let mut config = test_config();
+    config.size = (160, 160);
+    let mut widget = Widget::new_with_settings_path(config, persisted.clone(), Some(path.clone()));
+    observe_window_size(&mut widget, (160, 160), 1.0);
+
+    widget.apply_menu_action(MenuAction::SettingsOpened);
+
+    assert!(widget.settings_visible);
+    assert_eq!(
+        widget.window_runtime_request().inner_size,
+        Some((450, 600)),
+        "the live Settings presentation expands both deficient dimensions"
+    );
+    assert_eq!(widget.window_runtime_request().resizable, None);
+    assert_eq!(AppSettings::load_from_path(&path), persisted);
+
+    // Observing the temporary size and performing an unrelated settings save
+    // must not serialize the accommodation as configured Width/Height.
+    observe_window_size(&mut widget, (450, 600), 1.0);
+    let accommodated = widget.menu_window_state();
+    assert_eq!(accommodated.configured_width, 160);
+    assert_eq!(accommodated.configured_height, 160);
+    assert_eq!(accommodated.current_width_logical, Some(450));
+    assert_eq!(accommodated.current_height_logical, Some(600));
+    observe_window_size(&mut widget, (200, 200), 1.0);
+    assert_eq!(widget.window_runtime_request().inner_size, Some((450, 600)));
+    observe_window_size(&mut widget, (450, 600), 1.0);
+    widget.apply_menu_action(MenuAction::SetWindowAlwaysOnTop(false));
+    let after_unrelated_save = AppSettings::load_from_path(&path);
+    assert_eq!(after_unrelated_save.window.width, 160);
+    assert_eq!(after_unrelated_save.window.height, 160);
+
+    // An explicit small Width remains the durable preference, but the live
+    // request remains constrained for as long as Settings is visible.
+    widget.apply_menu_action(MenuAction::SetWindowWidth(160.0));
+    assert!(widget.settings_visible);
+    assert_eq!(widget.settings.window.width, 160);
+    assert_eq!(widget.settings.window.height, 160);
+    assert_eq!(widget.window_runtime_request().inner_size, Some((450, 600)));
+    assert_eq!(AppSettings::load_from_path(&path).window.width, 160);
+
+    widget.apply_menu_action(MenuAction::SettingsClosed);
+    assert!(!widget.settings_visible);
+    assert_eq!(widget.window_runtime_request().inner_size, Some((160, 160)));
+    let configured = AppSettings::load_from_path(&path);
+    assert_eq!(configured.window.width, 160);
+    assert_eq!(configured.window.height, 160);
+    assert!(!configured.window.resizable);
+
+    observe_window_size(&mut widget, (160, 160), 1.0);
+    widget.apply_menu_action(MenuAction::SettingsOpened);
+    assert!(widget.settings_visible);
+    assert_eq!(widget.window_runtime_request().inner_size, Some((450, 600)));
+}
+
+#[test]
+fn delayed_accommodation_observation_does_not_resolve_close_request() {
+    let mut widget = test_widget();
+    widget.settings.window.width = 160;
+    widget.settings.window.height = 160;
+    widget.settings.window.resizable = false;
+    observe_window_size(&mut widget, (160, 160), 1.0);
+
+    widget.apply_menu_action(MenuAction::SettingsOpened);
+    assert_eq!(widget.window_runtime_request().inner_size, Some((450, 600)));
+
+    // Close can supersede the accommodation before Windows reports that the
+    // first asynchronous resize was accepted.
+    widget.apply_menu_action(MenuAction::SettingsClosed);
+    assert_eq!(widget.window_runtime_request().inner_size, Some((160, 160)));
+
+    // The delayed accommodation observation belongs to the superseded
+    // request, not the close-time configured-size request.
+    observe_window_size(&mut widget, (450, 600), 1.0);
+    assert_eq!(widget.window_runtime_request().inner_size, Some((160, 160)));
+    assert_eq!(
+        widget
+            .pending_window_size_request
+            .as_ref()
+            .map(|pending| pending.requested_logical_size),
+        Some((160, 160))
+    );
+
+    observe_window_size(&mut widget, (160, 160), 1.0);
+    assert!(widget.pending_window_size_request.is_none());
+}
+
+#[test]
+fn consecutive_dimension_edits_before_observation_preserve_both_user_values() {
+    let mut widget = test_widget();
+    observe_window_size(&mut widget, (500, 500), 1.0);
+
+    widget.apply_menu_action(MenuAction::SetWindowWidth(720.0));
+    assert_eq!(widget.window_runtime_request().inner_size, Some((720, 500)));
+    widget.apply_menu_action(MenuAction::SetWindowHeight(700.0));
+
+    assert_eq!(widget.window_runtime_request().inner_size, Some((720, 700)));
+    assert_eq!(widget.settings.window.width, 720);
+    assert_eq!(widget.settings.window.height, 700);
+}
+
+#[test]
+fn superseded_size_observation_does_not_resolve_the_newer_combined_request() {
+    let mut widget = test_widget();
+    observe_window_size(&mut widget, (500, 500), 1.0);
+
+    widget.apply_menu_action(MenuAction::SetWindowWidth(720.0));
+    widget.apply_menu_action(MenuAction::SetWindowHeight(700.0));
+    assert_eq!(widget.window_runtime_request().inner_size, Some((720, 700)));
+
+    // Windows applies request_inner_size asynchronously. An observation for
+    // the superseded Width-only request must not resolve the combined request,
+    // including when the same observed state is reported again next frame.
+    observe_window_size(&mut widget, (720, 500), 1.0);
+    observe_window_size(&mut widget, (720, 500), 1.0);
+    assert_eq!(
+        widget
+            .pending_window_size_request
+            .as_ref()
+            .map(|pending| pending.requested_logical_size),
+        Some((720, 700))
+    );
+
+    widget.apply_menu_action(MenuAction::SetWindowWidth(800.0));
+    assert_eq!(widget.window_runtime_request().inner_size, Some((800, 700)));
+
+    observe_window_size(&mut widget, (720, 700), 1.0);
+    assert!(widget.pending_window_size_request.is_some());
+    observe_window_size(&mut widget, (800, 700), 1.0);
+    assert!(widget.pending_window_size_request.is_none());
+}
+
+#[test]
+fn request_returning_to_observed_baseline_waits_out_superseded_observation() {
+    let mut widget = test_widget();
+    observe_window_size(&mut widget, (500, 500), 1.0);
+
+    widget.apply_menu_action(MenuAction::SetWindowWidth(720.0));
+    widget.apply_menu_action(MenuAction::SetWindowWidth(500.0));
+    assert_eq!(widget.window_runtime_request().inner_size, Some((500, 500)));
+
+    // Seeing the unchanged baseline does not prove that the cancellation won
+    // over the older asynchronous request.
+    observe_window_size(&mut widget, (500, 500), 1.0);
+    assert!(widget.pending_window_size_request.is_some());
+    observe_window_size(&mut widget, (720, 500), 1.0);
+    assert!(widget.pending_window_size_request.is_some());
+    observe_window_size(&mut widget, (500, 500), 1.0);
+    assert!(widget.pending_window_size_request.is_none());
+}
+
+#[test]
+fn resolved_size_request_cannot_override_a_later_manual_resize_counterpart() {
+    let mut widget = test_widget();
+    observe_window_size(&mut widget, (500, 500), 1.0);
+
+    widget.apply_menu_action(MenuAction::SetWindowWidth(720.0));
+    assert_eq!(widget.window_runtime_request().inner_size, Some((720, 500)));
+
+    observe_window_size(&mut widget, (720, 500), 1.0);
+    assert!(widget.pending_window_size_request.is_none());
+    observe_window_size(&mut widget, (800, 600), 1.0);
+    widget.apply_menu_action(MenuAction::SetWindowHeight(700.0));
+
+    assert_eq!(widget.window_runtime_request().inner_size, Some((800, 700)));
+}
+
+#[test]
+fn configured_dimension_edits_apply_after_settings_closes() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let persisted = AppSettings {
+        window: WindowSettings {
+            width: 160,
+            height: 160,
+            resizable: false,
+            ..WindowSettings::default()
+        },
+        ..AppSettings::default()
+    };
+    persisted.save_to_path(&path).unwrap();
+    let mut widget = Widget::new_with_settings_path(test_config(), persisted, Some(path.clone()));
+    observe_window_size(&mut widget, (160, 160), 1.0);
+    widget.apply_menu_action(MenuAction::SettingsOpened);
+    observe_window_size(&mut widget, SETTINGS_PRESENTATION_SIZE, 1.0);
+
+    widget.apply_menu_action(MenuAction::SetWindowWidth(720.0));
+    assert_eq!(widget.window_runtime_request().inner_size, Some((720, 600)));
+    widget.apply_menu_action(MenuAction::SetWindowHeight(320.0));
+    assert_eq!(widget.window_runtime_request().inner_size, Some((720, 600)));
+    assert_eq!(AppSettings::load_from_path(&path).window.width, 720);
+    assert_eq!(AppSettings::load_from_path(&path).window.height, 320);
+
+    widget.apply_menu_action(MenuAction::SettingsClosed);
+    assert_eq!(widget.window_runtime_request().inner_size, Some((720, 320)));
 }
 
 #[test]
@@ -620,6 +852,189 @@ fn ui_reset_matches_r_and_restores_saved_camera_without_persistence() {
     let persisted = AppSettings::load_from_path(&path);
     assert_eq!(persisted.camera, expected_settings.camera);
     assert_eq!(persisted.rendering, expected_settings.rendering);
+}
+
+#[test]
+fn restore_defaults_replaces_settings_and_live_state_atomically() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let settings = AppSettings {
+        window: WindowSettings {
+            width: 720,
+            height: 800,
+            resizable: true,
+            always_on_top: false,
+        },
+        camera: CameraSettings {
+            fov_deg: 55.0,
+            distance_scale: 0.8,
+            headroom: 0.17,
+            yaw_snap_deg: 5.0,
+            roll_snap_deg: 17.5,
+            pitch_snap_deg: 30.0,
+        },
+        rendering: RenderSettings {
+            msaa: AntiAliasingPreference::X8,
+            max_fps: 90.0,
+            smaa_enabled: true,
+        },
+        ..AppSettings::default()
+    };
+    settings.save_to_path(&path).unwrap();
+    let mut config = test_config();
+    config.cli_max_fps_override = Some(120.0);
+    let mut widget = Widget::new_with_settings_path(config, settings, Some(path.clone()));
+    <Widget as Game>::window_runtime_state(
+        &mut widget,
+        WindowRuntimeState {
+            inner_size_px: (1440, 1600),
+            scale_factor: 2.0,
+            resizable: true,
+            always_on_top: false,
+            max_fps: Some(120.0),
+        },
+    );
+    widget.set_camera_adjustments(CameraRuntimeAdjustments {
+        fov_delta_deg: 4.0,
+        distance_scale_delta: 0.2,
+        pan_ndc: Vec2::new(0.05, -0.04),
+        yaw_deg: 33.0,
+        roll_deg: -21.0,
+        pitch_deg: 12.0,
+    });
+
+    let snapshot = widget.apply_menu_action(MenuAction::RestoreDefaults);
+    let defaults = AppSettings::default();
+
+    assert_eq!(widget.settings, defaults);
+    assert_eq!(
+        widget.camera_controls.adjustments(),
+        CameraRuntimeAdjustments::default()
+    );
+    assert_eq!(snapshot.base_fov_deg(), defaults.camera.fov_deg);
+    assert_eq!(
+        snapshot.base_distance_scale(),
+        defaults.camera.distance_scale
+    );
+    assert_eq!(snapshot.effective_fov_deg(), defaults.camera.fov_deg);
+    assert_eq!(
+        snapshot.effective_distance_scale(),
+        defaults.camera.distance_scale
+    );
+    assert_eq!(snapshot.headroom(), defaults.camera.headroom);
+    assert_eq!(snapshot.yaw_deg(), 0.0);
+    assert_eq!(snapshot.pitch_deg(), 0.0);
+    assert_eq!(snapshot.roll_deg(), 0.0);
+    assert_eq!(snapshot.requested_msaa(), defaults.rendering.msaa);
+    assert!(!snapshot.requested_smaa());
+
+    let pending = widget.aa.pending_requests();
+    assert_eq!(pending.msaa, defaults.rendering.msaa.samples());
+    assert_eq!(pending.smaa, Some(defaults.rendering.smaa_enabled));
+    assert_eq!(
+        widget.window_runtime_request(),
+        WindowRuntimeRequest {
+            inner_size: Some((defaults.window.width, defaults.window.height)),
+            resizable: Some(defaults.window.resizable),
+            always_on_top: Some(defaults.window.always_on_top),
+            max_fps: Some(Some(defaults.rendering.max_fps)),
+        }
+    );
+    assert_eq!(widget.menu_window_state().cli_max_fps_override, None);
+    assert_eq!(widget.save_count, 1);
+    assert_eq!(AppSettings::load_from_path(&path), defaults);
+
+    let actual_camera = resolved_camera_for_widget(&widget, canonical_test_aabb(), 450.0 / 600.0);
+    let expected_camera = super::camera::resolve_camera_parameters_with_aspect(
+        canonical_test_aabb(),
+        defaults.camera,
+        CameraRuntimeAdjustments::default(),
+        450.0 / 600.0,
+    );
+    assert_widget_cameras_equivalent(actual_camera, expected_camera, 450.0 / 600.0);
+}
+
+#[test]
+fn restore_defaults_keeps_settings_accommodation_until_close() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let settings = AppSettings {
+        window: WindowSettings {
+            width: 160,
+            height: 160,
+            resizable: false,
+            ..WindowSettings::default()
+        },
+        rendering: RenderSettings {
+            max_fps: 90.0,
+            ..RenderSettings::default()
+        },
+        ..AppSettings::default()
+    };
+    settings.save_to_path(&path).unwrap();
+    let mut widget = Widget::new_with_settings_path(test_config(), settings, Some(path.clone()));
+    observe_window_size(&mut widget, (160, 160), 1.0);
+    widget.apply_menu_action(MenuAction::SettingsOpened);
+    observe_window_size(&mut widget, SETTINGS_PRESENTATION_SIZE, 1.0);
+
+    widget.apply_menu_action(MenuAction::RestoreDefaults);
+    let defaults = AppSettings::default().sanitized();
+
+    assert!(widget.settings_visible);
+    assert_eq!(widget.settings, defaults);
+    assert_eq!(AppSettings::load_from_path(&path), defaults);
+    assert_eq!(
+        widget.window_runtime_request().inner_size,
+        Some(SETTINGS_PRESENTATION_SIZE)
+    );
+
+    widget.apply_menu_action(MenuAction::SettingsClosed);
+    assert!(!widget.settings_visible);
+    assert_eq!(
+        widget.window_runtime_request().inner_size,
+        Some((defaults.window.width, defaults.window.height))
+    );
+}
+
+#[test]
+fn restore_defaults_fails_closed_when_settings_write_fails() {
+    let dir = tempdir().unwrap();
+    let blocked_parent = dir.path().join("settings-parent-file");
+    std::fs::write(&blocked_parent, b"keep this file").unwrap();
+    let path = blocked_parent.join("settings.json");
+    let settings = AppSettings {
+        window: WindowSettings {
+            width: 720,
+            height: 800,
+            ..WindowSettings::default()
+        },
+        camera: CameraSettings {
+            fov_deg: 55.0,
+            distance_scale: 0.8,
+            ..CameraSettings::default()
+        },
+        ..AppSettings::default()
+    };
+    let mut widget = Widget::new_with_settings_path(test_config(), settings, Some(path));
+    widget.set_camera_adjustments(CameraRuntimeAdjustments {
+        fov_delta_deg: 4.0,
+        distance_scale_delta: 0.2,
+        yaw_deg: 33.0,
+        ..CameraRuntimeAdjustments::default()
+    });
+    let before_settings = widget.settings.clone();
+    let before_adjustments = widget.camera_controls.adjustments();
+    let before_request = widget.window_runtime_request();
+    let before_snapshot = widget.controls_snapshot();
+
+    let snapshot = widget.apply_menu_action(MenuAction::RestoreDefaults);
+
+    assert_eq!(widget.settings, before_settings);
+    assert_eq!(widget.camera_controls.adjustments(), before_adjustments);
+    assert_eq!(widget.window_runtime_request(), before_request);
+    assert_eq!(snapshot, before_snapshot);
+    assert_eq!(widget.save_count, 1);
+    assert_eq!(std::fs::read(&blocked_parent).unwrap(), b"keep this file");
 }
 
 #[test]

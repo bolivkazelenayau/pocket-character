@@ -1,4 +1,5 @@
 import { type TextInputCursorArea, type TextInputFrame, textInput } from "./text-input";
+import { cancelsInlineEditBeforePointerBlur } from "./menu-pointer-policy";
 
 export interface InlineNumberFieldInput {
   onFrame(listener: (frame: TextInputFrame) => void): () => void;
@@ -14,10 +15,10 @@ export interface InlineNumberFieldOptions {
   /** Authoritative formatter used to seed a lossless edit draft. */
   editFormat: (value: number) => string;
   onCommit: (value: number) => void;
-  /** Return the logical caret rectangle for the current draft/caret. */
-  captureArea: (caret: number, draft: string) => TextInputCursorArea;
+  /** Return the logical caret rectangle for the currently displayed text. */
+  captureArea: (caret: number, draft: string, displayedText: string) => TextInputCursorArea | null;
   /** Optional mapping for placing the caret from a pointer press. */
-  caretFromPointer?: (x: number, draft: string) => number;
+  caretFromPointer?: (x: number, draft: string, displayedText: string) => number;
   input?: InlineNumberFieldInput;
 }
 
@@ -178,9 +179,14 @@ export class InlineNumberFieldModel {
 
     if (this.editingState) {
       if (this.options.caretFromPointer) {
-        this.setCaret(this.options.caretFromPointer(x, this.draftState));
+        // Pointer coordinates are applied to the restored draft after an
+        // active composition is discarded. Mapping against displayText()
+        // would count the IME replacement text and then apply that visual
+        // index to a different UTF-16 string.
+        const draft = this.draftState;
         this.preeditState = null;
         this.preeditSelectionState = null;
+        this.setCaret(this.options.caretFromPointer(x, draft, draft));
         this.refreshCapture();
         this.notify();
       }
@@ -408,7 +414,7 @@ export class InlineNumberFieldModel {
     if (!this.editingState) return;
     const caret = this.visualCaret();
     if (caret === null) return;
-    this.input.setCapture(true, this.options.captureArea(caret, this.draftState));
+    this.input.setCapture(true, this.options.captureArea(caret, this.draftState, this.displayText()));
   }
 
   private finishEditing(): void {
@@ -432,6 +438,10 @@ export function dispatchInlineNumberPointerDown(
   x: number,
   y: number,
 ): void {
+  if (cancelsInlineEditBeforePointerBlur(targetId)) {
+    cancelInlineNumberFields();
+    return;
+  }
   const fields = [...inlineNumberFields];
   // Blur first so a non-target editor cannot clear the capture acquired by
   // the target editor later in this same pointer transition. The activation

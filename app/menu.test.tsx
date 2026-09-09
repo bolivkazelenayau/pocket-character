@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -24,7 +24,7 @@ function testHost(
   outgoing: unknown[],
   textUpdates: string[],
   onSend: (message: unknown) => void,
-  focusState: { id: number },
+  focusState: { id: number; hitRect: { x: number; y: number; width: number; height: number } | null },
 ): HostOps & { __viewport: { w: number; h: number } } {
   let nextNode = 2;
   return {
@@ -46,7 +46,20 @@ function testHost(
       focusState.id = id;
     },
     setActive: () => {},
-    hitTest: () => focusState.id,
+    hitTest: (x, y) => {
+      if (x < 0 || y < 0 || x >= 450 || y >= 600) return 0;
+      const rect = focusState.hitRect;
+      return rect && x >= rect.x && y >= rect.y && x < rect.x + rect.width && y < rect.y + rect.height
+        ? focusState.id
+        : 0;
+    },
+    layoutOf: (id) => {
+      if (id === focusState.id && focusState.hitRect) {
+        const { x, y, width, height } = focusState.hitRect;
+        return [x, y, width, height] as const;
+      }
+      return [0, 0, 450, 600] as const;
+    },
     measureText: (value) => value.length * 8,
     svcOpen: (app) => app === "controls",
     svcPoll: () => incoming.shift(),
@@ -104,25 +117,32 @@ function stateLine(
 }
 
 describe("PocketUI camera menu snap regression", () => {
-  test("displaying ORIENTATION never changes persisted snap increments", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "pocket-character-menu-"));
-    const settingsPath = join(directory, "settings.json");
-    const settings = {
-      camera: {
-        headroom: 0.05,
-        yaw_snap_deg: 15,
-        pitch_snap_deg: 15,
-        roll_snap_deg: 15,
-      },
+  test("menu hit testing requires an in-viewport point inside the target bounds", () => {
+    const focusState = {
+      id: 17,
+      hitRect: { x: 120, y: 209, width: 42, height: 18 },
     };
-    await writeFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`);
-    const persistedBefore = await readFile(settingsPath, "utf8");
-    const runtimeSnaps = { ...settings.camera };
+    const host = testHost([], [], [], () => {}, focusState);
+
+    expect(host.hitTest?.(131, 218)).toBe(17);
+    expect(host.hitTest?.(119, 218)).toBe(0);
+    expect(host.hitTest?.(131, 590)).toBe(0);
+    expect(host.hitTest?.(131, 600)).toBe(0);
+    expect(host.hitTest?.(-1, 218)).toBe(0);
+  });
+
+  test("displaying ORIENTATION never changes persisted snap increments", async () => {
+    const runtimeSnaps = {
+      headroom: 0.05,
+      yaw_snap_deg: 15,
+      pitch_snap_deg: 15,
+      roll_snap_deg: 15,
+    };
     const incoming = [stateLine(undefined, [720, 700])];
     const outgoing: unknown[] = [];
     const snapMutations: unknown[] = [];
     const textUpdates: string[] = [];
-    const focusState = { id: 0 };
+    const focusState = { id: 0, hitRect: null as { x: number; y: number; width: number; height: number } | null };
     const cameraState: TestCameraState = {
       headroom: 0.05,
       yaw: 22.5,
@@ -175,15 +195,33 @@ describe("PocketUI camera menu snap regression", () => {
       frame?: (buttons: number) => void;
     };
     global.ui = host;
+    let bundleDirectory: string | null = null;
 
     try {
-      // The application module owns the real mount; load it only after the
-      // test host is installed so its current generated PocketUI tree is
-      // exercised. The normal build step produces this ignored artifact.
-      await import(`${pathToFileURL(join(import.meta.dir, "..", "dist", "menu.js")).href}?test=menu`);
+      // Build the current source into an isolated test artifact. The ignored
+      // dist bundle may be stale and must never define behavior assertions.
+      bundleDirectory = await mkdtemp(join(tmpdir(), "pocket-character-menu-build-"));
+      const build = Bun.spawn(
+        ["bun", "vendor/pocketjs/tools/build.ts", "app/menu.tsx", "--density=2", `--outdir=${bundleDirectory}`],
+        { cwd: join(import.meta.dir, ".."), stdout: "pipe", stderr: "pipe" },
+      );
+      const buildExitCode = await build.exited;
+      if (buildExitCode !== 0) {
+        throw new Error(await new Response(build.stderr).text());
+      }
+      await import(`${pathToFileURL(join(bundleDirectory, "menu.js")).href}?test=menu`);
       const frame = global.frame;
       expect(frame).toBeDefined();
       expect(textUpdates).toContain("ORIENTATION");
+      const clickField = (x: number, y: number) => {
+        const rect = { x: x - 21, y: y - 9, width: 42, height: 18 };
+        focusState.hitRect = rect;
+        incoming.push(JSON.stringify({ t: "mouse", x, y, d: true }));
+        frame!(0);
+        incoming.push(JSON.stringify({ t: "mouse", x, y, d: false }));
+        frame!(0);
+        return rect;
+      };
 
       // Poll one authoritative MenuState, then let ordinary idle ticks run.
       frame!(0);
@@ -221,7 +259,6 @@ describe("PocketUI camera menu snap regression", () => {
       expect(textUpdates).toContain("ORIENTATION");
       expect(runtimeSnaps).toEqual({ headroom: 0.05, yaw_snap_deg: 15, pitch_snap_deg: 15, roll_snap_deg: 15 });
       expect(snapMutations).toEqual([]);
-      expect(await readFile(settingsPath, "utf8")).toBe(persistedBefore);
       expect(outgoing).toEqual([]);
 
       // From the focused Camera tab, walk the actual focus order to YawValue,
@@ -230,9 +267,44 @@ describe("PocketUI camera menu snap regression", () => {
         frame!(BTN_DOWN);
         frame!(0);
       }
-      incoming.push(JSON.stringify({ t: "mouse", x: 170, y: 625, d: true }));
+      const yawBounds = clickField(150, 220);
+      incoming.push(
+        JSON.stringify({
+          t: "input",
+          edits: [],
+          ime: [{ kind: "preedit", text: "５５", range_bytes: null }],
+          modifiers: { shift: false, control: false, alt: false, super: false },
+          cancelled: false,
+        }),
+      );
       frame!(0);
-      incoming.push(JSON.stringify({ t: "mouse", x: 170, y: 625, d: false }));
+      expect(
+        outgoing.some(
+          (message) =>
+            typeof message === "object" &&
+            message !== null &&
+            "t" in message &&
+            message.t === "text-input-state" &&
+            "active" in message &&
+            message.active === true &&
+            "cursor_area_logical_px" in message &&
+            typeof message.cursor_area_logical_px === "object" &&
+            message.cursor_area_logical_px !== null &&
+            "x" in message.cursor_area_logical_px &&
+            message.cursor_area_logical_px.x === 158 &&
+            "y" in message.cursor_area_logical_px &&
+            message.cursor_area_logical_px.y === yawBounds.y,
+        ),
+      ).toBe(true);
+      incoming.push(
+        JSON.stringify({
+          t: "input",
+          edits: [],
+          ime: [{ kind: "disabled" }],
+          modifiers: { shift: false, control: false, alt: false, super: false },
+          cancelled: false,
+        }),
+      );
       frame!(0);
       incoming.push(
         JSON.stringify({
@@ -270,7 +342,7 @@ describe("PocketUI camera menu snap regression", () => {
             typeof message.cursor_area_logical_px === "object" &&
             message.cursor_area_logical_px !== null &&
             "y" in message.cursor_area_logical_px &&
-             message.cursor_area_logical_px.y === 625,
+            message.cursor_area_logical_px.y === yawBounds.y,
         ),
       ).toBe(true);
       expect(textUpdates).toContain("45.25°");
@@ -291,10 +363,7 @@ describe("PocketUI camera menu snap regression", () => {
         frame!(BTN_DOWN);
         frame!(0);
       }
-      incoming.push(JSON.stringify({ t: "mouse", x: 170, y: 707, d: true }));
-      frame!(0);
-      incoming.push(JSON.stringify({ t: "mouse", x: 170, y: 707, d: false }));
-      frame!(0);
+      clickField(150, 270);
       incoming.push(
         JSON.stringify({
           t: "input",
@@ -326,10 +395,7 @@ describe("PocketUI camera menu snap regression", () => {
         frame!(BTN_UP);
         frame!(0);
       }
-      incoming.push(JSON.stringify({ t: "mouse", x: 170, y: 559, d: true }));
-      frame!(0);
-      incoming.push(JSON.stringify({ t: "mouse", x: 170, y: 559, d: false }));
-      frame!(0);
+      clickField(150, 180);
       incoming.push(
         JSON.stringify({
           t: "input",
@@ -369,10 +435,7 @@ describe("PocketUI camera menu snap regression", () => {
         frame!(BTN_DOWN);
         frame!(0);
       }
-      incoming.push(JSON.stringify({ t: "mouse", x: 170, y: 519, d: true }));
-      frame!(0);
-      incoming.push(JSON.stringify({ t: "mouse", x: 170, y: 519, d: false }));
-      frame!(0);
+      clickField(150, 200);
       incoming.push(
         JSON.stringify({
           t: "input",
@@ -397,10 +460,7 @@ describe("PocketUI camera menu snap regression", () => {
 
       frame!(BTN_DOWN);
       frame!(0);
-      incoming.push(JSON.stringify({ t: "mouse", x: 170, y: 539, d: true }));
-      frame!(0);
-      incoming.push(JSON.stringify({ t: "mouse", x: 170, y: 539, d: false }));
-      frame!(0);
+      clickField(150, 220);
       expect(
         outgoing.some(
           (message) =>
@@ -430,11 +490,10 @@ describe("PocketUI camera menu snap regression", () => {
         ),
       ).toBe(true);
 
-      expect(await readFile(settingsPath, "utf8")).toBe(persistedBefore);
     } finally {
       delete global.frame;
       delete global.ui;
-      await rm(directory, { recursive: true, force: true });
+      if (bundleDirectory) await rm(bundleDirectory, { recursive: true, force: true });
     }
   });
 });

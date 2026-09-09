@@ -50,8 +50,11 @@ pub(crate) enum ControlAction {
     SetWindowResizable(bool),
     SetWindowAlwaysOnTop(bool),
     SetMaxFps(f32),
+    SettingsOpened,
+    SettingsClosed,
     RequestMsaa(AntiAliasingPreference),
     RequestSmaa(bool),
+    RestoreDefaults,
 }
 
 /// Immutable user-facing requested/pending/effective state for the menu.

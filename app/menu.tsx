@@ -4,9 +4,10 @@
 // authoritative snapshots, emits semantic button intents, and exposes
 // generic text-input ownership for future editable widgets.
 import { createSignal, type JSX } from "solid-js";
-import { Focusable, Text, View } from "@pocketjs/framework/components";
+import { Focusable, Text, View, type NodeMirror } from "@pocketjs/framework/components";
 import { virtualNow } from "@pocketjs/framework/clock";
 import { getOps } from "@pocketjs/framework/solid";
+import { hostViewport } from "@pocketjs/framework/host";
 import { focusNode, hitFocusable, pressNode, setActiveNode } from "@pocketjs/framework/input";
 import { onFrame } from "@pocketjs/framework/lifecycle";
 import { mount } from "@pocketjs/framework/solid";
@@ -22,15 +23,18 @@ import {
   type MsaaPreference,
 } from "./graphics-settings";
 import {
-  INLINE_NUMBER_CELL_HEIGHT,
-  INLINE_NUMBER_CELL_WIDTH,
-  INLINE_NUMBER_CHAR_WIDTH,
   InlineNumberField,
   cancelInlineNumberFields,
   dispatchInlineNumberPointerDown,
 } from "./inline-number-field";
+import {
+  caretFromInlineNumberBounds,
+  captureAreaFromInlineNumberBounds,
+  boundsInsideInlineNumberViewport,
+  layoutBoundsFromInlineNumberNode,
+} from "./inline-number-field-geometry";
 import { PointerRepeat, type RepeatAction } from "./menu-repeat";
-import { textInput } from "./text-input";
+import { type TextInputCursorArea, textInput } from "./text-input";
 
 /// Authoritative facts pushed by the Rust host (MenuState in
 /// crates/pocket-character/src/menu_guest.rs). Requested and effective AA are
@@ -89,23 +93,19 @@ type ActionName =
   | "set_window_height"
   | "set_window_resizable"
   | "set_window_always_on_top"
-  | "set_max_fps";
+  | "set_max_fps"
+  | "settings_opened"
+  | "settings_closed"
+  | "restore_defaults";
 
 // Latest host facts, or null before the first svc line arrives.
 const [controls, setControls] = createSignal<ControlsState | null>(null);
 type SettingsPage = "camera" | "graphics" | "window";
-// Ephemeral presentation state only; it is never serialized or sent to Rust.
+// Page/confirmation state is guest-only. Visibility has an explicit host
+// lifecycle because Rust owns the temporary safe-window constraint.
 const [activePage, setActivePage] = createSignal<SettingsPage>("camera");
-const CAMERA_VALUE_X = 152;
-const CAMERA_DISTANCE_VALUE_Y = 519;
-const CAMERA_FOV_VALUE_Y = 539;
-const CAMERA_HEADROOM_VALUE_Y = 559;
-const CAMERA_YAW_VALUE_Y = 625;
-const CAMERA_PITCH_VALUE_Y = 645;
-const CAMERA_ROLL_VALUE_Y = 665;
-const CAMERA_YAW_SNAP_VALUE_Y = 707;
-const CAMERA_PITCH_SNAP_VALUE_Y = 727;
-const CAMERA_ROLL_SNAP_VALUE_Y = 747;
+const [confirmingRestoreDefaults, setConfirmingRestoreDefaults] = createSignal(false);
+const [settingsVisible, setSettingsVisible] = createSignal(true);
 
 // Pointer ownership follows the framework's focusable hit target. The
 // release compares against the latched down target, so one physical press can
@@ -164,7 +164,32 @@ function switchPage(page: SettingsPage): void {
   // the pointer bridge. Release native text-input capture before the current
   // panel is replaced.
   cancelInlineNumberFields();
+  setConfirmingRestoreDefaults(false);
   setActivePage(page);
+}
+
+function beginRestoreDefaults(): void {
+  cancelInlineNumberFields();
+  setConfirmingRestoreDefaults(true);
+}
+
+function cancelRestoreDefaults(): void {
+  setConfirmingRestoreDefaults(false);
+}
+
+function confirmRestoreDefaults(): void {
+  setConfirmingRestoreDefaults(false);
+  sendAction("restore_defaults");
+}
+
+function closeSettings(): void {
+  cancelInlineNumberFields();
+  setConfirmingRestoreDefaults(false);
+  if (sendAction("settings_closed")) setSettingsVisible(false);
+}
+
+function openSettings(): void {
+  if (sendAction("settings_opened")) setSettingsVisible(true);
 }
 
 function decodeWindowState(value: unknown): WindowControlsState | null {
@@ -214,6 +239,9 @@ function handleMouse(x: number, y: number, down: boolean): void {
 
   if (down) {
     if (!pointerDown) {
+      // Restore is a destructive-flow boundary. Cancel the two-phase field
+      // before generic pointer blur can commit a valid draft, then open the
+      // confirmation on release. Other navigation retains valid-blur commit.
       dispatchInlineNumberPointerDown(target?.debugName ?? null, x, y);
       pressedTarget = target;
       const immediate = pointerRepeat.begin(target, repeatActionFor(target), virtualNow());
@@ -365,7 +393,6 @@ function Row(props: {
   value: () => number | null;
   format: (value: number) => string;
   commitAction: "set_effective_fov" | "set_effective_distance";
-  captureY: number;
   decrement: () => void;
   increment: () => void;
   debugName: string;
@@ -382,7 +409,7 @@ function Row(props: {
           format={props.format}
           editFormat={(value) => value.toString()}
           onCommit={(value) => sendAction(props.commitAction, value)}
-          captureArea={(caret, draft) => inlineNumberCaptureArea(props.captureY, caret, draft)}
+          captureArea={inlineNumberCaptureArea}
           caretFromPointer={inlineNumberCaretFromPointer}
         />
         <Button label="+" debugName={`${props.debugName}Increment`} onPress={props.increment} />
@@ -391,21 +418,38 @@ function Row(props: {
   );
 }
 
-function inlineNumberCaptureArea(captureY: number, caret: number, draft: string) {
-  const textWidth = Math.min(INLINE_NUMBER_CELL_WIDTH, draft.length * INLINE_NUMBER_CHAR_WIDTH);
-  const textLeft = Math.max(0, (INLINE_NUMBER_CELL_WIDTH - textWidth) / 2);
-  return {
-    x: CAMERA_VALUE_X + Math.min(INLINE_NUMBER_CELL_WIDTH - 1, textLeft + caret * INLINE_NUMBER_CHAR_WIDTH),
-    y: captureY,
-    width: 1,
-    height: INLINE_NUMBER_CELL_HEIGHT,
-  };
+function fieldLayoutBounds(node: NodeMirror | null) {
+  const ops = getOps();
+  if (!ops.layoutOf || !node) return null;
+  const bounds = layoutBoundsFromInlineNumberNode(node, ops.layoutOf);
+  const viewport = hostViewport(ops);
+  return viewport && bounds && !boundsInsideInlineNumberViewport(bounds, viewport) ? null : bounds;
 }
 
-function inlineNumberCaretFromPointer(x: number, draft: string): number {
-  const textWidth = Math.min(INLINE_NUMBER_CELL_WIDTH, draft.length * INLINE_NUMBER_CHAR_WIDTH);
-  const textLeft = Math.max(0, (INLINE_NUMBER_CELL_WIDTH - textWidth) / 2);
-  return Math.round((x - CAMERA_VALUE_X - textLeft) / INLINE_NUMBER_CHAR_WIDTH);
+function measureInlineNumberText(text: string): number {
+  return getOps().measureText(text, 16);
+}
+
+function inlineNumberCaptureArea(
+  caret: number,
+  _draft: string,
+  displayedText: string,
+  node: NodeMirror | null,
+): TextInputCursorArea | null {
+  const bounds = fieldLayoutBounds(node);
+  return bounds
+    ? captureAreaFromInlineNumberBounds(bounds, caret, displayedText, measureInlineNumberText)
+    : null;
+}
+
+function inlineNumberCaretFromPointer(
+  x: number,
+  _draft: string,
+  displayedText: string,
+  node: NodeMirror | null,
+): number {
+  const bounds = fieldLayoutBounds(node);
+  return bounds ? caretFromInlineNumberBounds(bounds, x, displayedText, measureInlineNumberText) : 0;
 }
 
 function CameraNumberRow(props: {
@@ -420,7 +464,6 @@ function CameraNumberRow(props: {
     | "set_yaw_snap"
     | "set_pitch_snap"
     | "set_roll_snap";
-  captureY: number;
   debugName: string;
 }) {
   return (
@@ -433,7 +476,7 @@ function CameraNumberRow(props: {
         format={props.format ?? formatDegrees}
         editFormat={(value) => value.toString()}
         onCommit={(value) => sendAction(props.commitAction, value)}
-        captureArea={(caret, draft) => inlineNumberCaptureArea(props.captureY, caret, draft)}
+        captureArea={inlineNumberCaptureArea}
         caretFromPointer={inlineNumberCaretFromPointer}
       />
     </View>
@@ -445,7 +488,6 @@ function WindowNumberRow(props: {
   value: () => number | null;
   format: (value: number) => string;
   commitAction: "set_window_width" | "set_window_height" | "set_max_fps";
-  captureY: number;
   debugName: string;
 }) {
   return (
@@ -458,7 +500,7 @@ function WindowNumberRow(props: {
         format={props.format}
         editFormat={(value) => value.toString()}
         onCommit={(value) => sendAction(props.commitAction, value)}
-        captureArea={(caret, draft) => inlineNumberCaptureArea(props.captureY, caret, draft)}
+        captureArea={inlineNumberCaptureArea}
         caretFromPointer={inlineNumberCaretFromPointer}
       />
     </View>
@@ -544,6 +586,45 @@ function SettingsFrame(props: { panelClass: string; children: JSX.Element }) {
       <PageTabs />
       <View class="relative top-[2] mt-[4] h-[1] w-full bg-[#33c6ff4d]" />
       <View class="w-[184] flex-col">{props.children}</View>
+      <View class="mt-[12] w-full flex-col">
+        <View class="h-[1] w-full bg-[#33c6ff4d]" />
+        {confirmingRestoreDefaults() ? (
+          <View debugName="RestoreDefaultsConfirmation" class="mt-[8] flex-col gap-[6]">
+            <Text class="text-xs text-[#e8f1f8]">Restore all settings to factory defaults?</Text>
+            <View class="flex-row justify-end gap-[4]">
+              <Focusable
+                debugName="CancelRestoreDefaults"
+                class="h-[18] w-[48] flex-col items-center justify-center rounded-sm bg-[#172b3b] focus:bg-[#2b5167] active:bg-[#3a6f88]"
+                onPress={cancelRestoreDefaults}
+              >
+                <Text class="text-xs text-[#e8f1f8]">Cancel</Text>
+              </Focusable>
+              <Focusable
+                debugName="ConfirmRestoreDefaults"
+                class="h-[18] w-[52] flex-col items-center justify-center rounded-sm bg-[#2b5167] focus:bg-[#3a6f88] active:bg-[#3a6f88]"
+                onPress={confirmRestoreDefaults}
+              >
+                <Text class="text-xs text-[#e8f1f8]">Restore</Text>
+              </Focusable>
+            </View>
+          </View>
+        ) : (
+          <Focusable
+            debugName="RestoreDefaults"
+            class="mt-[8] h-[20] w-full flex-col items-center justify-center rounded-sm bg-[#172b3b] focus:bg-[#2b5167] active:bg-[#3a6f88]"
+            onPress={beginRestoreDefaults}
+          >
+            <Text class="text-xs text-[#e8f1f8]">Restore Defaults</Text>
+          </Focusable>
+        )}
+        <Focusable
+          debugName="CloseSettings"
+          class="mt-[6] h-[20] w-full flex-col items-center justify-center rounded-sm bg-[#172b3b] focus:bg-[#2b5167] active:bg-[#3a6f88]"
+          onPress={closeSettings}
+        >
+          <Text class="text-xs text-[#e8f1f8]">Close Settings</Text>
+        </Focusable>
+      </View>
     </View>
   );
 }
@@ -643,7 +724,6 @@ function CameraPanel() {
           value={() => controls()?.effective_distance_scale ?? null}
           format={(value) => value.toFixed(2)}
           commitAction="set_effective_distance"
-          captureY={CAMERA_DISTANCE_VALUE_Y}
           debugName="Distance"
           decrement={() => sendAction("distance_decrement")}
           increment={() => sendAction("distance_increment")}
@@ -653,7 +733,6 @@ function CameraPanel() {
           value={() => controls()?.effective_fov_deg ?? null}
           format={formatCompactFov}
           commitAction="set_effective_fov"
-          captureY={CAMERA_FOV_VALUE_Y}
           debugName="Fov"
           decrement={() => sendAction("fov_decrement")}
           increment={() => sendAction("fov_increment")}
@@ -663,7 +742,6 @@ function CameraPanel() {
           value={() => controls()?.headroom ?? null}
           format={formatCompactDecimal}
           commitAction="set_headroom"
-          captureY={CAMERA_HEADROOM_VALUE_Y}
           debugName="Headroom"
         />
       </View>
@@ -691,21 +769,18 @@ function CameraPanel() {
           label="Yaw"
           value={() => controls()?.yaw_deg ?? null}
           commitAction="set_yaw"
-          captureY={CAMERA_YAW_VALUE_Y}
           debugName="Yaw"
         />
         <CameraNumberRow
           label="Pitch"
           value={() => controls()?.pitch_deg ?? null}
           commitAction="set_pitch"
-          captureY={CAMERA_PITCH_VALUE_Y}
           debugName="Pitch"
         />
         <CameraNumberRow
           label="Roll"
           value={() => controls()?.roll_deg ?? null}
           commitAction="set_roll"
-          captureY={CAMERA_ROLL_VALUE_Y}
           debugName="Roll"
         />
       </View>
@@ -717,21 +792,18 @@ function CameraPanel() {
           label="Yaw step"
           value={() => controls()?.yaw_snap_deg ?? null}
           commitAction="set_yaw_snap"
-          captureY={CAMERA_YAW_SNAP_VALUE_Y}
           debugName="YawSnap"
         />
         <CameraNumberRow
           label="Pitch step"
           value={() => controls()?.pitch_snap_deg ?? null}
           commitAction="set_pitch_snap"
-          captureY={CAMERA_PITCH_SNAP_VALUE_Y}
           debugName="PitchSnap"
         />
         <CameraNumberRow
           label="Roll step"
           value={() => controls()?.roll_snap_deg ?? null}
           commitAction="set_roll_snap"
-          captureY={CAMERA_ROLL_SNAP_VALUE_Y}
           debugName="RollSnap"
         />
       </View>
@@ -814,7 +886,6 @@ function WindowPanel() {
           value={() => state()?.current_width_logical ?? null}
           format={(value) => Math.round(value).toString()}
           commitAction="set_window_width"
-          captureY={CAMERA_DISTANCE_VALUE_Y}
           debugName="WindowWidth"
         />
         <WindowNumberRow
@@ -822,7 +893,6 @@ function WindowPanel() {
           value={() => state()?.current_height_logical ?? null}
           format={(value) => Math.round(value).toString()}
           commitAction="set_window_height"
-          captureY={CAMERA_FOV_VALUE_Y}
           debugName="WindowHeight"
         />
       </View>
@@ -853,7 +923,6 @@ function WindowPanel() {
         value={() => state()?.configured_max_fps ?? null}
         format={formatCompactDecimal}
         commitAction="set_max_fps"
-        captureY={CAMERA_ROLL_VALUE_Y}
         debugName="MaxFps"
       />
       {maxFpsStatus(state()) ? (
@@ -872,8 +941,18 @@ export default function ControlsMenu() {
   // Display formatting only. Rust computes the next value and applies all
   // safety/persistence semantics after receiving the semantic action.
   return (
-    <View debugName="ControlsMenu" class="absolute left-[14] top-[456]">
-      {activePage() === "camera" ? <CameraPanel /> : activePage() === "graphics" ? <GraphicsPanel /> : <WindowPanel />}
+    <View debugName="ControlsMenu" class="absolute bottom-[14] left-[14] w-[246]">
+      {settingsVisible() ? (
+        activePage() === "camera" ? <CameraPanel /> : activePage() === "graphics" ? <GraphicsPanel /> : <WindowPanel />
+      ) : (
+        <Focusable
+          debugName="OpenSettings"
+          class="h-[24] w-[84] flex-col items-center justify-center rounded-sm bg-[#172b3be8] focus:bg-[#2b5167] active:bg-[#3a6f88]"
+          onPress={openSettings}
+        >
+          <Text class="text-xs text-[#e8f1f8]">Settings</Text>
+        </Focusable>
+      )}
     </View>
   );
 }

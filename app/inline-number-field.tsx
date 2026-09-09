@@ -1,5 +1,5 @@
 import { createSignal, onCleanup } from "solid-js";
-import { Focusable, Text, View } from "@pocketjs/framework/components";
+import { Focusable, Text, View, type NodeMirror } from "@pocketjs/framework/components";
 import {
   InlineNumberFieldModel,
   type InlineNumberFieldOptions,
@@ -25,8 +25,18 @@ export interface InlineNumberFieldProps {
   format: (value: number) => string;
   editFormat: (value: number) => string;
   onCommit: (value: number) => void;
-  captureArea: (caret: number, draft: string) => TextInputCursorArea;
-  caretFromPointer?: (x: number, draft: string) => number;
+  captureArea: (
+    caret: number,
+    draft: string,
+    displayedText: string,
+    fieldNode: NodeMirror | null,
+  ) => TextInputCursorArea | null;
+  caretFromPointer?: (
+    x: number,
+    draft: string,
+    displayedText: string,
+    fieldNode: NodeMirror | null,
+  ) => number;
 }
 
 function textWidth(text: string): number {
@@ -34,7 +44,20 @@ function textWidth(text: string): number {
 }
 
 export function InlineNumberField(props: InlineNumberFieldProps) {
-  const model = new InlineNumberFieldModel(props satisfies InlineNumberFieldOptions);
+  let fieldNode: NodeMirror | null = null;
+  const model = new InlineNumberFieldModel({
+    id: props.id,
+    value: props.value,
+    format: props.format,
+    editFormat: props.editFormat,
+    onCommit: props.onCommit,
+    captureArea: (caret, draft, displayedText) =>
+      props.captureArea(caret, draft, displayedText, fieldNode),
+    caretFromPointer: props.caretFromPointer
+      ? (x, draft, displayedText) =>
+          props.caretFromPointer?.(x, draft, displayedText, fieldNode) ?? 0
+      : undefined,
+  } satisfies InlineNumberFieldOptions);
   const [revision, setRevision] = createSignal(0);
   const unsubscribe = model.subscribe(() => setRevision((value) => value + 1));
   onCleanup(() => {
@@ -75,6 +98,9 @@ export function InlineNumberField(props: InlineNumberFieldProps) {
 
   return (
     <Focusable
+      ref={(node) => {
+        fieldNode = node;
+      }}
       debugName={props.debugName}
       class={
         editing()

@@ -6,6 +6,14 @@ import {
   type InlineNumberFieldInput,
 } from "./inline-number-field-model";
 import type { TextInputCursorArea, TextInputFrame } from "./text-input";
+import {
+  caretFromInlineNumberBounds,
+  captureAreaFromInlineNumberBounds,
+  layoutBoundsFromInlineNumberNode,
+  boundsInsideInlineNumberViewport,
+  type InlineNumberFieldBounds,
+} from "./inline-number-field-geometry";
+import type { NodeMirror } from "@pocketjs/framework/components";
 
 class TestTextInput implements InlineNumberFieldInput {
   private readonly listeners = new Set<(frame: TextInputFrame) => void>();
@@ -364,6 +372,26 @@ describe("PocketUI InlineNumberField", () => {
     }
   });
 
+  test("Restore Defaults cancels valid and invalid drafts before pointer blur", () => {
+    for (const invalid of [false, true]) {
+      const { field, input, commits } = makeField();
+      try {
+        field.beginEditing();
+        if (invalid) {
+          input.dispatch(frame({ edits: [{ kind: "key", key: "home" }, { kind: "key", key: "delete" }] }));
+          input.dispatch(frame({ edits: [{ kind: "key", key: "delete" }, { kind: "key", key: "delete" }] }));
+        } else {
+          input.dispatch(frame({ edits: [{ kind: "char", text: "60" }] }));
+        }
+        dispatchInlineNumberPointerDown("RestoreDefaults", 150, 200);
+        expect(commits).toEqual([]);
+        expect(field.isEditing()).toBe(false);
+      } finally {
+        field.dispose();
+      }
+    }
+  });
+
   test("orientation fields commit raw values and transfer native capture ownership", () => {
     const input = new TestTextInput();
     const committed: Array<{ id: string; value: number }> = [];
@@ -531,5 +559,88 @@ describe("PocketUI InlineNumberField", () => {
     } finally {
       field.dispose();
     }
+  });
+
+  test("production capture pipeline centers displayed IME preedit text", () => {
+    const input = new TestTextInput();
+    const bounds: InlineNumberFieldBounds = { x: 100, y: 200, width: 42, height: 18 };
+    const captures: Array<{ draft: string; displayedText: string; area: TextInputCursorArea }> = [];
+    const field = new InlineNumberFieldModel({
+      id: "FovValue",
+      value: () => 0.05,
+      format: (value) => value.toString(),
+      editFormat: (value) => value.toString(),
+      onCommit: () => {},
+      captureArea: (caret, draft, displayedText) => {
+        const area = captureAreaFromInlineNumberBounds(bounds, caret, displayedText);
+        captures.push({ draft, displayedText, area });
+        return area;
+      },
+      input,
+    });
+    try {
+      field.beginEditing();
+      const draftCapture = captures.at(-1)?.area;
+      input.dispatch(frame({ ime: [{ kind: "preedit", text: "５５", rangeBytes: null }] }));
+      const preeditCapture = captures.at(-1);
+      expect(preeditCapture?.draft).toBe("0.05");
+      expect(preeditCapture?.displayedText).toBe("５５");
+      expect(preeditCapture?.area).not.toEqual(draftCapture);
+      expect(preeditCapture?.area).toEqual({ x: 128, y: 200, width: 1, height: 18 });
+    } finally {
+      field.dispose();
+    }
+  });
+
+  test("production pointer placement maps an IME preedit click back to the draft", () => {
+    const input = new TestTextInput();
+    const bounds: InlineNumberFieldBounds = { x: 100, y: 200, width: 42, height: 18 };
+    const measureText = (text: string) => text.length * 8;
+    const field = new InlineNumberFieldModel({
+      id: "FovValue",
+      value: () => 0.05,
+      format: (value) => value.toString(),
+      editFormat: (value) => value.toString(),
+      onCommit: () => {},
+      captureArea: (caret, _draft, displayedText) =>
+        captureAreaFromInlineNumberBounds(bounds, caret, displayedText, measureText),
+      caretFromPointer: (x, _draft, displayedText) =>
+        caretFromInlineNumberBounds(bounds, x, displayedText, measureText),
+      input,
+    });
+    try {
+      field.beginEditing();
+      input.dispatch(frame({ ime: [{ kind: "preedit", text: "５５", rangeBytes: null }] }));
+      expect(field.draft()).toBe("0.05");
+      expect(field.displayText()).toBe("５５");
+
+      // x=136 is past the visible full-width preedit (which ends at x=129),
+      // and therefore means the end of the restored 0.05 draft. The pointer
+      // path must not apply the preedit's shorter two-character index to the
+      // four-character draft.
+      field.pointerDown("FovValue", 136, 209);
+      expect(field.preedit()).toBeNull();
+      expect(field.caret()).toBe(4);
+      expect(input.capture.cursorArea).toEqual({ x: 137, y: 200, width: 1, height: 18 });
+    } finally {
+      field.dispose();
+    }
+  });
+
+  test("layout-owned field bounds compose parent offsets and enforce the 450x600 viewport", () => {
+    const root = { id: 1, parent: null, children: [] } as unknown as NodeMirror;
+    const panel = { id: 2, parent: root, children: [] } as unknown as NodeMirror;
+    const field = { id: 3, parent: panel, children: [] } as unknown as NodeMirror;
+    const layouts = new Map<number, readonly [number, number, number, number]>([
+      [1, [0, 0, 450, 600]],
+      [2, [14, 193, 246, 393]],
+      [3, [117, 16, 42, 18]],
+    ]);
+    const bounds = layoutBoundsFromInlineNumberNode(field, (id) => layouts.get(id) ?? null);
+    expect(bounds).toEqual({ x: 131, y: 209, width: 42, height: 18 });
+    expect(bounds && boundsInsideInlineNumberViewport(bounds, { w: 450, h: 600 })).toBe(true);
+
+    const clipped = { ...bounds!, y: 590 };
+    expect(boundsInsideInlineNumberViewport(clipped, { w: 450, h: 600 })).toBe(false);
   });
 });

@@ -184,8 +184,11 @@ pub(crate) enum MenuAction {
     SetWindowResizable(bool),
     SetWindowAlwaysOnTop(bool),
     SetMaxFps(f32),
+    SettingsOpened,
+    SettingsClosed,
     RequestMsaa(AntiAliasingPreference),
     RequestSmaa(bool),
+    RestoreDefaults,
 }
 
 /// Private guest→host action wire type. Keep this separate from the public
@@ -280,6 +283,8 @@ fn decode_menu_action(line: &str) -> Option<MenuAction> {
             .as_ref()
             .and_then(finite_f32_value)
             .map(MenuAction::SetMaxFps),
+        "settings_opened" => Some(MenuAction::SettingsOpened),
+        "settings_closed" => Some(MenuAction::SettingsClosed),
         "request_msaa" => wire
             .value
             .as_ref()
@@ -292,6 +297,7 @@ fn decode_menu_action(line: &str) -> Option<MenuAction> {
             .as_ref()
             .and_then(|value| value.as_bool())
             .map(MenuAction::RequestSmaa),
+        "restore_defaults" => Some(MenuAction::RestoreDefaults),
         _ => None,
     }
 }
@@ -803,12 +809,24 @@ mod tests {
                 MenuAction::SetMaxFps(120.0),
             ),
             (
+                r#"{"t":"action","action":"settings_opened"}"#,
+                MenuAction::SettingsOpened,
+            ),
+            (
+                r#"{"t":"action","action":"settings_closed"}"#,
+                MenuAction::SettingsClosed,
+            ),
+            (
                 r#"{"t":"action","action":"request_msaa","value":8}"#,
                 MenuAction::RequestMsaa(AntiAliasingPreference::X8),
             ),
             (
                 r#"{"t":"action","action":"request_smaa","value":true}"#,
                 MenuAction::RequestSmaa(true),
+            ),
+            (
+                r#"{"t":"action","action":"restore_defaults"}"#,
+                MenuAction::RestoreDefaults,
             ),
         ];
 

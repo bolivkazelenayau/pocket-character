@@ -92,6 +92,25 @@ impl MenuHealth {
 
 const DEFAULT_WINDOW_SCALE_FACTOR: f64 = 1.0;
 
+/// The accepted Settings layout is authored for the default logical client
+/// area. A persisted character window may be smaller, so the native client
+/// area is expanded only for the live Settings presentation. This request is
+/// process-local and never changes `AppSettings`.
+const SETTINGS_PRESENTATION_SIZE: (u32, u32) = (450, 600);
+
+/// A logical size request that has not yet been resolved by a changed native
+/// observation. Pocket3D retains the last applied request for deduplication,
+/// so parent-side pending ownership must be tracked separately.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingWindowSizeRequest {
+    requested_logical_size: (u32, u32),
+    observation_baseline: Option<(u32, u32)>,
+    observation_generation: u64,
+    /// Older requests that Pocket3D may already have submitted but whose
+    /// asynchronous native observations have not reached the parent yet.
+    superseded_logical_sizes: Vec<(u32, u32)>,
+}
+
 fn normalized_scale_factor(scale_factor: f64) -> f64 {
     if scale_factor.is_finite() && scale_factor > 0.0 {
         scale_factor
@@ -226,6 +245,9 @@ pub struct Widget {
     window_scale_factor: f64,
     window_runtime_state: Option<WindowRuntimeState>,
     window_runtime_request: WindowRuntimeRequest,
+    window_observation_generation: u64,
+    pending_window_size_request: Option<PendingWindowSizeRequest>,
+    settings_visible: bool,
     cli_max_fps_override: Option<f32>,
     cli_max_fps_active: bool,
     settings: AppSettings,
@@ -330,6 +352,9 @@ impl Widget {
             window_scale_factor: DEFAULT_WINDOW_SCALE_FACTOR,
             window_runtime_state: None,
             window_runtime_request: WindowRuntimeRequest::default(),
+            window_observation_generation: 0,
+            pending_window_size_request: None,
+            settings_visible: false,
             cli_max_fps_override,
             cli_max_fps_active: cli_max_fps_override.is_some(),
             settings,
@@ -377,6 +402,9 @@ impl Widget {
             if text_capture_was_active {
                 self.arm_camera_input_release_barrier();
             }
+            // A disabled overlay is no longer visible, so release the same
+            // temporary presentation constraint as an explicit close.
+            self.close_settings();
             log::error!("menu {operation} failed; disabling overlay: {message}");
         }
     }
@@ -614,6 +642,9 @@ impl Widget {
             MenuAction::SetWindowResizable(value) => ControlAction::SetWindowResizable(value),
             MenuAction::SetWindowAlwaysOnTop(value) => ControlAction::SetWindowAlwaysOnTop(value),
             MenuAction::SetMaxFps(value) => ControlAction::SetMaxFps(value),
+            MenuAction::SettingsOpened => ControlAction::SettingsOpened,
+            MenuAction::SettingsClosed => ControlAction::SettingsClosed,
+            MenuAction::RestoreDefaults => ControlAction::RestoreDefaults,
         }
     }
 
@@ -633,6 +664,150 @@ impl Widget {
     #[allow(dead_code)]
     pub fn observed_window_runtime_state(&self) -> Option<WindowRuntimeState> {
         self.window_runtime_state
+    }
+
+    fn observed_logical_window_size(&self) -> Option<(u32, u32)> {
+        self.window_physical_size.map(|size| {
+            let logical = logical_viewport_for(size, self.window_scale_factor);
+            (logical.0.round() as u32, logical.1.round() as u32)
+        })
+    }
+
+    fn current_logical_window_size(&self) -> (u32, u32) {
+        self.observed_logical_window_size()
+            .unwrap_or((self.settings.window.width, self.settings.window.height))
+    }
+
+    fn window_size_for_edit(&self) -> (u32, u32) {
+        self.pending_window_size_request
+            .as_ref()
+            .map(|pending| pending.requested_logical_size)
+            .unwrap_or_else(|| self.current_logical_window_size())
+    }
+
+    fn constrain_size_for_settings(&self, size: (u32, u32)) -> (u32, u32) {
+        if self.settings_visible {
+            (
+                size.0.max(SETTINGS_PRESENTATION_SIZE.0),
+                size.1.max(SETTINGS_PRESENTATION_SIZE.1),
+            )
+        } else {
+            size
+        }
+    }
+
+    /// Queue a new logical size transaction. Callers choose whether to derive
+    /// `size` from the pending target (dimension edits) or from an independent
+    /// configured/observed source (lifecycle/default operations). Every new
+    /// request still retains older unresolved targets because their native
+    /// observations may arrive after they have been superseded.
+    fn request_window_size(&mut self, size: (u32, u32)) {
+        let requested_logical_size = self.constrain_size_for_settings(size);
+        let (observation_baseline, observation_generation, mut superseded_logical_sizes) = self
+            .pending_window_size_request
+            .take()
+            .map(|pending| {
+                let mut superseded = pending.superseded_logical_sizes;
+                if pending.requested_logical_size != requested_logical_size {
+                    superseded.push(pending.requested_logical_size);
+                }
+                (
+                    pending.observation_baseline,
+                    pending.observation_generation,
+                    superseded,
+                )
+            })
+            .unwrap_or_else(|| {
+                (
+                    self.observed_logical_window_size(),
+                    self.window_observation_generation,
+                    Vec::new(),
+                )
+            });
+        superseded_logical_sizes.dedup();
+
+        let has_unresolved_request = self.observed_logical_window_size()
+            != Some(requested_logical_size)
+            || !superseded_logical_sizes.is_empty();
+        self.pending_window_size_request =
+            has_unresolved_request.then_some(PendingWindowSizeRequest {
+                requested_logical_size,
+                observation_baseline,
+                observation_generation,
+                superseded_logical_sizes,
+            });
+        self.window_runtime_request.inner_size = Some(requested_logical_size);
+    }
+
+    fn resolve_pending_window_size_request(&mut self) {
+        let observed = self.observed_logical_window_size();
+        let observation_generation = self.window_observation_generation;
+        let Some(pending) = self.pending_window_size_request.as_mut() else {
+            return;
+        };
+        if observation_generation <= pending.observation_generation {
+            return;
+        }
+
+        let resolved = if observed == pending.observation_baseline {
+            // Pocket3D reports the current observation every frame. Do not
+            // consume another equal-sized historical request merely because
+            // the same native observation was polled again.
+            false
+        } else if observed == Some(pending.requested_logical_size) {
+            true
+        } else if let Some(index) = pending
+            .superseded_logical_sizes
+            .iter()
+            .position(|size| Some(*size) == observed)
+        {
+            // This observation belongs to an older request. Consume it and
+            // make it the new unchanged baseline, but retain ownership of the
+            // newest combined request.
+            pending.superseded_logical_sizes.drain(..=index);
+            pending.observation_baseline = observed;
+            pending.observation_generation = observation_generation;
+            false
+        } else {
+            observed != pending.observation_baseline
+        };
+        if resolved {
+            self.pending_window_size_request = None;
+        }
+    }
+
+    fn enforce_settings_presentation_size(&mut self) {
+        if !self.settings_visible {
+            return;
+        }
+        let observed = self.current_logical_window_size();
+        let target = self.constrain_size_for_settings(observed);
+        if target != observed {
+            self.request_window_size(target);
+        }
+    }
+
+    /// Settings is mounted by the app at startup and remains safe to interact
+    /// with until the guest explicitly closes it. The accommodation is a live
+    /// presentation constraint only; it never changes configured settings.
+    fn open_settings(&mut self) {
+        if self.settings_visible {
+            return;
+        }
+        self.settings_visible = true;
+        let current = self.current_logical_window_size();
+        let target = self.constrain_size_for_settings(current);
+        // Always supersede a possible close-time request, even when the
+        // currently observed window is already large enough.
+        self.request_window_size(target);
+    }
+
+    fn close_settings(&mut self) {
+        if !self.settings_visible {
+            return;
+        }
+        self.settings_visible = false;
+        self.request_window_size((self.settings.window.width, self.settings.window.height));
     }
 
     fn apply_menu_action(&mut self, action: MenuAction) -> ControlsSnapshot {
@@ -661,6 +836,29 @@ impl Widget {
     fn reset_runtime_camera(&mut self) {
         self.camera_controls.reset_runtime_camera();
         self.reapply_camera();
+    }
+
+    /// Replace every persisted preference with Rust's canonical factory state
+    /// only after its one coherent settings document is safely written.
+    fn restore_defaults(&mut self) {
+        let defaults = AppSettings::default().sanitized();
+        if !self.persist_settings_value(&defaults) {
+            return;
+        }
+
+        self.settings = defaults.clone();
+        self.camera_controls.reset_runtime_camera();
+        self.reapply_camera();
+
+        self.aa
+            .request_msaa_samples(defaults.rendering.msaa.samples().unwrap_or(1));
+        self.aa.request_smaa(defaults.rendering.smaa_enabled);
+
+        self.request_window_size((defaults.window.width, defaults.window.height));
+        self.window_runtime_request.resizable = Some(defaults.window.resizable);
+        self.window_runtime_request.always_on_top = Some(defaults.window.always_on_top);
+        self.window_runtime_request.max_fps = Some(Some(defaults.rendering.max_fps));
+        self.cli_max_fps_active = false;
     }
 
     pub(crate) fn apply_control_action(&mut self, action: ControlAction) -> ControlsSnapshot {
@@ -760,6 +958,9 @@ impl Widget {
             ControlAction::RequestSmaa(enabled) => {
                 self.aa.request_smaa(enabled);
             }
+            ControlAction::SettingsOpened => self.open_settings(),
+            ControlAction::SettingsClosed => self.close_settings(),
+            ControlAction::RestoreDefaults => self.restore_defaults(),
             ControlAction::SetWindowWidth(value) => {
                 let mut candidate = self.settings.window.clone();
                 candidate.width = sanitized_window_dimension(value, candidate.width);
@@ -768,12 +969,8 @@ impl Widget {
                     self.settings.window = sanitized;
                     self.persist_settings();
                 }
-                let observed_height = self
-                    .observed_window_logical_size()
-                    .map(|(_, height)| height)
-                    .unwrap_or(self.settings.window.height);
-                self.window_runtime_request.inner_size =
-                    Some((self.settings.window.width, observed_height));
+                let (_, observed_height) = self.window_size_for_edit();
+                self.request_window_size((self.settings.window.width, observed_height));
             }
             ControlAction::SetWindowHeight(value) => {
                 let mut candidate = self.settings.window.clone();
@@ -783,12 +980,8 @@ impl Widget {
                     self.settings.window = sanitized;
                     self.persist_settings();
                 }
-                let observed_width = self
-                    .observed_window_logical_size()
-                    .map(|(width, _)| width)
-                    .unwrap_or(self.settings.window.width);
-                self.window_runtime_request.inner_size =
-                    Some((observed_width, self.settings.window.height));
+                let (observed_width, _) = self.window_size_for_edit();
+                self.request_window_size((observed_width, self.settings.window.height));
             }
             ControlAction::SetWindowResizable(value) => {
                 let mut candidate = self.settings.window.clone();
@@ -894,7 +1087,27 @@ impl Widget {
         let Some(path) = self.settings_path.clone() else {
             return;
         };
-        if let Err(error) = self.settings.save_to_path(&path) {
+        let settings = self.settings.clone();
+        let _ = self.persist_settings_value_at(&settings, &path);
+    }
+
+    /// Persist a candidate settings snapshot and report the result so callers
+    /// that replace authoritative runtime state can fail closed.
+    fn persist_settings_value(&mut self, settings: &AppSettings) -> bool {
+        let Some(path) = self.settings_path.clone() else {
+            log::warn!("unable to persist settings: no settings path is available");
+            return false;
+        };
+        self.persist_settings_value_at(settings, &path)
+    }
+
+    fn persist_settings_value_at(
+        &mut self,
+        settings: &AppSettings,
+        path: &std::path::Path,
+    ) -> bool {
+        let result = settings.save_to_path(path);
+        if let Err(error) = &result {
             log::warn!(
                 "unable to persist settings to {}: {error:#}",
                 path.display()
@@ -904,6 +1117,7 @@ impl Widget {
         {
             self.save_count += 1;
         }
+        result.is_ok()
     }
 
     fn update_viewport(&mut self, size: (u32, u32)) {
@@ -981,11 +1195,17 @@ impl Game for Widget {
         self.window_runtime_state = Some(state);
         self.window_physical_size = Some(state.inner_size_px);
         self.window_scale_factor = normalized_scale_factor(state.scale_factor);
+        self.window_observation_generation = self.window_observation_generation.wrapping_add(1);
+        self.resolve_pending_window_size_request();
+        self.enforce_settings_presentation_size();
     }
 
     fn window_metrics(&mut self, physical_size: (u32, u32), scale_factor: f64) {
         self.window_physical_size = Some(physical_size);
         self.window_scale_factor = normalized_scale_factor(scale_factor);
+        self.window_observation_generation = self.window_observation_generation.wrapping_add(1);
+        self.resolve_pending_window_size_request();
+        self.enforce_settings_presentation_size();
     }
 
     fn window_runtime_request(&self) -> WindowRuntimeRequest {
@@ -1109,6 +1329,7 @@ impl Game for Widget {
             initial_ui_viewport,
             renderer.color_format,
         )?);
+        self.open_settings();
 
         self.vrm = Some(vrm);
         log::info!("init: {:.0} ms", t0.elapsed().as_secs_f32() * 1000.0);
