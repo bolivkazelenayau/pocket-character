@@ -248,6 +248,27 @@ impl AvatarLoadRequest {
     }
 }
 
+/// Convert the native picker result into the parent-side request seam. The
+/// UI never receives this path and cancellation is represented by `None`.
+pub(crate) fn avatar_request_from_picker_result(
+    selected: Option<PathBuf>,
+) -> Option<AvatarLoadRequest> {
+    let path = selected?;
+    let extension = path.extension()?.to_str()?;
+    if !extension.eq_ignore_ascii_case("vrm") {
+        return None;
+    }
+    let model_name = avatar_model_name(path.file_stem());
+    Some(AvatarLoadRequest::new(path, None, model_name))
+}
+
+fn avatar_model_name(file_stem: Option<&std::ffi::OsStr>) -> String {
+    file_stem
+        .map(|stem| stem.to_string_lossy().trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "Avatar".to_owned())
+}
+
 fn replace_at<T>(items: &mut [T], index: usize, value: T) -> T {
     std::mem::replace(
         items
@@ -305,29 +326,150 @@ fn vrm1_allowed_required_extensions(json: &Value) -> Result<Vec<&'static str>> {
     Ok(allowed)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum AvatarLoadErrorKind {
+    UnsupportedVrm,
+    VrmParse,
+    ModelLoad,
+    RuntimeStartup,
+    SceneUnavailable,
+}
+
+impl AvatarLoadErrorKind {
+    fn ui_message(self) -> &'static str {
+        match self {
+            Self::UnsupportedVrm => "Unsupported VRM format.",
+            Self::VrmParse => "VRM parse failed.",
+            Self::ModelLoad => "VRM model load failed.",
+            Self::RuntimeStartup => "Avatar runtime failed.",
+            Self::SceneUnavailable => "Avatar scene unavailable.",
+        }
+    }
+}
+
+/// Classify a semantic-parser failure from document structure rather than its
+/// diagnostic text. The latter may contain a user-selected filesystem path.
+fn semantic_parse_failure_kind(bytes: &[u8]) -> AvatarLoadErrorKind {
+    let Ok(glb) = pocket_vrm::glb::parse_glb(bytes) else {
+        return AvatarLoadErrorKind::VrmParse;
+    };
+    semantic_document_failure_kind(&glb.json)
+}
+
+fn semantic_document_failure_kind(json: &Value) -> AvatarLoadErrorKind {
+    let Some(extensions_value) = json.get("extensions") else {
+        return AvatarLoadErrorKind::UnsupportedVrm;
+    };
+    let Some(extensions) = extensions_value.as_object() else {
+        return AvatarLoadErrorKind::VrmParse;
+    };
+
+    match (extensions.contains_key("VRM"), extensions.get("VRMC_vrm")) {
+        (true, None) => AvatarLoadErrorKind::VrmParse,
+        (false, Some(vrm1)) => {
+            let spec_version = vrm1
+                .as_object()
+                .and_then(|value| value.get("specVersion"))
+                .and_then(Value::as_str);
+            if spec_version.is_some_and(|version| version != "1.0") {
+                AvatarLoadErrorKind::UnsupportedVrm
+            } else {
+                AvatarLoadErrorKind::VrmParse
+            }
+        }
+        _ => AvatarLoadErrorKind::UnsupportedVrm,
+    }
+}
+
 /// Narrow, observable error state for a failed runtime load.  The old active
 /// avatar is intentionally not part of this error path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AvatarRuntimeError {
     message: String,
+    kind: AvatarLoadErrorKind,
 }
 
 impl AvatarRuntimeError {
-    pub(super) fn new(error: &anyhow::Error) -> Self {
+    pub(super) fn new(kind: AvatarLoadErrorKind, error: &anyhow::Error) -> Self {
         Self {
             message: format!("{error:#}"),
+            kind,
         }
     }
 
     #[cfg(test)]
-    pub(super) fn message(&self) -> &str {
+    pub(crate) fn message(&self) -> &str {
         &self.message
+    }
+
+    /// The diagnostic chain can include local model/bundle paths.  Preserve a
+    /// useful, explicitly assigned failure category without sending that chain
+    /// through the guest wire.
+    pub(crate) fn ui_message(&self) -> &'static str {
+        self.kind.ui_message()
     }
 }
 
 impl fmt::Display for AvatarRuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.message.fmt(f)
+    }
+}
+
+impl std::error::Error for AvatarRuntimeError {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum AvatarLoadStatus {
+    Idle,
+    Loading,
+    Error(AvatarRuntimeError),
+}
+
+impl Default for AvatarLoadStatus {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
+impl AvatarLoadStatus {
+    pub(super) fn begin_loading(&mut self) {
+        *self = Self::Loading;
+    }
+
+    pub(super) fn fail(&mut self, error: AvatarRuntimeError) {
+        *self = Self::Error(error);
+    }
+
+    pub(super) fn succeed(&mut self) {
+        *self = Self::Idle;
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_loading(&self) -> bool {
+        matches!(self, Self::Loading)
+    }
+
+    pub(super) fn ui_status(&self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Loading => "loading",
+            Self::Error(_) => "error",
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn error_message(&self) -> Option<&str> {
+        match self {
+            Self::Error(error) => Some(error.message()),
+            Self::Idle | Self::Loading => None,
+        }
+    }
+
+    pub(super) fn ui_error_message(&self) -> Option<&'static str> {
+        match self {
+            Self::Error(error) => Some(error.ui_message()),
+            Self::Idle | Self::Loading => None,
+        }
     }
 }
 
@@ -355,11 +497,15 @@ impl AvatarCandidate {
         renderer: &Renderer,
         bundle_path: &Path,
         request: &AvatarLoadRequest,
-    ) -> Result<Self> {
+    ) -> std::result::Result<Self, AvatarRuntimeError> {
         let model_bytes = std::fs::read(&request.model_path)
-            .with_context(|| format!("reading model {}", request.model_path.display()))?;
-        let document =
-            AvatarSemanticDocument::parse(&model_bytes).context("parsing VRM document")?;
+            .with_context(|| format!("reading model {}", request.model_path.display()))
+            .map_err(|error| AvatarRuntimeError::new(AvatarLoadErrorKind::ModelLoad, &error))?;
+        let document = AvatarSemanticDocument::parse(&model_bytes)
+            .context("parsing VRM document")
+            .map_err(|error| {
+                AvatarRuntimeError::new(semantic_parse_failure_kind(&model_bytes), &error)
+            })?;
         let presentation = AvatarPresentation::for_version(document.version());
 
         let model = match document.version() {
@@ -378,8 +524,14 @@ impl AvatarCandidate {
             }
             AvatarVersion::Vrm1 => {
                 let glb = pocket_vrm::glb::parse_glb(&model_bytes)
-                    .context("parsing VRM 1.0 glTF material extensions")?;
-                let allowed_required_extensions = vrm1_allowed_required_extensions(&glb.json)?;
+                    .context("parsing VRM 1.0 glTF material extensions")
+                    .map_err(|error| {
+                        AvatarRuntimeError::new(AvatarLoadErrorKind::VrmParse, &error)
+                    })?;
+                let allowed_required_extensions = vrm1_allowed_required_extensions(&glb.json)
+                    .map_err(|error| {
+                        AvatarRuntimeError::new(AvatarLoadErrorKind::UnsupportedVrm, &error)
+                    })?;
                 ModelAsset::load_glb_bytes_opts_with_allowed_required_extensions(
                     gpu,
                     &renderer.model_material_layout,
@@ -393,14 +545,20 @@ impl AvatarCandidate {
                 )
             }
         }
-        .context("loading VRM model")?;
+        .context("loading VRM model")
+        .map_err(|error| AvatarRuntimeError::new(AvatarLoadErrorKind::ModelLoad, &error))?;
 
         let mut clips = Vec::new();
         if let (Some(vrm0), Some(vrma_path)) = (document.vrm0(), request.vrma_path.as_ref()) {
             let vrma_bytes = std::fs::read(vrma_path)
-                .with_context(|| format!("reading vrma {}", vrma_path.display()))?;
-            let vrma = pocket_vrm::load_vrma_bytes(&vrma_bytes)?;
-            let clip = pocket_vrm::retarget(&vrma, &vrm0.humanoid, &model.skeleton)?;
+                .with_context(|| format!("reading vrma {}", vrma_path.display()))
+                .map_err(|error| AvatarRuntimeError::new(AvatarLoadErrorKind::ModelLoad, &error))?;
+            let vrma = pocket_vrm::load_vrma_bytes(&vrma_bytes)
+                .context("parsing VRMA animation")
+                .map_err(|error| AvatarRuntimeError::new(AvatarLoadErrorKind::ModelLoad, &error))?;
+            let clip = pocket_vrm::retarget(&vrma, &vrm0.humanoid, &model.skeleton)
+                .context("retargeting VRMA animation")
+                .map_err(|error| AvatarRuntimeError::new(AvatarLoadErrorKind::ModelLoad, &error))?;
             let clip_name = vrma_path
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
@@ -440,7 +598,10 @@ impl AvatarCandidate {
         instance.pose = Some(globals.clone());
 
         let bundle = std::fs::read_to_string(bundle_path)
-            .with_context(|| format!("reading bundle {}", bundle_path.display()))?;
+            .with_context(|| format!("reading bundle {}", bundle_path.display()))
+            .map_err(|error| {
+                AvatarRuntimeError::new(AvatarLoadErrorKind::RuntimeStartup, &error)
+            })?;
         let capabilities =
             AvatarCapabilities::for_candidate(request.model_name.clone(), &document, &clips);
         let guest = CharacterGuest::boot(
@@ -448,7 +609,9 @@ impl AvatarCandidate {
             &capabilities.model_name,
             &capabilities.clip_names,
             &capabilities.expression_names,
-        )?;
+        )
+        .context("starting character guest")
+        .map_err(|error| AvatarRuntimeError::new(AvatarLoadErrorKind::RuntimeStartup, &error))?;
 
         if document.vrm0().is_some() && blink_binds.is_empty() {
             log::warn!("model has no 'blink' expression; blinking disabled");
@@ -656,7 +819,7 @@ mod tests {
     #[test]
     fn failed_preparation_is_represented_without_touching_active_state() {
         let error = anyhow!("synthetic candidate failure");
-        let runtime_error = AvatarRuntimeError::new(&error);
+        let runtime_error = AvatarRuntimeError::new(AvatarLoadErrorKind::ModelLoad, &error);
         let old_active = String::from("old-avatar");
         let candidate: Result<String> = Err(error);
         assert!(candidate.is_err());
@@ -674,6 +837,150 @@ mod tests {
         assert_eq!(
             AvatarCapabilities::advertised_idle_clip(&["idle_loop".into()]),
             Some("idle_loop".into())
+        );
+    }
+
+    #[test]
+    fn picker_cancel_produces_no_avatar_request() {
+        let previous_request =
+            AvatarLoadRequest::new(PathBuf::from(r"C:\avatars\current.vrm"), None, "Current");
+        let mut pending = Some(previous_request.clone());
+        let mut status = AvatarLoadStatus::default();
+        status.fail(AvatarRuntimeError::new(
+            AvatarLoadErrorKind::ModelLoad,
+            &anyhow!("previous load failed"),
+        ));
+        let previous_status = status.clone();
+
+        let request = avatar_request_from_picker_result(None);
+        if let Some(request) = request {
+            pending = Some(request);
+            status.begin_loading();
+        }
+        assert_eq!(pending, Some(previous_request));
+        assert_eq!(status, previous_status);
+    }
+
+    #[test]
+    fn picker_path_maps_to_vrm_request_without_vrma() {
+        let request =
+            avatar_request_from_picker_result(Some(PathBuf::from(r"C:\avatars\Sample Avatar.VRM")))
+                .unwrap();
+        assert_eq!(
+            request.model_path,
+            PathBuf::from(r"C:\avatars\Sample Avatar.VRM")
+        );
+        assert_eq!(request.vrma_path, None);
+        assert_eq!(request.model_name, "Sample Avatar");
+    }
+
+    #[test]
+    fn picker_display_name_and_fallback_are_observable() {
+        let request =
+            avatar_request_from_picker_result(Some(PathBuf::from(r"C:\avatars\Sample Avatar.VRM")))
+                .unwrap();
+        assert_eq!(request.model_name, "Sample Avatar");
+        assert_eq!(avatar_model_name(None), "Avatar");
+        assert!(
+            avatar_request_from_picker_result(Some(PathBuf::from(r"C:\avatars\sample.txt",)))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn avatar_load_status_has_loading_and_error_states() {
+        let mut status = AvatarLoadStatus::default();
+        status.begin_loading();
+        assert!(status.is_loading());
+        assert_eq!(status.ui_status(), "loading");
+        assert_eq!(status.error_message(), None);
+        status.fail(AvatarRuntimeError::new(
+            AvatarLoadErrorKind::ModelLoad,
+            &anyhow!("load failed"),
+        ));
+        assert!(!status.is_loading());
+        assert_eq!(status.ui_status(), "error");
+        assert_eq!(status.error_message(), Some("load failed"));
+        assert_eq!(status.ui_error_message(), Some("VRM model load failed."));
+    }
+
+    #[test]
+    fn successful_avatar_status_clears_previous_load_error() {
+        let mut status = AvatarLoadStatus::default();
+        status.fail(AvatarRuntimeError::new(
+            AvatarLoadErrorKind::ModelLoad,
+            &anyhow!("previous load failed"),
+        ));
+        assert_eq!(status.error_message(), Some("previous load failed"));
+        status.succeed();
+        assert_eq!(status.ui_status(), "idle");
+        assert_eq!(status.error_message(), None);
+        assert_eq!(status.ui_error_message(), None);
+    }
+
+    #[test]
+    fn avatar_ui_error_does_not_expose_local_diagnostic_paths() {
+        let error = anyhow!(r"reading model C:\unsupported\parse\private.vrm: access denied");
+        let runtime_error = AvatarRuntimeError::new(AvatarLoadErrorKind::ModelLoad, &error);
+        assert_eq!(runtime_error.ui_message(), "VRM model load failed.");
+        assert!(!runtime_error.ui_message().contains("private.vrm"));
+        assert!(!runtime_error.ui_message().contains("C:\\unsupported"));
+        assert_eq!(runtime_error.kind, AvatarLoadErrorKind::ModelLoad);
+    }
+
+    #[test]
+    fn avatar_ui_error_categories_are_explicit() {
+        let diagnostic = anyhow!("synthetic failure");
+        let expected = [
+            (
+                AvatarLoadErrorKind::UnsupportedVrm,
+                "Unsupported VRM format.",
+            ),
+            (AvatarLoadErrorKind::VrmParse, "VRM parse failed."),
+            (AvatarLoadErrorKind::ModelLoad, "VRM model load failed."),
+            (
+                AvatarLoadErrorKind::RuntimeStartup,
+                "Avatar runtime failed.",
+            ),
+            (
+                AvatarLoadErrorKind::SceneUnavailable,
+                "Avatar scene unavailable.",
+            ),
+        ];
+
+        for (kind, message) in expected {
+            assert_eq!(
+                AvatarRuntimeError::new(kind, &diagnostic).ui_message(),
+                message
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_error_categories_come_from_document_structure() {
+        assert_eq!(
+            semantic_parse_failure_kind(b"not a GLB"),
+            AvatarLoadErrorKind::VrmParse
+        );
+        assert_eq!(
+            semantic_document_failure_kind(&serde_json::json!({})),
+            AvatarLoadErrorKind::UnsupportedVrm
+        );
+        assert_eq!(
+            semantic_document_failure_kind(&serde_json::json!({ "extensions": [] })),
+            AvatarLoadErrorKind::VrmParse
+        );
+        assert_eq!(
+            semantic_document_failure_kind(&serde_json::json!({
+                "extensions": { "VRMC_vrm": { "specVersion": "0.99" } }
+            })),
+            AvatarLoadErrorKind::UnsupportedVrm
+        );
+        assert_eq!(
+            semantic_document_failure_kind(&serde_json::json!({
+                "extensions": { "VRMC_vrm": { "specVersion": "1.0" } }
+            })),
+            AvatarLoadErrorKind::VrmParse
         );
     }
 

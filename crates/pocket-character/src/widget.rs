@@ -36,7 +36,8 @@ mod diagnostics;
 
 use aa::AaRuntime;
 use avatar::{
-    ActiveAvatar, AvatarCandidate, AvatarLoadRequest, AvatarRuntimeError, AvatarSceneSlot,
+    ActiveAvatar, AvatarCandidate, AvatarLoadErrorKind, AvatarLoadRequest, AvatarLoadStatus,
+    AvatarRuntimeError, AvatarSceneSlot, avatar_request_from_picker_result,
 };
 #[cfg(test)]
 use camera::CameraRuntimeAdjustments;
@@ -223,7 +224,7 @@ pub struct Widget {
     /// are prepared as an `AvatarCandidate` before this value changes.
     active_avatar: Option<ActiveAvatar>,
     pending_avatar_request: Option<AvatarLoadRequest>,
-    latest_avatar_load_error: Option<AvatarRuntimeError>,
+    avatar_load_status: AvatarLoadStatus,
 
     scene: Scene,
     camera: Camera,
@@ -320,7 +321,7 @@ impl Widget {
             menu_health: MenuHealth::default(),
             active_avatar: None,
             pending_avatar_request: None,
-            latest_avatar_load_error: None,
+            avatar_load_status: AvatarLoadStatus::default(),
             scene: Scene::default(),
             camera: Camera::default(),
             hud: Hud::default(),
@@ -372,14 +373,34 @@ impl Widget {
     /// Queue a parent-side replacement.  This is intentionally an internal
     /// seam: a future file picker can provide a request without becoming part
     /// of the render or guest ownership model.
-    #[allow(dead_code)]
     pub(crate) fn request_avatar_replacement(&mut self, request: AvatarLoadRequest) {
         self.pending_avatar_request = Some(request);
+        self.avatar_load_status.begin_loading();
+    }
+
+    fn open_avatar_picker(&mut self) {
+        #[cfg(windows)]
+        {
+            let selected = rfd::FileDialog::new()
+                .set_title("Open Avatar")
+                .add_filter("VRM avatar", &["vrm"])
+                .pick_file();
+            if let Some(request) = avatar_request_from_picker_result(selected) {
+                self.request_avatar_replacement(request);
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            log::warn!("Open Avatar is only available on Windows");
+        }
     }
 
     #[allow(dead_code)]
     pub(crate) fn latest_avatar_load_error(&self) -> Option<&AvatarRuntimeError> {
-        self.latest_avatar_load_error.as_ref()
+        match &self.avatar_load_status {
+            AvatarLoadStatus::Error(error) => Some(error),
+            AvatarLoadStatus::Idle | AvatarLoadStatus::Loading => None,
+        }
     }
 
     /// Move a fully prepared candidate into the single owned scene slot.  The
@@ -411,7 +432,7 @@ impl Widget {
         }
 
         self.active_avatar = Some(active);
-        self.latest_avatar_load_error = None;
+        self.avatar_load_status.succeed();
         self.reapply_camera();
     }
 
@@ -430,7 +451,10 @@ impl Widget {
                     .is_some_and(|active| !active.scene_slot.is_valid(&self.scene))
                 {
                     let error = anyhow::anyhow!("active avatar scene slot is no longer valid");
-                    self.latest_avatar_load_error = Some(AvatarRuntimeError::new(&error));
+                    self.avatar_load_status.fail(AvatarRuntimeError::new(
+                        AvatarLoadErrorKind::SceneUnavailable,
+                        &error,
+                    ));
                     return;
                 }
                 self.commit_avatar_candidate(candidate);
@@ -439,8 +463,8 @@ impl Widget {
                 // `candidate` does not exist on this path, so every GPU/guest
                 // resource created during preparation is dropped here while
                 // the old active state remains untouched.
-                self.latest_avatar_load_error = Some(AvatarRuntimeError::new(&error));
                 log::error!("avatar replacement failed: {error:#}");
+                self.avatar_load_status.fail(error);
             }
         }
     }
@@ -702,6 +726,7 @@ impl Widget {
             MenuAction::SettingsOpened => ControlAction::SettingsOpened,
             MenuAction::SettingsClosed => ControlAction::SettingsClosed,
             MenuAction::RestoreDefaults => ControlAction::RestoreDefaults,
+            MenuAction::OpenAvatar => unreachable!("OpenAvatar is handled before control actions"),
         }
     }
 
@@ -868,7 +893,12 @@ impl Widget {
     }
 
     fn apply_menu_action(&mut self, action: MenuAction) -> ControlsSnapshot {
-        self.apply_control_action(self.menu_control_action(action))
+        if matches!(action, MenuAction::OpenAvatar) {
+            self.open_avatar_picker();
+            self.controls_snapshot()
+        } else {
+            self.apply_control_action(self.menu_control_action(action))
+        }
     }
 
     /// Persist the live optic values that have a representation in
@@ -1510,6 +1540,8 @@ impl Game for Widget {
         if self.menu_health.is_healthy() {
             let snapshot = self.controls_snapshot();
             let window_snapshot = self.menu_window_state();
+            let avatar_status = self.avatar_load_status.ui_status();
+            let avatar_error = self.avatar_load_status.ui_error_message();
             let scale_factor = self.window_scale_factor;
             let pointer_frames = std::mem::take(&mut self.pending_menu_pointer);
             let input_frames = self.take_pending_menu_input();
@@ -1535,6 +1567,8 @@ impl Game for Widget {
                             snapshot.effective_smaa(),
                             snapshot.msaa_pending(),
                             snapshot.smaa_pending(),
+                            avatar_status,
+                            avatar_error,
                             window_snapshot,
                         )?;
                         for pointer_frame in pointer_frames {

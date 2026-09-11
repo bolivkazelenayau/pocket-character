@@ -56,8 +56,12 @@ interface ControlsState {
   effective_smaa: boolean;
   msaa_pending: boolean;
   smaa_pending: boolean;
+  avatar_status: AvatarStatus;
+  avatar_error: string | null;
   window: WindowControlsState;
 }
+
+type AvatarStatus = "idle" | "loading" | "error";
 
 interface WindowControlsState {
   configured_width: number;
@@ -96,7 +100,8 @@ type ActionName =
   | "set_max_fps"
   | "settings_opened"
   | "settings_closed"
-  | "restore_defaults";
+  | "restore_defaults"
+  | "open_avatar";
 
 // Latest host facts, or null before the first svc line arrives.
 const [controls, setControls] = createSignal<ControlsState | null>(null);
@@ -233,6 +238,10 @@ function decodeWindowState(value: unknown): WindowControlsState | null {
   };
 }
 
+function isAvatarStatus(value: unknown): value is AvatarStatus {
+  return value === "idle" || value === "loading" || value === "error";
+}
+
 function handleMouse(x: number, y: number, down: boolean): void {
   const target = hitFocusable(x, y);
   focusNode(target);
@@ -293,6 +302,9 @@ function pollControls(): void {
           effective_smaa?: unknown;
           msaa_pending?: unknown;
           smaa_pending?: unknown;
+          avatar_status?: unknown;
+          avatar_loading?: unknown;
+          avatar_error?: unknown;
           window?: unknown;
           x?: unknown;
           y?: unknown;
@@ -300,6 +312,15 @@ function pollControls(): void {
         };
         if (msg.t === "state") {
           const window = decodeWindowState(msg.window);
+          const avatarStatus =
+            msg.avatar_status === undefined
+              ? msg.avatar_loading === true
+                ? "loading"
+                : msg.avatar_error === null || msg.avatar_error === undefined
+                  ? "idle"
+                  : "error"
+              : msg.avatar_status;
+          const avatarError = msg.avatar_error === undefined ? null : msg.avatar_error;
           if (
             !window ||
             typeof msg.effective_fov_deg !== "number" ||
@@ -320,6 +341,8 @@ function pollControls(): void {
             typeof msg.effective_smaa !== "boolean" ||
             typeof msg.msaa_pending !== "boolean" ||
             typeof msg.smaa_pending !== "boolean" ||
+            !isAvatarStatus(avatarStatus) ||
+            (avatarError !== null && typeof avatarError !== "string") ||
             !Number.isFinite(msg.effective_fov_deg) ||
             !Number.isFinite(msg.effective_distance_scale) ||
             !Number.isFinite(msg.headroom) ||
@@ -347,6 +370,8 @@ function pollControls(): void {
             effective_smaa: msg.effective_smaa,
             msaa_pending: msg.msaa_pending,
             smaa_pending: msg.smaa_pending,
+            avatar_status: avatarStatus,
+            avatar_error: avatarError,
             window,
           });
         } else if (
@@ -715,6 +740,29 @@ function CameraPanel() {
   // capture geometry.
   return (
     <SettingsFrame panelClass="w-[246] flex-col rounded-md bg-[#0b1420b4] p-[16]">
+      <View class="mt-[6] flex-col gap-[3]">
+        <View class="h-[16] flex-row items-center">
+          <Text class="text-xs font-bold text-[#7fd0ff]">AVATAR</Text>
+        </View>
+        <Focusable
+          debugName="OpenAvatar"
+          class="h-[20] w-full flex-col items-center justify-center rounded-sm bg-[#172b3b] focus:bg-[#2b5167] active:bg-[#3a6f88]"
+          onPress={() => sendAction("open_avatar")}
+        >
+          <Text class="text-xs text-[#e8f1f8]">Open Avatar…</Text>
+        </Focusable>
+        {controls()?.avatar_status === "loading" ? (
+          <View class="h-[18] w-full flex-row items-center rounded-sm bg-[#17354a] px-[4]">
+            <Text class="text-xs text-[#b9e5ff]">Loading avatar…</Text>
+          </View>
+        ) : controls()?.avatar_status === "error" ? (
+          <View class="h-[18] w-full flex-row items-center rounded-sm bg-[#4a2529] px-[4]">
+            <Text class="text-xs text-[#ffd1d1]">
+              {controls()?.avatar_error ?? "Avatar could not be loaded."}
+            </Text>
+          </View>
+        ) : null}
+      </View>
       <View class="mt-[6] h-[16] flex-row items-center">
         <Text class="text-xs font-bold text-[#7fd0ff]">FRAMING</Text>
       </View>
