@@ -7,25 +7,21 @@
 
 use std::fmt::Display;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use glam::{Mat4, Vec3};
-use pocket_character_core::{CharacterSim, TrackingMode};
-use pocket_vrm::{SpringSolver, VrmDoc};
-use pocket3d::anim::NodeTrs;
+use pocket_character_core::TrackingMode;
 use pocket3d::app::{Game, TextInputRequest, WindowRuntimeRequest, WindowRuntimeState};
 use pocket3d::camera::Camera;
 use pocket3d::gpu::Gpu;
 use pocket3d::hud::Hud;
 use pocket3d::input::Input;
-use pocket3d::model::{ModelAsset, ModelInstance, ModelLoadOptions};
 use pocket3d::renderer::Renderer;
 use pocket3d::scene::Scene;
 use pocket3d::winit::keyboard::KeyCode;
 
-use crate::guest::{CharacterGuest, Command, TickEvent, TickState};
+use crate::guest::{Command, TickEvent, TickState};
 use crate::menu_guest::{
     MenuAction, MenuGuest, MenuInputFrame, MenuInputModifiers, MenuTextInputCapture,
     MenuWindowState,
@@ -33,11 +29,15 @@ use crate::menu_guest::{
 use crate::settings::{AntiAliasingPreference, AppSettings, CameraSettings};
 
 mod aa;
+mod avatar;
 mod camera;
 mod controls;
 mod diagnostics;
 
 use aa::AaRuntime;
+use avatar::{
+    ActiveAvatar, AvatarCandidate, AvatarLoadRequest, AvatarRuntimeError, AvatarSceneSlot,
+};
 #[cfg(test)]
 use camera::CameraRuntimeAdjustments;
 use camera::controls::{CameraControls, CameraSnapSteps};
@@ -212,27 +212,18 @@ struct MenuPointerFrame {
 
 pub struct Widget {
     cfg: WidgetConfig,
-    guest: Option<CharacterGuest>,
-    /// PocketUI overlay guest — a separate QuickJS realm from `guest`.
+    /// PocketUI overlay guest — a separate QuickJS realm from the avatar guest.
     /// Boots in `init` once the GPU/renderer exist; `None` until then (and
     /// in unit tests that never call `init`).
     menu: Option<MenuGuest>,
     menu_health: MenuHealth,
 
-    // Loaded in init (needs the GPU).
-    model: Option<Arc<ModelAsset>>,
-    vrm: Option<VrmDoc>,
-    clips: Vec<(String, pocket3d::anim::Clip)>,
-    springs: Option<SpringSolver>,
-
-    // Pose pipeline state.
-    sim: CharacterSim,
-    locals: Vec<NodeTrs>,
-    globals: Vec<Mat4>,
-    clip_index: usize,
-    clip_time: f32,
-    clip_looping: bool,
-    blink_binds: Vec<(usize, usize, f32)>, // (morph mesh slot, target, weight)
+    /// The only avatar-specific state owned by Widget.  Its scene instance is
+    /// kept in `scene.models` at `active.scene_slot`; all replacement inputs
+    /// are prepared as an `AvatarCandidate` before this value changes.
+    active_avatar: Option<ActiveAvatar>,
+    pending_avatar_request: Option<AvatarLoadRequest>,
+    latest_avatar_load_error: Option<AvatarRuntimeError>,
 
     scene: Scene,
     camera: Camera,
@@ -323,25 +314,13 @@ impl Widget {
         // `reapply_camera()` is the common application path.
         let settings = settings.sanitized();
         let cli_max_fps_override = cfg.cli_max_fps_override;
-        // Seed fixed for reproducible measurement runs; behavior parity is
-        // distributional, not per-run.
-        let sim = CharacterSim::new(0x0c9a_11e0, Vec3::ZERO);
         Self {
             cfg,
-            guest: None,
             menu: None,
             menu_health: MenuHealth::default(),
-            model: None,
-            vrm: None,
-            clips: Vec::new(),
-            springs: None,
-            sim,
-            locals: Vec::new(),
-            globals: Vec::new(),
-            clip_index: 0,
-            clip_time: 0.0,
-            clip_looping: true,
-            blink_binds: Vec::new(),
+            active_avatar: None,
+            pending_avatar_request: None,
+            latest_avatar_load_error: None,
             scene: Scene::default(),
             camera: Camera::default(),
             hud: Hud::default(),
@@ -385,8 +364,84 @@ impl Widget {
     }
 
     fn reapply_camera(&mut self) {
-        if self.model.is_some() {
+        if self.active_avatar.is_some() {
             self.apply_camera_settings();
+        }
+    }
+
+    /// Queue a parent-side replacement.  This is intentionally an internal
+    /// seam: a future file picker can provide a request without becoming part
+    /// of the render or guest ownership model.
+    #[allow(dead_code)]
+    pub(crate) fn request_avatar_replacement(&mut self, request: AvatarLoadRequest) {
+        self.pending_avatar_request = Some(request);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn latest_avatar_load_error(&self) -> Option<&AvatarRuntimeError> {
+        self.latest_avatar_load_error.as_ref()
+    }
+
+    /// Move a fully prepared candidate into the single owned scene slot.  The
+    /// function deliberately has no `Result` boundary: candidate preparation,
+    /// guest boot, GPU allocation, and semantic parsing all happened before
+    /// this point.  The remaining operations are field moves and Vec slot
+    /// replacement only.
+    fn commit_avatar_candidate(&mut self, candidate: AvatarCandidate) {
+        let replacing = self.active_avatar.is_some();
+        let scene_slot = self
+            .active_avatar
+            .as_ref()
+            .map(|active| active.scene_slot)
+            .unwrap_or_else(|| AvatarSceneSlot::new(self.scene.models.len()));
+        let (instance, active) = candidate.into_parts(scene_slot);
+        debug_assert_eq!(active.presentation.transform, instance.transform);
+        debug_assert_eq!(active.capabilities.clip_names.len(), active.clips.len());
+        debug_assert_eq!(
+            active.capabilities.idle_clip.is_some(),
+            active.clips.iter().any(|(name, _)| name == "idle_loop")
+        );
+
+        if replacing {
+            debug_assert!(scene_slot.is_valid(&self.scene));
+            let _old_instance = scene_slot.replace(&mut self.scene, instance);
+        } else {
+            debug_assert_eq!(scene_slot.index(), self.scene.models.len());
+            self.scene.models.push(instance);
+        }
+
+        self.active_avatar = Some(active);
+        self.latest_avatar_load_error = None;
+        self.reapply_camera();
+    }
+
+    fn process_pending_avatar_request(&mut self, gpu: &Gpu, renderer: &Renderer) {
+        let Some(request) = self.pending_avatar_request.take() else {
+            return;
+        };
+
+        match AvatarCandidate::prepare(gpu, renderer, &self.cfg.bundle_path, &request) {
+            Ok(candidate) => {
+                // A missing slot is an invariant failure, not a reason to
+                // guess which unrelated scene model should be replaced.
+                if self
+                    .active_avatar
+                    .as_ref()
+                    .is_some_and(|active| !active.scene_slot.is_valid(&self.scene))
+                {
+                    let error = anyhow::anyhow!("active avatar scene slot is no longer valid");
+                    self.latest_avatar_load_error = Some(AvatarRuntimeError::new(&error));
+                    return;
+                }
+                self.commit_avatar_candidate(candidate);
+            }
+            Err(error) => {
+                // `candidate` does not exist on this path, so every GPU/guest
+                // resource created during preparation is dropped here while
+                // the old active state remains untouched.
+                self.latest_avatar_load_error = Some(AvatarRuntimeError::new(&error));
+                log::error!("avatar replacement failed: {error:#}");
+            }
         }
     }
 
@@ -493,10 +548,10 @@ impl Widget {
     }
 
     fn apply_camera_settings(&mut self) {
-        let Some(model) = self.model.as_ref() else {
+        let Some(active) = self.active_avatar.as_ref() else {
             return;
         };
-        let aabb = model.aabb;
+        let aabb = active.presentation_aabb;
         let viewport_aspect = self.camera_viewport_aspect();
         self.camera_controls.validate_pan(
             CameraPanContext::new(aabb, self.settings.camera),
@@ -515,8 +570,10 @@ impl Widget {
         self.camera.roll = parameters.roll_deg.to_radians();
         self.camera.pitch = parameters.pitch_deg.to_radians();
         self.camera.pos = parameters.position;
-        self.sim.look_base = self.camera.pos;
-        self.sim.mouse_target = self.camera.pos;
+        if let Some(active) = self.active_avatar.as_mut() {
+            active.sim.look_base = self.camera.pos;
+            active.sim.mouse_target = self.camera.pos;
+        }
     }
 
     #[cfg(test)]
@@ -1135,24 +1192,28 @@ impl Widget {
         for cmd in commands {
             match cmd {
                 Command::SetTracking(mode) => {
-                    self.sim.tracking = match mode.as_str() {
-                        "mouse" => TrackingMode::Mouse,
-                        _ => TrackingMode::None,
-                    };
+                    if let Some(active) = self.active_avatar.as_mut() {
+                        active.sim.tracking = match mode.as_str() {
+                            "mouse" => TrackingMode::Mouse,
+                            _ => TrackingMode::None,
+                        };
+                    }
                 }
                 Command::SetExpression(name, w) => {
-                    let Some((vrm, model)) = self.vrm.as_ref().zip(self.model.as_ref()) else {
+                    let Some(active) = self.active_avatar.as_ref() else {
                         continue;
                     };
-                    apply_expression(vrm, model, &mut self.scene, &name, w);
+                    apply_expression(active, &mut self.scene, &name, w);
                 }
                 Command::PlayClip { name, looping } => {
-                    if let Some(i) = self.clips.iter().position(|(n, _)| *n == name) {
-                        self.clip_index = i;
-                        self.clip_time = 0.0;
-                        self.clip_looping = looping;
-                    } else {
-                        log::warn!("character.playClip: unknown clip '{name}'");
+                    if let Some(active) = self.active_avatar.as_mut() {
+                        if let Some(i) = active.clips.iter().position(|(n, _)| *n == name) {
+                            active.animation.clip_index = i;
+                            active.animation.clip_time = 0.0;
+                            active.animation.clip_looping = looping;
+                        } else {
+                            log::warn!("character.playClip: unknown clip '{name}'");
+                        }
                     }
                 }
                 Command::SetMaxFps(fps) => {
@@ -1172,10 +1233,12 @@ impl Widget {
 }
 
 /// Resolve a named VRM expression to morph weights on the instance.
-fn apply_expression(vrm: &VrmDoc, model: &Arc<ModelAsset>, scene: &mut Scene, name: &str, w: f32) {
-    let Some(inst) = scene.models.first_mut() else {
+fn apply_expression(active: &ActiveAvatar, scene: &mut Scene, name: &str, w: f32) {
+    let Some(vrm) = active.document.vrm0() else {
         return;
     };
+    let model = &active.asset;
+    let inst = active.scene_slot.get_mut(scene);
     let Some(morph) = inst.morph.as_mut() else {
         return;
     };
@@ -1234,83 +1297,18 @@ impl Game for Widget {
             renderer.smaa_enabled(),
         );
 
-        // 2048 halves the 4096² authoring textures: invisible at 450×600,
-        // and GPU texture memory is the widget's dominant footprint.
-        let model = ModelAsset::load_glb_opts(
-            gpu,
-            &renderer.model_material_layout,
-            &renderer.samplers,
-            &self.cfg.model_path,
-            &ModelLoadOptions {
-                max_texture_dim: Some(2048),
-            },
-        )
-        .context("loading VRM model")?;
-        let vrm = VrmDoc::from_path(&self.cfg.model_path).context("parsing VRM extension")?;
-
-        // Retarget the idle animation onto this rig.
-        let vrma_bytes = std::fs::read(&self.cfg.vrma_path).context("reading vrma")?;
-        let vrma = pocket_vrm::load_vrma_bytes(&vrma_bytes)?;
-        let clip = pocket_vrm::retarget(&vrma, &vrm.humanoid, &model.skeleton)?;
-        let clip_name = self
-            .cfg
-            .vrma_path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "idle".into());
-        self.clips = vec![(clip_name, clip)];
-
-        // Springs seeded from the rest pose.
-        model
-            .skeleton
-            .sample_locals(None, 0.0, false, &mut self.locals);
-        self.springs = Some(SpringSolver::new(
-            &vrm.springs,
-            &model.skeleton,
-            &self.locals,
-        ));
-
-        // Blink expression → morph slots.
-        for expr in &vrm.expressions {
-            if expr.name == "blink" {
-                for b in &expr.binds {
-                    if let Some(slot) = model.morph_mesh_slot(b.mesh) {
-                        self.blink_binds.push((slot, b.target, b.weight));
-                    }
-                }
-            }
-        }
-        if self.blink_binds.is_empty() {
-            log::warn!("model has no 'blink' expression; blinking disabled");
-        }
+        let startup_request = AvatarLoadRequest::new(
+            self.cfg.model_path.clone(),
+            Some(self.cfg.vrma_path.clone()),
+            "AvatarSample_A",
+        );
+        let candidate =
+            AvatarCandidate::prepare(gpu, renderer, &self.cfg.bundle_path, &startup_request)?;
 
         // Scene: one instance, transparent background, near-unlit shading
         // (MToon reads mostly flat; sun/hemisphere would double-shade it).
-        let mut inst = ModelInstance::new(model.clone());
-        inst.morph = model.create_morph_state(gpu);
-        inst.cutout = 0.5;
-        inst.lit = 0.25;
         self.scene.transparent_clear = true;
-        self.scene.models.push(inst);
-
-        // Camera framing is character-owned and derived from the loaded
-        // model's bounds. `AppSettings.camera` is the canonical persisted/base
-        // settings, `CameraControls` holds session adjustments, and
-        // `reapply_camera()` is the common application path.
-        self.model = Some(model.clone());
-        self.reapply_camera();
-
-        // Guest boots last so its boot table reflects the loaded assets.
-        let bundle = std::fs::read_to_string(&self.cfg.bundle_path)
-            .with_context(|| format!("reading bundle {}", self.cfg.bundle_path.display()))?;
-        let clip_names: Vec<String> = self.clips.iter().map(|(n, _)| n.clone()).collect();
-        let expr_names: Vec<String> = vrm.expressions.iter().map(|e| e.name.clone()).collect();
-        self.guest = Some(CharacterGuest::boot(
-            &bundle,
-            "AvatarSample_A",
-            &clip_names,
-            &expr_names,
-        )?);
+        self.commit_avatar_candidate(candidate);
 
         // The menu guest boots independently of the character guest (separate
         // QuickJS realm + ui surface), after the GPU/renderer exist so the
@@ -1331,7 +1329,6 @@ impl Game for Widget {
         )?);
         self.open_settings();
 
-        self.vrm = Some(vrm);
         log::info!("init: {:.0} ms", t0.elapsed().as_secs_f32() * 1000.0);
         Ok(())
     }
@@ -1371,10 +1368,9 @@ impl Game for Widget {
             }
             // Temporary F8 validation controls are never written to
             // AppSettings.
-            let pan_context = self
-                .model
-                .as_ref()
-                .map(|model| CameraPanContext::new(model.aabb, self.settings.camera));
+            let pan_context = self.active_avatar.as_ref().map(|active| {
+                CameraPanContext::new(active.presentation_aabb, self.settings.camera)
+            });
             let camera_changed = self.camera_controls.apply_frame(
                 dt,
                 input,
@@ -1400,92 +1396,108 @@ impl Game for Widget {
 
     fn tick(&mut self, dt: f32, _input: &Input) {
         let t0 = Instant::now();
-        let (Some(model), Some(vrm)) = (self.model.clone(), self.vrm.as_ref()) else {
+        if self.active_avatar.is_none() {
             return;
-        };
+        }
         self.tick_count += 1;
 
-        // --- sim --------------------------------------------------------
-        let out = self.sim.tick(dt);
+        // Keep the complete avatar tick inside one borrow.  The guest result
+        // is owned before commands are applied, so a guest command cannot
+        // observe partially updated avatar state.
+        let guest_turn = {
+            let active = self.active_avatar.as_mut().expect("active avatar checked");
+            let model = active.asset.clone();
 
-        // --- clip -------------------------------------------------------
-        self.clip_time += dt;
-        let clip = self.clips.get(self.clip_index).map(|(_, c)| c);
-        model
-            .skeleton
-            .sample_locals(clip, self.clip_time, self.clip_looping, &mut self.locals);
+            // --- sim ----------------------------------------------------
+            let out = active.sim.tick(dt);
 
-        // --- eyes -------------------------------------------------------
-        // Yaw/pitch from the head toward the look target (model space).
-        self.globals.resize(self.locals.len(), Mat4::IDENTITY);
-        model
-            .skeleton
-            .globals_from_locals(&self.locals, &mut self.globals);
-        let head = vrm
-            .humanoid_node("head")
-            .map(|n| self.globals[n].w_axis.truncate());
-        if let Some(head_pos) = head {
-            // Character forward is -Z; yaw > 0 = its left (-X), pitch > 0 = up.
-            let d = out.look_target - head_pos;
-            let yaw = (-d.x).atan2(-d.z).to_degrees();
-            let pitch = d.y.atan2(Vec3::new(d.x, 0.0, d.z).length()).to_degrees();
-            pocket_vrm::apply_eye_look(
-                &mut self.locals,
-                &model.skeleton.rest,
-                vrm.humanoid_node("leftEye"),
-                vrm.humanoid_node("rightEye"),
-                &vrm.look_at,
-                yaw,
-                pitch,
+            // --- clip ---------------------------------------------------
+            active.animation.clip_time += dt;
+            let clip = active
+                .clips
+                .get(active.animation.clip_index)
+                .map(|(_, c)| c);
+            model.skeleton.sample_locals(
+                clip,
+                active.animation.clip_time,
+                active.animation.clip_looping,
+                &mut active.locals,
             );
-        }
 
-        // --- springs ----------------------------------------------------
-        if let Some(springs) = self.springs.as_mut() {
-            springs.step(dt, &model.skeleton, &mut self.locals, Mat4::IDENTITY);
-        }
-
-        // --- pose + blink -----------------------------------------------
-        model
-            .skeleton
-            .globals_from_locals(&self.locals, &mut self.globals);
-        let inst = &mut self.scene.models[0];
-        inst.pose = Some(self.globals.clone());
-        if out.blink_changed {
-            if let Some(morph) = inst.morph.as_mut() {
-                for &(slot, target, w) in &self.blink_binds {
-                    morph.set_weight(slot, target, out.blink * w);
+            // --- eyes ---------------------------------------------------
+            // Yaw/pitch from the head toward the look target (model space).
+            active.globals.resize(active.locals.len(), Mat4::IDENTITY);
+            model
+                .skeleton
+                .globals_from_locals(&active.locals, &mut active.globals);
+            if let Some(vrm) = active.document.vrm0() {
+                let head = vrm
+                    .humanoid_node("head")
+                    .map(|n| active.globals[n].w_axis.truncate());
+                if let Some(head_pos) = head {
+                    // Character forward is -Z; yaw > 0 = its left (-X), pitch > 0 = up.
+                    let d = out.look_target - head_pos;
+                    let yaw = (-d.x).atan2(-d.z).to_degrees();
+                    let pitch = d.y.atan2(Vec3::new(d.x, 0.0, d.z).length()).to_degrees();
+                    pocket_vrm::apply_eye_look(
+                        &mut active.locals,
+                        &model.skeleton.rest,
+                        vrm.humanoid_node("leftEye"),
+                        vrm.humanoid_node("rightEye"),
+                        &vrm.look_at,
+                        yaw,
+                        pitch,
+                    );
                 }
             }
-        }
 
-        // --- guest turn -------------------------------------------------
-        let mut events: Vec<TickEvent> = std::mem::take(&mut self.pending_events);
-        for _ in 0..self.pending_character_clicks {
-            events.push(TickEvent::Click);
-        }
-        self.pending_character_clicks = 0;
-        let state = TickState {
-            t: self.tick_count as f64 * dt as f64,
-            blink: out.blink,
-            clip: self
-                .clips
-                .get(self.clip_index)
-                .map(|(n, _)| n.clone())
-                .unwrap_or_default(),
-            hovered: self.hovered,
-            tracking: match self.sim.tracking {
-                TrackingMode::None => "none",
-                TrackingMode::Mouse => "mouse",
-            },
-            fps: self.stats.fps(),
-            frame_ms: self.stats.frame_ms(),
-        };
-        if let Some(guest) = &self.guest {
-            match guest.turn(&state, &events) {
-                Ok(commands) => self.apply_commands(commands),
-                Err(e) => log::error!("guest turn: {e:#}"),
+            // --- springs ------------------------------------------------
+            if let Some(springs) = active.springs.as_mut() {
+                springs.step(dt, &model.skeleton, &mut active.locals, Mat4::IDENTITY);
             }
+
+            // --- pose + blink ------------------------------------------
+            model
+                .skeleton
+                .globals_from_locals(&active.locals, &mut active.globals);
+            let scene_slot = active.scene_slot;
+            let inst = scene_slot.get_mut(&mut self.scene);
+            inst.pose = Some(active.globals.clone());
+            if out.blink_changed {
+                if let Some(morph) = inst.morph.as_mut() {
+                    for &(slot, target, w) in &active.blink_binds {
+                        morph.set_weight(slot, target, out.blink * w);
+                    }
+                }
+            }
+
+            // --- guest turn ---------------------------------------------
+            let mut events: Vec<TickEvent> = std::mem::take(&mut self.pending_events);
+            for _ in 0..self.pending_character_clicks {
+                events.push(TickEvent::Click);
+            }
+            self.pending_character_clicks = 0;
+            let state = TickState {
+                t: self.tick_count as f64 * dt as f64,
+                blink: out.blink,
+                clip: active
+                    .clips
+                    .get(active.animation.clip_index)
+                    .map(|(n, _)| n.clone())
+                    .unwrap_or_default(),
+                hovered: self.hovered,
+                tracking: match active.sim.tracking {
+                    TrackingMode::None => "none",
+                    TrackingMode::Mouse => "mouse",
+                },
+                fps: self.stats.fps(),
+                frame_ms: self.stats.frame_ms(),
+            };
+            active.guest.turn(&state, &events)
+        };
+        match guest_turn {
+            Ok(commands) => self.apply_commands(commands),
+            Err(e) => log::error!("guest turn: {e:#}"),
         }
 
         self.stats.record(t0.elapsed().as_secs_f32() * 1000.0);
@@ -1573,46 +1585,47 @@ impl Game for Widget {
 
     fn prepare_render(&mut self, gpu: &Gpu, renderer: &mut Renderer) {
         let requests = self.aa.take_pending_requests();
-        if requests.is_empty() {
-            return;
+        if !requests.is_empty() {
+            let mut accepted_msaa = None;
+            if let Some(requested) = requests.msaa {
+                renderer.set_requested_sample_count(gpu, requested);
+                accepted_msaa = requests.accepted_msaa(renderer.requested_sample_count());
+                if accepted_msaa.is_none() {
+                    log::warn!(
+                        "renderer rejected requested MSAA {}; keeping persisted preference",
+                        diagnostics::format_msaa_count(requested)
+                    );
+                }
+            }
+
+            let mut accepted_smaa = None;
+            if let Some(enabled) = requests.smaa {
+                renderer.set_smaa_enabled(gpu, enabled);
+                accepted_smaa = requests.accepted_smaa(renderer.smaa_enabled());
+                if accepted_smaa.is_none() {
+                    log::warn!(
+                        "renderer rejected requested SMAA {}; keeping persisted preference",
+                        if enabled { "on" } else { "off" }
+                    );
+                }
+            }
+
+            self.aa.sync_after_application(
+                renderer.requested_sample_count(),
+                renderer.effective_sample_count(),
+                renderer.smaa_enabled(),
+            );
+            self.commit_accepted_aa_preferences(accepted_msaa, accepted_smaa);
+            let aa = self.aa.status();
+            log::info!(
+                "AA: requested {}, effective MSAA {}, SMAA {}",
+                diagnostics::format_msaa_count(aa.requested_msaa),
+                diagnostics::format_msaa_count(aa.effective_msaa),
+                if aa.smaa_enabled { "on" } else { "off" }
+            );
         }
 
-        let mut accepted_msaa = None;
-        if let Some(requested) = requests.msaa {
-            renderer.set_requested_sample_count(gpu, requested);
-            accepted_msaa = requests.accepted_msaa(renderer.requested_sample_count());
-            if accepted_msaa.is_none() {
-                log::warn!(
-                    "renderer rejected requested MSAA {}; keeping persisted preference",
-                    diagnostics::format_msaa_count(requested)
-                );
-            }
-        }
-        let mut accepted_smaa = None;
-        if let Some(enabled) = requests.smaa {
-            renderer.set_smaa_enabled(gpu, enabled);
-            accepted_smaa = requests.accepted_smaa(renderer.smaa_enabled());
-            if accepted_smaa.is_none() {
-                log::warn!(
-                    "renderer rejected requested SMAA {}; keeping persisted preference",
-                    if enabled { "on" } else { "off" }
-                );
-            }
-        }
-
-        self.aa.sync_after_application(
-            renderer.requested_sample_count(),
-            renderer.effective_sample_count(),
-            renderer.smaa_enabled(),
-        );
-        self.commit_accepted_aa_preferences(accepted_msaa, accepted_smaa);
-        let aa = self.aa.status();
-        log::info!(
-            "AA: requested {}, effective MSAA {}, SMAA {}",
-            diagnostics::format_msaa_count(aa.requested_msaa),
-            diagnostics::format_msaa_count(aa.effective_msaa),
-            if aa.smaa_enabled { "on" } else { "off" }
-        );
+        self.process_pending_avatar_request(gpu, renderer);
     }
 
     fn compose(&mut self, _alpha: f32, time: f32, size: (u32, u32)) -> (&Scene, &Camera, &Hud) {

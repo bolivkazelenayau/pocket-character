@@ -12,7 +12,9 @@ console.log(
 
 // airi VRM defaults: tracking mode "none", idle_loop.vrma looped.
 character.setTracking("none");
-character.playClip("idle_loop", true);
+if (character.__boot.clips.includes("idle_loop")) {
+  character.playClip("idle_loop", true);
+}
 
 let lastStatsLog = 0;
 onTick((state, events) => {
