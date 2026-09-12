@@ -13,7 +13,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, ensure};
 use glam::{Mat4, Vec3};
 use pocket_character_core::CharacterSim;
-use pocket_vrm::{SpringSolver, Vrm1Doc, VrmDoc};
+use pocket_vrm::{HumanoidView, SpringSolver, Vrm1Doc, VrmDoc, retarget_with_humanoid};
 use pocket3d::anim::{Clip, NodeTrs};
 use pocket3d::gpu::Gpu;
 use pocket3d::model::{ModelAsset, ModelInstance, ModelLoadOptions};
@@ -227,10 +227,20 @@ impl AvatarSceneSlot {
 
 /// A future file-picker or other parent-side producer can feed this request
 /// into the pending seam.  It carries no UI state and performs no I/O itself.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum VrmaProvenance {
+    OptionalDefault,
+    Explicit,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AvatarLoadRequest {
     pub(super) model_path: PathBuf,
     pub(super) vrma_path: Option<PathBuf>,
+    /// Retained separately from the path so a future explicitly selected
+    /// VRMA can use a strict failure policy without changing this seam.
+    pub(super) vrma_provenance: Option<VrmaProvenance>,
     pub(super) model_name: String,
 }
 
@@ -240,9 +250,11 @@ impl AvatarLoadRequest {
         vrma_path: Option<PathBuf>,
         model_name: impl Into<String>,
     ) -> Self {
+        let vrma_provenance = vrma_path.as_ref().map(|_| VrmaProvenance::OptionalDefault);
         Self {
             model_path,
             vrma_path,
+            vrma_provenance,
             model_name: model_name.into(),
         }
     }
@@ -252,6 +264,7 @@ impl AvatarLoadRequest {
 /// UI never receives this path and cancellation is represented by `None`.
 pub(crate) fn avatar_request_from_picker_result(
     selected: Option<PathBuf>,
+    default_vrma_path: &Path,
 ) -> Option<AvatarLoadRequest> {
     let path = selected?;
     let extension = path.extension()?.to_str()?;
@@ -259,7 +272,36 @@ pub(crate) fn avatar_request_from_picker_result(
         return None;
     }
     let model_name = avatar_model_name(path.file_stem());
-    Some(AvatarLoadRequest::new(path, None, model_name))
+    Some(AvatarLoadRequest::new(
+        path,
+        Some(default_vrma_path.to_owned()),
+        model_name,
+    ))
+}
+
+pub(super) fn startup_avatar_request(
+    model_path: PathBuf,
+    default_vrma_path: PathBuf,
+) -> AvatarLoadRequest {
+    AvatarLoadRequest::new(model_path, Some(default_vrma_path), "AvatarSample_A")
+}
+
+fn stage_vrma_clip(
+    provenance: Option<VrmaProvenance>,
+    load: impl FnOnce() -> Result<(String, Clip)>,
+) -> Result<Option<(String, Clip)>> {
+    match load() {
+        Ok(clip) => Ok(Some(clip)),
+        Err(error) if provenance == Some(VrmaProvenance::OptionalDefault) => {
+            log::warn!("optional default VRMA unavailable; continuing in rest pose: {error:#}");
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn fresh_animation_state() -> AvatarAnimationState {
+    AvatarAnimationState::default()
 }
 
 fn avatar_model_name(file_stem: Option<&std::ffi::OsStr>) -> String {
@@ -549,21 +591,35 @@ impl AvatarCandidate {
         .map_err(|error| AvatarRuntimeError::new(AvatarLoadErrorKind::ModelLoad, &error))?;
 
         let mut clips = Vec::new();
-        if let (Some(vrm0), Some(vrma_path)) = (document.vrm0(), request.vrma_path.as_ref()) {
-            let vrma_bytes = std::fs::read(vrma_path)
-                .with_context(|| format!("reading vrma {}", vrma_path.display()))
-                .map_err(|error| AvatarRuntimeError::new(AvatarLoadErrorKind::ModelLoad, &error))?;
-            let vrma = pocket_vrm::load_vrma_bytes(&vrma_bytes)
-                .context("parsing VRMA animation")
-                .map_err(|error| AvatarRuntimeError::new(AvatarLoadErrorKind::ModelLoad, &error))?;
-            let clip = pocket_vrm::retarget(&vrma, &vrm0.humanoid, &model.skeleton)
-                .context("retargeting VRMA animation")
-                .map_err(|error| AvatarRuntimeError::new(AvatarLoadErrorKind::ModelLoad, &error))?;
-            let clip_name = vrma_path
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "idle".into());
-            clips.push((clip_name, clip));
+        if let Some(vrma_path) = request.vrma_path.as_ref() {
+            let clip = stage_vrma_clip(request.vrma_provenance, || {
+                let vrma_bytes = std::fs::read(vrma_path)
+                    .with_context(|| format!("reading vrma {}", vrma_path.display()))?;
+                let vrma =
+                    pocket_vrm::load_vrma_bytes(&vrma_bytes).context("parsing VRMA animation")?;
+                let clip = match &document {
+                    AvatarSemanticDocument::Vrm0(vrm0) => retarget_with_humanoid(
+                        &vrma,
+                        HumanoidView::Vrm0(&vrm0.humanoid),
+                        &model.skeleton,
+                    ),
+                    AvatarSemanticDocument::Vrm1(vrm1) => retarget_with_humanoid(
+                        &vrma,
+                        HumanoidView::Vrm1(&vrm1.humanoid),
+                        &model.skeleton,
+                    ),
+                }
+                .context("retargeting VRMA animation")?;
+                let clip_name = vrma_path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "idle".into());
+                Ok((clip_name, clip))
+            })
+            .map_err(|error| AvatarRuntimeError::new(AvatarLoadErrorKind::ModelLoad, &error))?;
+            if let Some(clip) = clip {
+                clips.push(clip);
+            }
         }
 
         let mut locals = Vec::new();
@@ -667,7 +723,7 @@ impl AvatarCandidate {
                 capabilities,
                 guest,
                 sim,
-                animation: AvatarAnimationState::default(),
+                animation: fresh_animation_state(),
             },
         )
     }
@@ -707,6 +763,8 @@ pub(super) fn revalidate_camera_adjustments(
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use super::*;
     use crate::settings::CameraSettings;
 
@@ -715,6 +773,95 @@ mod tests {
             (actual - expected).abs().max_element() < 1.0e-5,
             "{actual:?} != {expected:?}"
         );
+    }
+
+    fn glb_with_json_and_bin(json: &Value, bin: &[u8]) -> Vec<u8> {
+        let mut json_bytes = serde_json::to_vec(json).unwrap();
+        while !json_bytes.len().is_multiple_of(4) {
+            json_bytes.push(b' ');
+        }
+        let mut bin_bytes = bin.to_vec();
+        while !bin_bytes.len().is_multiple_of(4) {
+            bin_bytes.push(0);
+        }
+        let total = 12 + 8 + json_bytes.len() + 8 + bin_bytes.len();
+        let mut glb = Vec::with_capacity(total);
+        glb.extend_from_slice(b"glTF");
+        glb.extend_from_slice(&2u32.to_le_bytes());
+        glb.extend_from_slice(&(total as u32).to_le_bytes());
+        glb.extend_from_slice(&(json_bytes.len() as u32).to_le_bytes());
+        glb.extend_from_slice(b"JSON");
+        glb.extend_from_slice(&json_bytes);
+        glb.extend_from_slice(&(bin_bytes.len() as u32).to_le_bytes());
+        glb.extend_from_slice(b"BIN\0");
+        glb.extend_from_slice(&bin_bytes);
+        glb
+    }
+
+    fn generated_vrm1_avatar() -> (tempfile::NamedTempFile, usize, usize) {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let source_bytes = std::fs::read(root.join("assets/AvatarSample_A.vrm")).unwrap();
+        let source = VrmDoc::from_glb_bytes(&source_bytes).unwrap();
+        let source_glb = pocket_vrm::glb::parse_glb(&source_bytes).unwrap();
+
+        // Keep the generated fixture minimal at the semantic layer while
+        // reusing the real model's valid geometry and accessors.
+        let required_bones = [
+            "hips",
+            "spine",
+            "head",
+            "leftUpperLeg",
+            "leftLowerLeg",
+            "leftFoot",
+            "rightUpperLeg",
+            "rightLowerLeg",
+            "rightFoot",
+            "leftUpperArm",
+            "leftLowerArm",
+            "leftHand",
+            "rightUpperArm",
+            "rightLowerArm",
+            "rightHand",
+        ];
+        let mut human_bones = serde_json::Map::new();
+        for (name, node) in &source.humanoid {
+            if required_bones.contains(&name.as_str()) {
+                human_bones.insert(name.clone(), serde_json::json!({ "node": node }));
+            }
+        }
+
+        let mut json = source_glb.json;
+        json["extensions"] = serde_json::json!({
+            "VRMC_vrm": {
+                "specVersion": "1.0",
+                "meta": {
+                    "name": "Generated VRM1 test avatar",
+                    "authors": ["pocket-character tests"],
+                    "licenseUrl": "https://example.invalid/license"
+                },
+                "humanoid": { "humanBones": human_bones }
+            }
+        });
+        json["extensionsUsed"] =
+            serde_json::json!(["VRMC_vrm", "KHR_texture_transform", "KHR_materials_unlit"]);
+        json["extensionsRequired"] = serde_json::json!(["VRMC_vrm"]);
+
+        let root_node = source
+            .nodes
+            .parents
+            .iter()
+            .position(|&parent| parent == usize::MAX)
+            .unwrap();
+        let spine_node = source.humanoid_node("spine").unwrap();
+        let nodes = json["nodes"].as_array_mut().unwrap();
+        nodes[root_node]["scale"] = serde_json::json!([0.001, 0.001, 0.001]);
+        nodes[spine_node]["rotation"] =
+            serde_json::json!(glam::Quat::from_rotation_y(0.17).to_array());
+
+        let mut file = tempfile::Builder::new().suffix(".vrm").tempfile().unwrap();
+        file.write_all(&glb_with_json_and_bin(&json, source_glb.bin))
+            .unwrap();
+        (file, root_node, spine_node)
     }
 
     #[test]
@@ -841,6 +988,74 @@ mod tests {
     }
 
     #[test]
+    fn successful_optional_default_idle_is_advertised() {
+        let staged = stage_vrma_clip(Some(VrmaProvenance::OptionalDefault), || {
+            Ok((
+                "idle_loop".into(),
+                Clip {
+                    name: "idle_loop".into(),
+                    duration: 1.0,
+                    channels: Vec::new(),
+                },
+            ))
+        })
+        .unwrap();
+        let clips = vec![staged.unwrap()];
+        let names = clips
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            AvatarCapabilities::advertised_idle_clip(&names),
+            Some("idle_loop".into())
+        );
+    }
+
+    #[test]
+    fn failed_optional_default_idle_keeps_avatar_preparation_nonfatal_and_unadvertised() {
+        let staged = stage_vrma_clip(Some(VrmaProvenance::OptionalDefault), || {
+            Err(anyhow!("synthetic default idle failure"))
+        })
+        .unwrap();
+        assert!(staged.is_none());
+        let clips: Vec<(String, Clip)> = Vec::new();
+        let names = clips
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(AvatarCapabilities::advertised_idle_clip(&names), None);
+    }
+
+    #[test]
+    fn explicit_vrma_provenance_remains_strict() {
+        let result = stage_vrma_clip(Some(VrmaProvenance::Explicit), || {
+            Err(anyhow!("synthetic explicit animation failure"))
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn startup_and_open_avatar_requests_share_the_optional_default_idle_policy() {
+        let default_idle = PathBuf::from(r"C:\bundle\idle_loop.vrma");
+        let startup = startup_avatar_request(
+            PathBuf::from(r"C:\avatars\startup.vrm"),
+            default_idle.clone(),
+        );
+        let open = avatar_request_from_picker_result(
+            Some(PathBuf::from(r"C:\avatars\picked.vrm")),
+            &default_idle,
+        )
+        .unwrap();
+        assert_eq!(startup.vrma_path, Some(default_idle.clone()));
+        assert_eq!(open.vrma_path, Some(default_idle));
+        assert_eq!(
+            startup.vrma_provenance,
+            Some(VrmaProvenance::OptionalDefault)
+        );
+        assert_eq!(open.vrma_provenance, Some(VrmaProvenance::OptionalDefault));
+    }
+
+    #[test]
     fn picker_cancel_produces_no_avatar_request() {
         let previous_request =
             AvatarLoadRequest::new(PathBuf::from(r"C:\avatars\current.vrm"), None, "Current");
@@ -852,7 +1067,7 @@ mod tests {
         ));
         let previous_status = status.clone();
 
-        let request = avatar_request_from_picker_result(None);
+        let request = avatar_request_from_picker_result(None, Path::new("idle_loop.vrma"));
         if let Some(request) = request {
             pending = Some(request);
             status.begin_loading();
@@ -862,28 +1077,42 @@ mod tests {
     }
 
     #[test]
-    fn picker_path_maps_to_vrm_request_without_vrma() {
-        let request =
-            avatar_request_from_picker_result(Some(PathBuf::from(r"C:\avatars\Sample Avatar.VRM")))
-                .unwrap();
+    fn picker_path_maps_to_vrm_request_with_optional_default_vrma() {
+        let request = avatar_request_from_picker_result(
+            Some(PathBuf::from(r"C:\avatars\Sample Avatar.VRM")),
+            Path::new(r"C:\bundle\idle_loop.vrma"),
+        )
+        .unwrap();
         assert_eq!(
             request.model_path,
             PathBuf::from(r"C:\avatars\Sample Avatar.VRM")
         );
-        assert_eq!(request.vrma_path, None);
+        assert_eq!(
+            request.vrma_path,
+            Some(PathBuf::from(r"C:\bundle\idle_loop.vrma"))
+        );
+        assert_eq!(
+            request.vrma_provenance,
+            Some(VrmaProvenance::OptionalDefault)
+        );
         assert_eq!(request.model_name, "Sample Avatar");
     }
 
     #[test]
     fn picker_display_name_and_fallback_are_observable() {
-        let request =
-            avatar_request_from_picker_result(Some(PathBuf::from(r"C:\avatars\Sample Avatar.VRM")))
-                .unwrap();
+        let request = avatar_request_from_picker_result(
+            Some(PathBuf::from(r"C:\avatars\Sample Avatar.VRM")),
+            Path::new(r"C:\bundle\idle_loop.vrma"),
+        )
+        .unwrap();
         assert_eq!(request.model_name, "Sample Avatar");
         assert_eq!(avatar_model_name(None), "Avatar");
         assert!(
-            avatar_request_from_picker_result(Some(PathBuf::from(r"C:\avatars\sample.txt",)))
-                .is_none()
+            avatar_request_from_picker_result(
+                Some(PathBuf::from(r"C:\avatars\sample.txt")),
+                Path::new(r"C:\bundle\idle_loop.vrma"),
+            )
+            .is_none()
         );
     }
 
@@ -1037,13 +1266,97 @@ mod tests {
 
     #[test]
     fn avatar_animation_runtime_starts_reset_for_each_candidate() {
+        let old_state = AvatarAnimationState {
+            clip_index: 4,
+            clip_time: 3.5,
+            clip_looping: false,
+        };
         assert_eq!(
-            AvatarAnimationState::default(),
+            fresh_animation_state(),
             AvatarAnimationState {
                 clip_index: 0,
                 clip_time: 0.0,
                 clip_looping: true,
             }
+        );
+        assert_ne!(fresh_animation_state(), old_state);
+    }
+
+    #[test]
+    fn real_candidate_handles_optional_default_idle_success_and_failure() {
+        let gpu = Gpu::new_headless().expect("headless GPU is required for candidate smoke tests");
+        let renderer = Renderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT).unwrap();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let model_path = root.join("assets/AvatarSample_A.vrm");
+        let bundle_path = root.join("dist/character.js");
+        let idle_path = root.join("assets/idle_loop.vrma");
+
+        let success_request =
+            AvatarLoadRequest::new(model_path.clone(), Some(idle_path), "AvatarSample_A");
+        let success = AvatarCandidate::prepare(&gpu, &renderer, &bundle_path, &success_request)
+            .expect("bundled default idle should be optional but loadable");
+        assert!(success.clips.iter().any(|(name, _)| name == "idle_loop"));
+        assert_eq!(success.capabilities.idle_clip.as_deref(), Some("idle_loop"));
+
+        let failure_request = AvatarLoadRequest::new(
+            model_path,
+            Some(root.join("assets/optional-idle-does-not-exist.vrma")),
+            "AvatarSample_A",
+        );
+        let failure = AvatarCandidate::prepare(&gpu, &renderer, &bundle_path, &failure_request)
+            .expect("optional default idle failure must not fail avatar preparation");
+        assert!(failure.clips.is_empty());
+        assert_eq!(failure.capabilities.idle_clip, None);
+    }
+
+    #[test]
+    fn generated_vrm1_candidate_retargets_bundled_idle_end_to_end() {
+        let gpu = Gpu::new_headless().expect("headless GPU is required for VRM1 integration");
+        let renderer = Renderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT).unwrap();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let (model_file, root_node, spine_node) = generated_vrm1_avatar();
+        let request = AvatarLoadRequest::new(
+            model_file.path().to_owned(),
+            Some(root.join("assets/idle_loop.vrma")),
+            "GeneratedVrm1",
+        );
+
+        let candidate =
+            AvatarCandidate::prepare(&gpu, &renderer, &root.join("dist/character.js"), &request)
+                .expect("generated VRM1 candidate should load and retarget");
+
+        assert!(matches!(
+            &candidate.document,
+            AvatarSemanticDocument::Vrm1(_)
+        ));
+        assert_eq!(
+            candidate.asset.skeleton.rest[root_node].scale,
+            Vec3::splat(0.001)
+        );
+        assert!(
+            candidate.asset.skeleton.rest[spine_node]
+                .rotation
+                .angle_between(glam::Quat::from_rotation_y(0.17))
+                < 1.0e-5
+        );
+        assert_eq!(
+            candidate.capabilities.idle_clip.as_deref(),
+            Some("idle_loop")
+        );
+        let idle = candidate
+            .clips
+            .iter()
+            .find(|(name, _)| name == "idle_loop")
+            .map(|(_, clip)| clip)
+            .unwrap();
+        assert!(
+            idle.channels
+                .iter()
+                .any(|channel| channel.node == spine_node)
+        );
+        assert_eq!(
+            candidate.presentation.transform,
+            Mat4::from_rotation_y(core::f32::consts::PI)
         );
     }
 }

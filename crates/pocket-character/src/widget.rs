@@ -37,7 +37,7 @@ mod diagnostics;
 use aa::AaRuntime;
 use avatar::{
     ActiveAvatar, AvatarCandidate, AvatarLoadErrorKind, AvatarLoadRequest, AvatarLoadStatus,
-    AvatarRuntimeError, AvatarSceneSlot, avatar_request_from_picker_result,
+    AvatarRuntimeError, AvatarSceneSlot, avatar_request_from_picker_result, startup_avatar_request,
 };
 #[cfg(test)]
 use camera::CameraRuntimeAdjustments;
@@ -385,7 +385,8 @@ impl Widget {
                 .set_title("Open Avatar")
                 .add_filter("VRM avatar", &["vrm"])
                 .pick_file();
-            if let Some(request) = avatar_request_from_picker_result(selected) {
+            if let Some(request) = avatar_request_from_picker_result(selected, &self.cfg.vrma_path)
+            {
                 self.request_avatar_replacement(request);
             }
         }
@@ -1327,11 +1328,8 @@ impl Game for Widget {
             renderer.smaa_enabled(),
         );
 
-        let startup_request = AvatarLoadRequest::new(
-            self.cfg.model_path.clone(),
-            Some(self.cfg.vrma_path.clone()),
-            "AvatarSample_A",
-        );
+        let startup_request =
+            startup_avatar_request(self.cfg.model_path.clone(), self.cfg.vrma_path.clone());
         let candidate =
             AvatarCandidate::prepare(gpu, renderer, &self.cfg.bundle_path, &startup_request)?;
 
