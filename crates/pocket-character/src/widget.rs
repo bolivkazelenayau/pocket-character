@@ -33,6 +33,7 @@ mod avatar;
 mod camera;
 mod controls;
 mod diagnostics;
+mod expression;
 
 use aa::AaRuntime;
 use avatar::{
@@ -48,6 +49,7 @@ use camera::{
 };
 use controls::{ControlAction, ControlsSnapshot};
 use diagnostics::{FrameStats, RenderFps};
+use expression::ResolvedExpressionRuntime;
 
 pub struct WidgetConfig {
     pub model_path: PathBuf,
@@ -254,6 +256,7 @@ pub struct Widget {
     debug_backend: String,
     aa: AaRuntime,
     tick_count: u64,
+    last_blink: f32,
     hovered: bool,
     /// UI ownership is latched from the press edge until release. The same
     /// latch gates native dragging and CharacterGuest click delivery.
@@ -348,6 +351,7 @@ impl Widget {
             debug_backend: "unknown".into(),
             aa: AaRuntime::new(requested_msaa, requested_smaa),
             tick_count: 0,
+            last_blink: 0.0,
             hovered: false,
             menu_pointer_owned: false,
             pending_menu_press: None,
@@ -1220,6 +1224,7 @@ impl Widget {
     }
 
     fn apply_commands(&mut self, commands: Vec<Command>) {
+        let mut expressions_dirty = false;
         for cmd in commands {
             match cmd {
                 Command::SetTracking(mode) => {
@@ -1231,10 +1236,15 @@ impl Widget {
                     }
                 }
                 Command::SetExpression(name, w) => {
-                    let Some(active) = self.active_avatar.as_ref() else {
+                    let Some(active) = self.active_avatar.as_mut() else {
                         continue;
                     };
-                    apply_expression(active, &mut self.scene, &name, w);
+                    if matches!(&active.expressions, ResolvedExpressionRuntime::Vrm0Legacy) {
+                        apply_expression(active, &mut self.scene, &name, w);
+                    } else if let ResolvedExpressionRuntime::Vrm1(runtime) = &mut active.expressions
+                    {
+                        expressions_dirty |= runtime.set_input(&name, w);
+                    }
                 }
                 Command::PlayClip { name, looping } => {
                     if let Some(active) = self.active_avatar.as_mut() {
@@ -1258,6 +1268,13 @@ impl Widget {
                     }
                 }
                 Command::Quit => self.exit = true,
+            }
+        }
+        if expressions_dirty {
+            if let Some(active) = self.active_avatar.as_mut() {
+                if let ResolvedExpressionRuntime::Vrm1(runtime) = &mut active.expressions {
+                    runtime.compose_if_needed(&mut self.scene, active.scene_slot, self.last_blink);
+                }
             }
         }
     }
@@ -1489,14 +1506,23 @@ impl Game for Widget {
                 .skeleton
                 .globals_from_locals(&active.locals, &mut active.globals);
             let scene_slot = active.scene_slot;
-            let inst = scene_slot.get_mut(&mut self.scene);
-            inst.pose = Some(active.globals.clone());
-            if out.blink_changed {
-                if let Some(morph) = inst.morph.as_mut() {
-                    for &(slot, target, w) in &active.blink_binds {
-                        morph.set_weight(slot, target, out.blink * w);
+            {
+                let inst = scene_slot.get_mut(&mut self.scene);
+                inst.pose = Some(active.globals.clone());
+            }
+            match &mut active.expressions {
+                ResolvedExpressionRuntime::Vrm0Legacy if out.blink_changed => {
+                    let inst = scene_slot.get_mut(&mut self.scene);
+                    if let Some(morph) = inst.morph.as_mut() {
+                        for &(slot, target, w) in &active.blink_binds {
+                            morph.set_weight(slot, target, out.blink * w);
+                        }
                     }
                 }
+                ResolvedExpressionRuntime::Vrm1(runtime) => {
+                    runtime.compose_if_needed(&mut self.scene, scene_slot, out.blink);
+                }
+                ResolvedExpressionRuntime::Vrm0Legacy => {}
             }
 
             // --- guest turn ---------------------------------------------
@@ -1521,11 +1547,15 @@ impl Game for Widget {
                 fps: self.stats.fps(),
                 frame_ms: self.stats.frame_ms(),
             };
-            active.guest.turn(&state, &events)
+            let blink = out.blink;
+            (active.guest.turn(&state, &events), blink)
         };
         match guest_turn {
-            Ok(commands) => self.apply_commands(commands),
-            Err(e) => log::error!("guest turn: {e:#}"),
+            (Ok(commands), blink) => {
+                self.last_blink = blink;
+                self.apply_commands(commands)
+            }
+            (Err(e), _) => log::error!("guest turn: {e:#}"),
         }
 
         self.stats.record(t0.elapsed().as_secs_f32() * 1000.0);

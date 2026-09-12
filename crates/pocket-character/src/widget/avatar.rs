@@ -23,6 +23,8 @@ use serde_json::Value;
 
 use crate::guest::CharacterGuest;
 
+use super::expression::{ResolvedExpressionRuntime, resolve_vrm1};
+
 #[cfg(test)]
 use super::camera::CameraRuntimeAdjustments;
 
@@ -153,6 +155,7 @@ impl AvatarCapabilities {
         model_name: String,
         document: &AvatarSemanticDocument,
         clips: &[(String, Clip)],
+        expressions: &ResolvedExpressionRuntime,
     ) -> Self {
         let clip_names = clips
             .iter()
@@ -162,7 +165,10 @@ impl AvatarCapabilities {
         Self {
             model_name,
             clip_names,
-            expression_names: document.expression_names(),
+            expression_names: match expressions {
+                ResolvedExpressionRuntime::Vrm0Legacy => document.expression_names(),
+                ResolvedExpressionRuntime::Vrm1(runtime) => runtime.capability_names(),
+            },
             idle_clip,
         }
     }
@@ -528,6 +534,7 @@ pub(super) struct AvatarCandidate {
     pub(super) clips: Vec<(String, Clip)>,
     pub(super) springs: Option<SpringSolver>,
     pub(super) blink_binds: Vec<(usize, usize, f32)>,
+    pub(super) expressions: ResolvedExpressionRuntime,
     pub(super) capabilities: AvatarCapabilities,
     pub(super) guest: CharacterGuest,
     pub(super) sim: CharacterSim,
@@ -622,6 +629,13 @@ impl AvatarCandidate {
             }
         }
 
+        let expressions = match &document {
+            AvatarSemanticDocument::Vrm0(_) => ResolvedExpressionRuntime::Vrm0Legacy,
+            AvatarSemanticDocument::Vrm1(vrm1) => resolve_vrm1(vrm1, &model)
+                .context("resolving VRM 1.0 expressions")
+                .map_err(|error| AvatarRuntimeError::new(AvatarLoadErrorKind::ModelLoad, &error))?,
+        };
+
         let mut locals = Vec::new();
         model.skeleton.sample_locals(None, 0.0, false, &mut locals);
         let mut globals = Vec::new();
@@ -658,8 +672,12 @@ impl AvatarCandidate {
             .map_err(|error| {
                 AvatarRuntimeError::new(AvatarLoadErrorKind::RuntimeStartup, &error)
             })?;
-        let capabilities =
-            AvatarCapabilities::for_candidate(request.model_name.clone(), &document, &clips);
+        let capabilities = AvatarCapabilities::for_candidate(
+            request.model_name.clone(),
+            &document,
+            &clips,
+            &expressions,
+        );
         let guest = CharacterGuest::boot(
             &bundle,
             &capabilities.model_name,
@@ -685,6 +703,7 @@ impl AvatarCandidate {
             clips,
             springs,
             blink_binds,
+            expressions,
             capabilities,
             guest,
             sim: CharacterSim::new(AVATAR_SIM_SEED, Vec3::ZERO),
@@ -703,6 +722,7 @@ impl AvatarCandidate {
             clips,
             springs,
             blink_binds,
+            expressions,
             capabilities,
             guest,
             sim,
@@ -720,6 +740,7 @@ impl AvatarCandidate {
                 clips,
                 springs,
                 blink_binds,
+                expressions,
                 capabilities,
                 guest,
                 sim,
@@ -742,6 +763,7 @@ pub(super) struct ActiveAvatar {
     pub(super) clips: Vec<(String, Clip)>,
     pub(super) springs: Option<SpringSolver>,
     pub(super) blink_binds: Vec<(usize, usize, f32)>,
+    pub(super) expressions: ResolvedExpressionRuntime,
     #[allow(dead_code)]
     pub(super) capabilities: AvatarCapabilities,
     pub(super) guest: CharacterGuest,
@@ -798,7 +820,7 @@ mod tests {
         glb
     }
 
-    fn generated_vrm1_avatar() -> (tempfile::NamedTempFile, usize, usize) {
+    fn generated_vrm1_avatar() -> (tempfile::NamedTempFile, usize, usize, usize) {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let source_bytes = std::fs::read(root.join("assets/AvatarSample_A.vrm")).unwrap();
         let source = VrmDoc::from_glb_bytes(&source_bytes).unwrap();
@@ -831,6 +853,37 @@ mod tests {
         }
 
         let mut json = source_glb.json;
+        let expression_node =
+            {
+                let nodes = json["nodes"].as_array().unwrap();
+                let meshes = json["meshes"].as_array().unwrap();
+                let mut mesh_users = std::collections::HashMap::<usize, usize>::new();
+                for node in nodes {
+                    if let Some(mesh) = node.get("mesh").and_then(Value::as_u64) {
+                        *mesh_users.entry(mesh as usize).or_default() += 1;
+                    }
+                }
+                nodes
+                    .iter()
+                    .enumerate()
+                    .find_map(|(node_index, node)| {
+                        let mesh = node.get("mesh")?.as_u64()? as usize;
+                        if mesh_users.get(&mesh).copied() != Some(1) {
+                            return None;
+                        }
+                        let has_targets =
+                            meshes.get(mesh)?.get("primitives")?.as_array()?.iter().any(
+                                |primitive| {
+                                    primitive
+                                        .get("targets")
+                                        .and_then(Value::as_array)
+                                        .is_some_and(|targets| !targets.is_empty())
+                                },
+                            );
+                        has_targets.then_some(node_index)
+                    })
+                    .expect("AvatarSample_A should contain one uniquely-instanced morph mesh")
+            };
         json["extensions"] = serde_json::json!({
             "VRMC_vrm": {
                 "specVersion": "1.0",
@@ -839,7 +892,16 @@ mod tests {
                     "authors": ["pocket-character tests"],
                     "licenseUrl": "https://example.invalid/license"
                 },
-                "humanoid": { "humanBones": human_bones }
+                "humanoid": { "humanBones": human_bones },
+                "expressions": {
+                    "preset": {
+                        "blink": {
+                            "morphTargetBinds": [
+                                { "node": expression_node, "index": 1, "weight": 1.0 }
+                            ]
+                        }
+                    }
+                }
             }
         });
         json["extensionsUsed"] =
@@ -861,7 +923,7 @@ mod tests {
         let mut file = tempfile::Builder::new().suffix(".vrm").tempfile().unwrap();
         file.write_all(&glb_with_json_and_bin(&json, source_glb.bin))
             .unwrap();
-        (file, root_node, spine_node)
+        (file, root_node, spine_node, expression_node)
     }
 
     #[test]
@@ -1314,7 +1376,7 @@ mod tests {
         let gpu = Gpu::new_headless().expect("headless GPU is required for VRM1 integration");
         let renderer = Renderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT).unwrap();
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let (model_file, root_node, spine_node) = generated_vrm1_avatar();
+        let (model_file, root_node, spine_node, expression_node) = generated_vrm1_avatar();
         let request = AvatarLoadRequest::new(
             model_file.path().to_owned(),
             Some(root.join("assets/idle_loop.vrma")),
@@ -1327,7 +1389,8 @@ mod tests {
 
         assert!(matches!(
             &candidate.document,
-            AvatarSemanticDocument::Vrm1(_)
+            AvatarSemanticDocument::Vrm1(document)
+                if document.node_meshes[expression_node].is_some()
         ));
         assert_eq!(
             candidate.asset.skeleton.rest[root_node].scale,
@@ -1343,6 +1406,25 @@ mod tests {
             candidate.capabilities.idle_clip.as_deref(),
             Some("idle_loop")
         );
+        assert_eq!(candidate.capabilities.expression_names, ["blink"]);
+        assert!(matches!(
+            &candidate.expressions,
+            ResolvedExpressionRuntime::Vrm1(runtime)
+                if runtime
+                    .expressions
+                    .iter()
+                    .any(|expression| expression.name == "blink" && !expression.morph_binds.is_empty())
+        ));
+        let (mesh_slot, target) = match &candidate.expressions {
+            ResolvedExpressionRuntime::Vrm1(runtime) => runtime
+                .expressions
+                .iter()
+                .find(|expression| expression.name == "blink")
+                .and_then(|expression| expression.morph_binds.first())
+                .map(|bind| (bind.mesh_slot, bind.target))
+                .unwrap(),
+            ResolvedExpressionRuntime::Vrm0Legacy => unreachable!(),
+        };
         let idle = candidate
             .clips
             .iter()
@@ -1357,6 +1439,22 @@ mod tests {
         assert_eq!(
             candidate.presentation.transform,
             Mat4::from_rotation_y(core::f32::consts::PI)
+        );
+
+        let (instance, mut active) = candidate.into_parts(AvatarSceneSlot::new(0));
+        let mut scene = Scene::default();
+        scene.models.push(instance);
+        if let ResolvedExpressionRuntime::Vrm1(runtime) = &mut active.expressions {
+            assert!(runtime.set_input("blink", 1.0));
+            runtime.compose_if_needed(&mut scene, active.scene_slot, 0.0);
+        }
+        assert_eq!(
+            scene.models[0]
+                .morph
+                .as_ref()
+                .unwrap()
+                .weight(mesh_slot, target),
+            1.0
         );
     }
 }
