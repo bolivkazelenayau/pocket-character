@@ -333,7 +333,10 @@ fn vrm0_allowed_required_extensions() -> [&'static str; 1] {
     ["VRM"]
 }
 
-fn vrm1_allowed_required_extensions(json: &Value) -> Result<Vec<&'static str>> {
+fn vrm1_allowed_required_extensions(
+    json: &Value,
+    spring_bone_supported: bool,
+) -> Result<Vec<&'static str>> {
     let materials = match json.get("materials") {
         None => &[][..],
         Some(value) => value
@@ -369,8 +372,18 @@ fn vrm1_allowed_required_extensions(json: &Value) -> Result<Vec<&'static str>> {
         // existing renderer understands.
         allowed.push("VRMC_materials_mtoon");
     }
-    // Spring bones and node constraints are intentionally not allowlisted:
-    // this slice does not implement either runtime semantic.
+    if json
+        .get("extensions")
+        .and_then(Value::as_object)
+        .is_some_and(|extensions| extensions.contains_key("VRMC_springBone"))
+    {
+        ensure!(
+            spring_bone_supported,
+            "VRMC_springBone is present but its supported 1.0 semantics were not parsed"
+        );
+        allowed.push("VRMC_springBone");
+    }
+    // Node constraints remain intentionally unsupported.
     Ok(allowed)
 }
 
@@ -577,10 +590,17 @@ impl AvatarCandidate {
                     .map_err(|error| {
                         AvatarRuntimeError::new(AvatarLoadErrorKind::VrmParse, &error)
                     })?;
-                let allowed_required_extensions = vrm1_allowed_required_extensions(&glb.json)
-                    .map_err(|error| {
-                        AvatarRuntimeError::new(AvatarLoadErrorKind::UnsupportedVrm, &error)
-                    })?;
+                let spring_bone_supported = matches!(
+                    &document,
+                    AvatarSemanticDocument::Vrm1(document)
+                        if document.spring_bone_semantics.is_some()
+                );
+                let allowed_required_extensions =
+                    vrm1_allowed_required_extensions(&glb.json, spring_bone_supported).map_err(
+                        |error| {
+                            AvatarRuntimeError::new(AvatarLoadErrorKind::UnsupportedVrm, &error)
+                        },
+                    )?;
                 ModelAsset::load_glb_bytes_opts_with_allowed_required_extensions(
                     gpu,
                     &renderer.model_material_layout,
@@ -641,9 +661,16 @@ impl AvatarCandidate {
         let mut globals = Vec::new();
         model.skeleton.globals_from_locals(&locals, &mut globals);
 
-        let springs = document
-            .vrm0()
-            .map(|vrm0| SpringSolver::new(&vrm0.springs, &model.skeleton, &locals));
+        let springs = match &document {
+            AvatarSemanticDocument::Vrm0(vrm0) => {
+                Some(SpringSolver::new(&vrm0.springs, &model.skeleton, &locals))
+            }
+            AvatarSemanticDocument::Vrm1(vrm1) => {
+                vrm1.spring_bone_semantics.as_ref().and_then(|spring_bone| {
+                    SpringSolver::new_vrm1(spring_bone, &model.skeleton, &locals)
+                })
+            }
+        };
 
         let mut blink_binds = Vec::new();
         if let Some(vrm0) = document.vrm0() {
@@ -820,7 +847,9 @@ mod tests {
         glb
     }
 
-    fn generated_vrm1_avatar() -> (tempfile::NamedTempFile, usize, usize, usize) {
+    fn generated_vrm1_avatar(
+        with_spring_bone: bool,
+    ) -> (tempfile::NamedTempFile, usize, usize, usize) {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let source_bytes = std::fs::read(root.join("assets/AvatarSample_A.vrm")).unwrap();
         let source = VrmDoc::from_glb_bytes(&source_bytes).unwrap();
@@ -904,10 +933,6 @@ mod tests {
                 }
             }
         });
-        json["extensionsUsed"] =
-            serde_json::json!(["VRMC_vrm", "KHR_texture_transform", "KHR_materials_unlit"]);
-        json["extensionsRequired"] = serde_json::json!(["VRMC_vrm"]);
-
         let root_node = source
             .nodes
             .parents
@@ -916,9 +941,38 @@ mod tests {
             .unwrap();
         let spine_node = source.humanoid_node("spine").unwrap();
         let nodes = json["nodes"].as_array_mut().unwrap();
+        let tail_node = nodes[spine_node]["children"]
+            .as_array()
+            .and_then(|children| children.first())
+            .and_then(Value::as_u64)
+            .expect("generated spine should have a child") as usize;
         nodes[root_node]["scale"] = serde_json::json!([0.001, 0.001, 0.001]);
         nodes[spine_node]["rotation"] =
             serde_json::json!(glam::Quat::from_rotation_y(0.17).to_array());
+        if with_spring_bone {
+            json["extensions"]["VRMC_springBone"] = serde_json::json!({
+                "specVersion": "1.0",
+                "springs": [{
+                    "name": "generated",
+                    "joints": [{ "node": spine_node }, { "node": tail_node }]
+                }]
+            });
+        }
+        json["extensionsUsed"] = if with_spring_bone {
+            serde_json::json!([
+                "VRMC_vrm",
+                "VRMC_springBone",
+                "KHR_texture_transform",
+                "KHR_materials_unlit"
+            ])
+        } else {
+            serde_json::json!(["VRMC_vrm", "KHR_texture_transform", "KHR_materials_unlit"])
+        };
+        json["extensionsRequired"] = if with_spring_bone {
+            serde_json::json!(["VRMC_vrm", "VRMC_springBone"])
+        } else {
+            serde_json::json!(["VRMC_vrm"])
+        };
 
         let mut file = tempfile::Builder::new().suffix(".vrm").tempfile().unwrap();
         file.write_all(&glb_with_json_and_bin(&json, source_glb.bin))
@@ -1291,7 +1345,7 @@ mod tests {
             }]
         });
         assert_eq!(
-            vrm1_allowed_required_extensions(&json).unwrap(),
+            vrm1_allowed_required_extensions(&json, false).unwrap(),
             ["VRMC_vrm", "VRMC_materials_mtoon"]
         );
 
@@ -1302,7 +1356,7 @@ mod tests {
                 }
             }]
         });
-        let error = vrm1_allowed_required_extensions(&json).unwrap_err();
+        let error = vrm1_allowed_required_extensions(&json, false).unwrap_err();
         assert!(format!("{error:#}").contains("KHR_materials_unlit"));
 
         let json = serde_json::json!({
@@ -1313,7 +1367,7 @@ mod tests {
                 }
             }]
         });
-        let error = vrm1_allowed_required_extensions(&json).unwrap_err();
+        let error = vrm1_allowed_required_extensions(&json, false).unwrap_err();
         assert!(format!("{error:#}").contains("KHR_materials_unlit"));
     }
 
@@ -1321,8 +1375,20 @@ mod tests {
     fn vrm1_allowlist_does_not_claim_spring_or_constraint_runtime_support() {
         let json = serde_json::json!({"materials": []});
         assert_eq!(
-            vrm1_allowed_required_extensions(&json).unwrap(),
+            vrm1_allowed_required_extensions(&json, false).unwrap(),
             ["VRMC_vrm"]
+        );
+    }
+
+    #[test]
+    fn vrm1_allowlist_accepts_spring_only_after_semantic_parse() {
+        let json = serde_json::json!({
+            "extensions": {"VRMC_springBone": {"specVersion": "1.0"}}
+        });
+        assert!(vrm1_allowed_required_extensions(&json, false).is_err());
+        assert_eq!(
+            vrm1_allowed_required_extensions(&json, true).unwrap(),
+            ["VRMC_vrm", "VRMC_springBone"]
         );
     }
 
@@ -1376,7 +1442,7 @@ mod tests {
         let gpu = Gpu::new_headless().expect("headless GPU is required for VRM1 integration");
         let renderer = Renderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT).unwrap();
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let (model_file, root_node, spine_node, expression_node) = generated_vrm1_avatar();
+        let (model_file, root_node, spine_node, expression_node) = generated_vrm1_avatar(false);
         let request = AvatarLoadRequest::new(
             model_file.path().to_owned(),
             Some(root.join("assets/idle_loop.vrma")),
@@ -1455,6 +1521,27 @@ mod tests {
                 .unwrap()
                 .weight(mesh_slot, target),
             1.0
+        );
+    }
+
+    #[test]
+    fn generated_vrm1_candidate_builds_spring_solver() {
+        let gpu = Gpu::new_headless().expect("headless GPU is required for VRM1 integration");
+        let renderer = Renderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT).unwrap();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let (model_file, _, _, _) = generated_vrm1_avatar(true);
+        let request =
+            AvatarLoadRequest::new(model_file.path().to_owned(), None, "GeneratedVrm1Spring");
+        let candidate =
+            AvatarCandidate::prepare(&gpu, &renderer, &root.join("dist/character.js"), &request)
+                .expect("generated VRM1 spring avatar should load");
+        assert_eq!(
+            candidate.springs.as_ref().map(SpringSolver::joint_count),
+            Some(1)
+        );
+        assert_eq!(
+            candidate.presentation.transform,
+            Mat4::from_rotation_y(core::f32::consts::PI)
         );
     }
 }
