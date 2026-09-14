@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::Result;
-use glam::{Mat4, Vec3};
-use pocket_character_core::TrackingMode;
+use glam::{Mat4, Vec2, Vec3};
+use pocket_character_core::{CharacterSim, TrackingMode};
 use pocket3d::app::{Game, TextInputRequest, WindowRuntimeRequest, WindowRuntimeState};
 use pocket3d::camera::Camera;
 use pocket3d::gpu::Gpu;
@@ -94,6 +94,11 @@ impl MenuHealth {
 }
 
 const DEFAULT_WINDOW_SCALE_FACTOR: f64 = 1.0;
+const MOUSE_RAY_PLANE_EPSILON: f32 = 1.0e-5;
+/// Keep the cursor target close enough to the head for visible gaze while
+/// retaining forward depth. Expressing the offset as a camera-distance ratio
+/// makes zooming preserve approximately the same angular response.
+const MOUSE_TARGET_DEPTH_TOWARD_CAMERA: f32 = 0.25;
 
 /// The accepted Settings layout is authored for the default logical client
 /// area. A persisted character window may be smaller, so the native client
@@ -143,6 +148,86 @@ fn sanitized_window_dimension(value: f32, current: u32) -> u32 {
 
 fn native_drag_allowed_for_menu_pointer(menu_pointer_owned: bool) -> bool {
     !menu_pointer_owned
+}
+
+/// Intersect a world-space ray with a plane. Invalid, parallel, and
+/// behind-camera intersections are rejected so callers can choose a stable
+/// fallback instead of retaining an obsolete target.
+fn ray_plane_target(
+    ray_origin: Vec3,
+    ray_direction: Vec3,
+    plane_point: Vec3,
+    plane_normal: Vec3,
+) -> Option<Vec3> {
+    if !ray_origin.is_finite()
+        || !ray_direction.is_finite()
+        || !plane_point.is_finite()
+        || !plane_normal.is_finite()
+    {
+        return None;
+    }
+
+    let denominator = ray_direction.dot(plane_normal);
+    if !denominator.is_finite() || denominator.abs() <= MOUSE_RAY_PLANE_EPSILON {
+        return None;
+    }
+    let distance = (plane_point - ray_origin).dot(plane_normal) / denominator;
+    if !distance.is_finite() || distance < 0.0 {
+        return None;
+    }
+
+    let target = ray_origin + ray_direction * distance;
+    target.is_finite().then_some(target)
+}
+
+/// Resolve a physical-pixel cursor through the camera onto a camera-facing
+/// plane just in front of the avatar head. The plane keeps pointer motion
+/// independent of arbitrary ray distance while preserving forward depth and
+/// screen-left/right/up/down.
+fn mouse_target_from_screen(
+    camera: &Camera,
+    cursor: Vec2,
+    viewport: (u32, u32),
+    head_world: Vec3,
+) -> Option<Vec3> {
+    Camera::aspect_for_viewport(viewport)?;
+    if !cursor.is_finite()
+        || cursor.x < 0.0
+        || cursor.y < 0.0
+        || cursor.x > viewport.0 as f32
+        || cursor.y > viewport.1 as f32
+        || !head_world.is_finite()
+    {
+        return None;
+    }
+
+    let (origin, direction) = camera.screen_ray(cursor, (viewport.0 as f32, viewport.1 as f32));
+    let plane_point = head_world.lerp(camera.pos, MOUSE_TARGET_DEPTH_TOWARD_CAMERA);
+    ray_plane_target(origin, direction, plane_point, camera.forward())
+}
+
+fn resolved_mouse_target(
+    camera: &Camera,
+    cursor: Option<Vec2>,
+    viewport: (u32, u32),
+    head_world: Vec3,
+    fallback: Vec3,
+) -> Vec3 {
+    cursor
+        .and_then(|cursor| mouse_target_from_screen(camera, cursor, viewport, head_world))
+        .unwrap_or(fallback)
+}
+
+fn set_tracking_mode(sim: &mut CharacterSim, mode: &str) {
+    sim.tracking = if mode == "mouse" {
+        TrackingMode::Mouse
+    } else {
+        TrackingMode::None
+    };
+    // Mouse mode must never revive a target from an earlier tracking session.
+    // Camera/idle targeting is also the safe initial value until the next
+    // valid cursor frame arrives.
+    sim.mouse_target = sim.look_base;
 }
 
 /// Map the guest's logical PocketUI caret rectangle to the physical-pixel
@@ -371,6 +456,40 @@ impl Widget {
     fn reapply_camera(&mut self) {
         if self.active_avatar.is_some() {
             self.apply_camera_settings();
+        }
+    }
+
+    fn update_mouse_tracking_target(&mut self, cursor: Option<Vec2>) {
+        let Some(active) = self.active_avatar.as_ref() else {
+            return;
+        };
+        if active.sim.tracking != TrackingMode::Mouse {
+            return;
+        }
+
+        let fallback = active.sim.look_base;
+        let head_world = active
+            .document
+            .humanoid_node("head")
+            .and_then(|node| active.globals.get(node))
+            .map(|global| global.w_axis.truncate())
+            .filter(|position| position.is_finite())
+            .map(|position| active.presentation.world_point_from_model(position))
+            .filter(|position| position.is_finite())
+            .unwrap_or_else(|| {
+                let (min, max) = active.presentation_aabb;
+                (min + max) * 0.5
+            });
+        // A reported zero physical size means the window is minimized. Do
+        // not fall back to a stale pre-minimize viewport in that case.
+        let viewport = self
+            .window_physical_size
+            .or(self.viewport_size)
+            .unwrap_or(self.cfg.size);
+        let target = resolved_mouse_target(&self.camera, cursor, viewport, head_world, fallback);
+
+        if let Some(active) = self.active_avatar.as_mut() {
+            active.sim.mouse_target = target;
         }
     }
 
@@ -1229,10 +1348,7 @@ impl Widget {
             match cmd {
                 Command::SetTracking(mode) => {
                     if let Some(active) = self.active_avatar.as_mut() {
-                        active.sim.tracking = match mode.as_str() {
-                            "mouse" => TrackingMode::Mouse,
-                            _ => TrackingMode::None,
-                        };
+                        set_tracking_mode(&mut active.sim, &mode);
                     }
                 }
                 Command::SetExpression(name, w) => {
@@ -1437,6 +1553,7 @@ impl Game for Widget {
                 TickEvent::HoverEnd
             });
         }
+        self.update_mouse_tracking_target(input.cursor());
     }
 
     fn tick(&mut self, dt: f32, _input: &Input) {
@@ -1475,6 +1592,7 @@ impl Game for Widget {
             model
                 .skeleton
                 .globals_from_locals(&active.locals, &mut active.globals);
+            let mut procedural_look_at = pocket_vrm::Vrm1ExpressionLookAt::default();
             if let Some(vrm) = active.document.vrm0() {
                 let head = vrm
                     .humanoid_node("head")
@@ -1495,21 +1613,17 @@ impl Game for Widget {
                     );
                 }
             }
-
-            // --- springs ------------------------------------------------
-            if let Some(springs) = active.springs.as_mut() {
-                springs.step(dt, &model.skeleton, &mut active.locals, Mat4::IDENTITY);
+            if let Some(look_at) = active.look_at.as_ref() {
+                let target_model = active.presentation.model_point_from_world(out.look_target);
+                let output = look_at.evaluate(target_model, &active.locals, &active.globals);
+                output.apply_bone_rotations(&mut active.locals);
+                procedural_look_at = output.expression_weights();
             }
 
-            // --- pose + blink ------------------------------------------
-            model
-                .skeleton
-                .globals_from_locals(&active.locals, &mut active.globals);
+            // --- expressions --------------------------------------------
+            // Gaze and blink share the VRM 1.0 compositor so overlapping
+            // morph binds accumulate once and procedural overrides see both.
             let scene_slot = active.scene_slot;
-            {
-                let inst = scene_slot.get_mut(&mut self.scene);
-                inst.pose = Some(active.globals.clone());
-            }
             match &mut active.expressions {
                 ResolvedExpressionRuntime::Vrm0Legacy if out.blink_changed => {
                     let inst = scene_slot.get_mut(&mut self.scene);
@@ -1520,9 +1634,30 @@ impl Game for Widget {
                     }
                 }
                 ResolvedExpressionRuntime::Vrm1(runtime) => {
-                    runtime.compose_if_needed(&mut self.scene, scene_slot, out.blink);
+                    runtime.compose_with_procedural_look_at(
+                        &mut self.scene,
+                        scene_slot,
+                        out.blink,
+                        procedural_look_at,
+                    );
                 }
                 ResolvedExpressionRuntime::Vrm0Legacy => {}
+            }
+
+            // --- constraints (future insertion point) -------------------
+
+            // --- springs ------------------------------------------------
+            if let Some(springs) = active.springs.as_mut() {
+                springs.step(dt, &model.skeleton, &mut active.locals, Mat4::IDENTITY);
+            }
+
+            // --- final pose ---------------------------------------------
+            model
+                .skeleton
+                .globals_from_locals(&active.locals, &mut active.globals);
+            {
+                let inst = scene_slot.get_mut(&mut self.scene);
+                inst.pose = Some(active.globals.clone());
             }
 
             // --- guest turn ---------------------------------------------

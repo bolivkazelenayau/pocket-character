@@ -9,6 +9,94 @@ fn test_widget() -> Widget {
     Widget::new(test_config())
 }
 
+fn assert_vec3_near(actual: Vec3, expected: Vec3, epsilon: f32) {
+    assert!(
+        (actual - expected).length() <= epsilon,
+        "actual={actual:?}, expected={expected:?}, epsilon={epsilon}"
+    );
+}
+
+#[test]
+fn mouse_target_center_tracks_camera_forward_at_stable_depth() {
+    let camera = Camera::default();
+    let target = mouse_target_from_screen(
+        &camera,
+        Vec2::new(225.0, 300.0),
+        (450, 600),
+        Vec3::new(0.0, 1.5, -5.0),
+    )
+    .unwrap();
+
+    assert_vec3_near(target, Vec3::new(0.0, 0.0, -3.75), 1.0e-4);
+    assert_vec3_near((target - camera.pos).normalize(), camera.forward(), 1.0e-4);
+}
+
+#[test]
+fn mouse_target_preserves_screen_axis_directions() {
+    let camera = Camera::default();
+    let viewport = (450, 600);
+    let head = Vec3::new(0.0, 1.5, -5.0);
+    let center =
+        mouse_target_from_screen(&camera, Vec2::new(225.0, 300.0), viewport, head).unwrap();
+    let left = mouse_target_from_screen(&camera, Vec2::new(50.0, 300.0), viewport, head).unwrap();
+    let right = mouse_target_from_screen(&camera, Vec2::new(400.0, 300.0), viewport, head).unwrap();
+    let up = mouse_target_from_screen(&camera, Vec2::new(225.0, 50.0), viewport, head).unwrap();
+    let down = mouse_target_from_screen(&camera, Vec2::new(225.0, 550.0), viewport, head).unwrap();
+
+    assert!(left.x < center.x && right.x > center.x);
+    assert!(up.y > center.y && down.y < center.y);
+    for target in [left, right, up, down] {
+        assert!((target.z - -3.75).abs() <= 1.0e-4);
+    }
+}
+
+#[test]
+fn mouse_target_rejects_invalid_viewports_cursors_and_intersections() {
+    let camera = Camera::default();
+    let head = Vec3::new(0.0, 1.5, -5.0);
+    let fallback = Vec3::new(4.0, 5.0, 6.0);
+    assert!(mouse_target_from_screen(&camera, Vec2::ZERO, (0, 600), head).is_none());
+    assert!(mouse_target_from_screen(&camera, Vec2::new(-1.0, 10.0), (450, 600), head).is_none());
+    assert!(
+        mouse_target_from_screen(&camera, Vec2::new(f32::NAN, 10.0), (450, 600), head).is_none()
+    );
+    assert!(ray_plane_target(Vec3::ZERO, Vec3::X, Vec3::new(0.0, 0.0, -5.0), Vec3::Z).is_none());
+    assert!(ray_plane_target(Vec3::ZERO, Vec3::Z, Vec3::new(0.0, 0.0, -5.0), Vec3::Z).is_none());
+    assert_eq!(
+        resolved_mouse_target(&camera, None, (450, 600), head, fallback),
+        fallback
+    );
+    assert_eq!(
+        resolved_mouse_target(
+            &camera,
+            Some(Vec2::new(225.0, 300.0)),
+            (0, 600),
+            head,
+            fallback,
+        ),
+        fallback
+    );
+}
+
+#[test]
+fn tracking_mode_switches_clear_stale_mouse_targets() {
+    let look_base = Vec3::new(1.0, 2.0, 3.0);
+    let mut sim = CharacterSim::new(7, look_base);
+    sim.mouse_target = Vec3::splat(99.0);
+
+    set_tracking_mode(&mut sim, "mouse");
+    assert_eq!(sim.tracking, TrackingMode::Mouse);
+    assert_eq!(sim.mouse_target, look_base);
+
+    sim.mouse_target = Vec3::splat(-99.0);
+    set_tracking_mode(&mut sim, "none");
+    assert_eq!(sim.tracking, TrackingMode::None);
+    assert_eq!(sim.mouse_target, look_base);
+
+    set_tracking_mode(&mut sim, "mouse");
+    assert_eq!(sim.mouse_target, look_base);
+}
+
 fn test_config() -> WidgetConfig {
     WidgetConfig {
         model_path: PathBuf::new(),

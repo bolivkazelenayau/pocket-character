@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use anyhow::Result;
-use pocket_vrm::{Vrm1Doc, Vrm1ExpressionKind, Vrm1ExpressionOverride};
+use pocket_vrm::{Vrm1Doc, Vrm1ExpressionKind, Vrm1ExpressionLookAt, Vrm1ExpressionOverride};
 use pocket3d::model::ModelAsset;
 use pocket3d::scene::Scene;
 
@@ -18,6 +18,7 @@ use super::avatar::AvatarSceneSlot;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ResolvedExpressionClass {
     Blink,
+    LookAt,
     Other,
 }
 
@@ -67,6 +68,7 @@ pub(super) struct Vrm1ExpressionRuntime {
     procedural_blink: ProceduralBlinkSource,
     dirty: bool,
     last_procedural_blink: f32,
+    last_procedural_look_at: Option<Vrm1ExpressionLookAt>,
     warned_nonfinite_input: bool,
 }
 
@@ -115,6 +117,7 @@ impl Vrm1ExpressionRuntime {
             // NaN makes the first procedural sample observable without
             // assigning an artificial blink value to the rest pose.
             last_procedural_blink: f32::NAN,
+            last_procedural_look_at: None,
             warned_nonfinite_input: false,
         }
     }
@@ -154,14 +157,34 @@ impl Vrm1ExpressionRuntime {
         scene_slot: AvatarSceneSlot,
         procedural_blink: f32,
     ) {
-        if !self.dirty && self.last_procedural_blink == procedural_blink {
+        let procedural_look_at = self.last_procedural_look_at.unwrap_or_default();
+        self.compose_with_procedural_look_at(
+            scene,
+            scene_slot,
+            procedural_blink,
+            procedural_look_at,
+        );
+    }
+
+    pub(super) fn compose_with_procedural_look_at(
+        &mut self,
+        scene: &mut Scene,
+        scene_slot: AvatarSceneSlot,
+        procedural_blink: f32,
+        procedural_look_at: Vrm1ExpressionLookAt,
+    ) {
+        if !self.dirty
+            && self.last_procedural_blink == procedural_blink
+            && self.last_procedural_look_at == Some(procedural_look_at)
+        {
             return;
         }
-        let assignments = self.composed_weights(procedural_blink);
+        let assignments = self.composed_weights(procedural_blink, procedural_look_at);
         let instance = scene_slot.get_mut(scene);
         let Some(morph) = instance.morph.as_mut() else {
             self.dirty = false;
             self.last_procedural_blink = procedural_blink;
+            self.last_procedural_look_at = Some(procedural_look_at);
             return;
         };
 
@@ -176,6 +199,7 @@ impl Vrm1ExpressionRuntime {
         }
         self.dirty = false;
         self.last_procedural_blink = procedural_blink;
+        self.last_procedural_look_at = Some(procedural_look_at);
     }
 
     #[cfg(test)]
@@ -183,10 +207,23 @@ impl Vrm1ExpressionRuntime {
         &self,
         procedural_blink: f32,
     ) -> Vec<((usize, usize), f32)> {
-        self.composed_weights(procedural_blink)
+        self.composed_weights(procedural_blink, Vrm1ExpressionLookAt::default())
     }
 
-    fn composed_weights(&self, procedural_blink: f32) -> Vec<((usize, usize), f32)> {
+    #[cfg(test)]
+    pub(super) fn composed_weights_with_look_at_for_test(
+        &self,
+        procedural_blink: f32,
+        procedural_look_at: Vrm1ExpressionLookAt,
+    ) -> Vec<((usize, usize), f32)> {
+        self.composed_weights(procedural_blink, procedural_look_at)
+    }
+
+    fn composed_weights(
+        &self,
+        procedural_blink: f32,
+        procedural_look_at: Vrm1ExpressionLookAt,
+    ) -> Vec<((usize, usize), f32)> {
         let procedural_blink = if procedural_blink.is_finite() {
             procedural_blink.clamp(0.0, 1.0)
         } else {
@@ -215,34 +252,77 @@ impl Vrm1ExpressionRuntime {
         };
         let blink_override_active = override_blocks || override_blend > 0.0;
 
+        let mut look_at_blocks = false;
+        let mut look_at_blend = 0.0;
+        for (index, expression) in self.expressions.iter().enumerate() {
+            // An override targeting its own procedural class is invalid and
+            // ignored, matching the existing blink behavior.
+            if expression.class == ResolvedExpressionClass::LookAt {
+                continue;
+            }
+            let output = expression_output(self.inputs[index], expression.is_binary);
+            if output <= 0.0 {
+                continue;
+            }
+            match expression.override_look_at {
+                Vrm1ExpressionOverride::None => {}
+                Vrm1ExpressionOverride::Block => look_at_blocks = true,
+                Vrm1ExpressionOverride::Blend => look_at_blend += output,
+            }
+        }
+        let look_at_multiplier = if look_at_blocks {
+            0.0
+        } else {
+            (1.0 - look_at_blend).max(0.0)
+        };
+        let look_at_override_active = look_at_blocks || look_at_blend > 0.0;
+
         let mut totals = BTreeMap::<(usize, usize), f32>::new();
         for (index, expression) in self.expressions.iter().enumerate() {
-            let mut output = if expression.class == ResolvedExpressionClass::Blink {
-                0.0
-            } else {
-                expression_output(self.inputs[index], expression.is_binary)
-            };
-            if expression.class == ResolvedExpressionClass::Blink {
-                let procedural = match self.procedural_blink {
-                    ProceduralBlinkSource::Preset(source) if source == index => procedural_blink,
-                    ProceduralBlinkSource::Pair(left, right) if left == index || right == index => {
-                        procedural_blink
-                    }
-                    _ => 0.0,
-                };
-                // Guest and procedural blink inputs are combined before VRM1's
-                // binary threshold is applied. This keeps binary blink from
-                // treating any positive procedural input as a full close.
-                let raw_output = self.inputs[index].max(procedural);
-                if expression.is_binary {
-                    output = if raw_output > 0.5 { 1.0 } else { 0.0 };
-                    if blink_override_active {
-                        output = 0.0;
-                    }
-                } else {
-                    output = raw_output * blink_multiplier;
+            let output = match expression.class {
+                ResolvedExpressionClass::Other => {
+                    expression_output(self.inputs[index], expression.is_binary)
                 }
-            }
+                ResolvedExpressionClass::Blink => {
+                    let procedural = match self.procedural_blink {
+                        ProceduralBlinkSource::Preset(source) if source == index => {
+                            procedural_blink
+                        }
+                        ProceduralBlinkSource::Pair(left, right)
+                            if left == index || right == index =>
+                        {
+                            procedural_blink
+                        }
+                        _ => 0.0,
+                    };
+                    procedural_output(
+                        self.inputs[index].max(procedural),
+                        expression.is_binary,
+                        blink_multiplier,
+                        blink_override_active,
+                    )
+                }
+                ResolvedExpressionClass::LookAt => {
+                    let procedural = match expression.name.as_str() {
+                        "lookUp" => procedural_look_at.look_up,
+                        "lookDown" => procedural_look_at.look_down,
+                        "lookLeft" => procedural_look_at.look_left,
+                        "lookRight" => procedural_look_at.look_right,
+                        _ => 0.0,
+                    };
+                    let procedural = if procedural.is_finite() {
+                        procedural.clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    procedural_output(
+                        self.inputs[index].max(procedural),
+                        expression.is_binary,
+                        look_at_multiplier,
+                        look_at_override_active,
+                    )
+                }
+            };
             if output == 0.0 {
                 continue;
             }
@@ -251,6 +331,25 @@ impl Vrm1ExpressionRuntime {
             }
         }
         totals.into_iter().collect()
+    }
+}
+
+fn procedural_output(
+    raw_output: f32,
+    is_binary: bool,
+    multiplier: f32,
+    override_active: bool,
+) -> f32 {
+    if is_binary {
+        if override_active {
+            0.0
+        } else if raw_output > 0.5 {
+            1.0
+        } else {
+            0.0
+        }
+    } else {
+        raw_output * multiplier
     }
 }
 
@@ -384,12 +483,12 @@ pub(super) fn resolve_vrm1(
             continue;
         }
 
-        let class = if expression.kind == Vrm1ExpressionKind::Preset
-            && matches!(
-                expression.name.as_str(),
-                "blink" | "blinkLeft" | "blinkRight"
-            ) {
-            ResolvedExpressionClass::Blink
+        let class = if expression.kind == Vrm1ExpressionKind::Preset {
+            match expression.name.as_str() {
+                "blink" | "blinkLeft" | "blinkRight" => ResolvedExpressionClass::Blink,
+                "lookUp" | "lookDown" | "lookLeft" | "lookRight" => ResolvedExpressionClass::LookAt,
+                _ => ResolvedExpressionClass::Other,
+            }
         } else {
             ResolvedExpressionClass::Other
         };
@@ -442,6 +541,24 @@ mod tests {
 
     fn runtime(expressions: Vec<ResolvedExpression>) -> Vrm1ExpressionRuntime {
         Vrm1ExpressionRuntime::new(expressions)
+    }
+
+    fn with_look_at_override(
+        mut expression: ResolvedExpression,
+        override_look_at: Vrm1ExpressionOverride,
+    ) -> ResolvedExpression {
+        expression.override_look_at = override_look_at;
+        expression
+    }
+
+    fn gaze(name: &str, target: usize, is_binary: bool) -> ResolvedExpression {
+        expression(
+            name,
+            ResolvedExpressionClass::LookAt,
+            is_binary,
+            Vrm1ExpressionOverride::None,
+            vec![bind(0, target, 1.0)],
+        )
     }
 
     #[test]
@@ -555,5 +672,137 @@ mod tests {
         assert!(!runtime.set_input("unknown", 1.0));
         assert!(!runtime.set_input("smile", f32::NAN));
         assert_eq!(runtime.composed_weights_for_test(0.0), vec![((0, 0), 1.0)]);
+    }
+
+    #[test]
+    fn gaze_directions_are_procedural_and_opposites_do_not_stay_stale() {
+        let runtime = runtime(vec![
+            gaze("lookUp", 0, false),
+            gaze("lookDown", 1, false),
+            gaze("lookLeft", 2, false),
+            gaze("lookRight", 3, false),
+        ]);
+        assert_eq!(
+            runtime.composed_weights_with_look_at_for_test(
+                0.0,
+                Vrm1ExpressionLookAt {
+                    look_up: 0.25,
+                    look_left: 0.75,
+                    ..Default::default()
+                },
+            ),
+            vec![((0, 0), 0.25), ((0, 2), 0.75)]
+        );
+        assert_eq!(
+            runtime.composed_weights_with_look_at_for_test(
+                0.0,
+                Vrm1ExpressionLookAt {
+                    look_down: 0.5,
+                    look_right: 1.0,
+                    ..Default::default()
+                },
+            ),
+            vec![((0, 1), 0.5), ((0, 3), 1.0)]
+        );
+        assert!(
+            runtime
+                .composed_weights_with_look_at_for_test(0.0, Vrm1ExpressionLookAt::default())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn look_at_override_none_block_and_blend_follow_expression_output() {
+        let make_runtime = |override_look_at| {
+            let mut runtime = runtime(vec![
+                gaze("lookLeft", 0, false),
+                with_look_at_override(
+                    expression(
+                        "happy",
+                        ResolvedExpressionClass::Other,
+                        false,
+                        Vrm1ExpressionOverride::None,
+                        vec![bind(0, 1, 1.0)],
+                    ),
+                    override_look_at,
+                ),
+            ]);
+            runtime.set_input("happy", 0.25);
+            runtime
+        };
+        let look_at = Vrm1ExpressionLookAt {
+            look_left: 0.8,
+            ..Default::default()
+        };
+        assert_eq!(
+            make_runtime(Vrm1ExpressionOverride::None)
+                .composed_weights_with_look_at_for_test(0.0, look_at),
+            vec![((0, 0), 0.8), ((0, 1), 0.25)]
+        );
+        assert_eq!(
+            make_runtime(Vrm1ExpressionOverride::Block)
+                .composed_weights_with_look_at_for_test(0.0, look_at),
+            vec![((0, 1), 0.25)]
+        );
+        assert_eq!(
+            make_runtime(Vrm1ExpressionOverride::Blend)
+                .composed_weights_with_look_at_for_test(0.0, look_at),
+            vec![((0, 0), 0.6), ((0, 1), 0.25)]
+        );
+    }
+
+    #[test]
+    fn binary_overrider_and_binary_gaze_use_visual_outputs() {
+        let mut runtime = runtime(vec![
+            gaze("lookLeft", 0, true),
+            with_look_at_override(
+                expression(
+                    "angry",
+                    ResolvedExpressionClass::Other,
+                    true,
+                    Vrm1ExpressionOverride::None,
+                    vec![bind(0, 1, 1.0)],
+                ),
+                Vrm1ExpressionOverride::Blend,
+            ),
+        ]);
+        let look_at = Vrm1ExpressionLookAt {
+            look_left: 0.75,
+            ..Default::default()
+        };
+        runtime.set_input("angry", 0.5);
+        assert_eq!(
+            runtime.composed_weights_with_look_at_for_test(0.0, look_at),
+            vec![((0, 0), 1.0)]
+        );
+        runtime.set_input("angry", 0.5001);
+        assert_eq!(
+            runtime.composed_weights_with_look_at_for_test(0.0, look_at),
+            vec![((0, 1), 1.0)]
+        );
+    }
+
+    #[test]
+    fn blink_and_gaze_accumulate_on_a_shared_morph_target() {
+        let runtime = runtime(vec![
+            expression(
+                "blink",
+                ResolvedExpressionClass::Blink,
+                false,
+                Vrm1ExpressionOverride::None,
+                vec![bind(0, 0, 1.0)],
+            ),
+            gaze("lookDown", 0, false),
+        ]);
+        assert_eq!(
+            runtime.composed_weights_with_look_at_for_test(
+                0.4,
+                Vrm1ExpressionLookAt {
+                    look_down: 0.3,
+                    ..Default::default()
+                },
+            ),
+            vec![((0, 0), 0.70000005)]
+        );
     }
 }

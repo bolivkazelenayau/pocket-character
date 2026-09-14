@@ -11,7 +11,7 @@ console.log(
 );
 
 // airi VRM defaults: tracking mode "none", idle_loop.vrma looped.
-character.setTracking("none");
+character.setTracking("mouse");
 if (character.__boot.clips.includes("idle_loop")) {
   character.playClip("idle_loop", true);
 }

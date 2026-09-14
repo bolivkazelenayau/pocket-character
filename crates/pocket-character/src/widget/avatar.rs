@@ -13,7 +13,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, ensure};
 use glam::{Mat4, Vec3};
 use pocket_character_core::CharacterSim;
-use pocket_vrm::{HumanoidView, SpringSolver, Vrm1Doc, VrmDoc, retarget_with_humanoid};
+use pocket_vrm::{
+    HumanoidView, SpringSolver, Vrm1Doc, Vrm1LookAtRuntime, VrmDoc, retarget_with_humanoid,
+};
 use pocket3d::anim::{Clip, NodeTrs};
 use pocket3d::gpu::Gpu;
 use pocket3d::model::{ModelAsset, ModelInstance, ModelLoadOptions};
@@ -69,6 +71,18 @@ impl AvatarSemanticDocument {
         }
     }
 
+    pub(super) fn humanoid_node(&self, bone: &str) -> Option<usize> {
+        match self {
+            Self::Vrm0(document) => document.humanoid_node(bone),
+            Self::Vrm1(document) => document
+                .humanoid
+                .human_bones
+                .iter()
+                .find(|(name, _)| name.as_str() == bone)
+                .map(|(_, &node)| node),
+        }
+    }
+
     pub(super) fn expression_names(&self) -> Vec<String> {
         self.vrm0()
             .map(|document| {
@@ -95,6 +109,7 @@ pub(super) enum AvatarVersion {
 pub(super) struct AvatarPresentation {
     pub(super) version: AvatarVersion,
     pub(super) transform: Mat4,
+    model_from_world: Mat4,
 }
 
 impl AvatarPresentation {
@@ -103,7 +118,11 @@ impl AvatarPresentation {
             AvatarVersion::Vrm0 => Mat4::IDENTITY,
             AvatarVersion::Vrm1 => Mat4::from_rotation_y(core::f32::consts::PI),
         };
-        Self { version, transform }
+        Self {
+            version,
+            transform,
+            model_from_world: transform.inverse(),
+        }
     }
 
     /// Transform all eight raw AABB corners.  Rotating only the min/max
@@ -111,6 +130,14 @@ impl AvatarPresentation {
     /// presentation transform.
     pub(super) fn aabb(self, raw: (Vec3, Vec3)) -> (Vec3, Vec3) {
         transformed_aabb(raw, self.transform)
+    }
+
+    pub(super) fn model_point_from_world(self, world: Vec3) -> Vec3 {
+        self.model_from_world.transform_point3(world)
+    }
+
+    pub(super) fn world_point_from_model(self, model: Vec3) -> Vec3 {
+        self.transform.transform_point3(model)
     }
 }
 
@@ -548,6 +575,7 @@ pub(super) struct AvatarCandidate {
     pub(super) springs: Option<SpringSolver>,
     pub(super) blink_binds: Vec<(usize, usize, f32)>,
     pub(super) expressions: ResolvedExpressionRuntime,
+    pub(super) look_at: Option<Vrm1LookAtRuntime>,
     pub(super) capabilities: AvatarCapabilities,
     pub(super) guest: CharacterGuest,
     pub(super) sim: CharacterSim,
@@ -655,6 +683,10 @@ impl AvatarCandidate {
                 .context("resolving VRM 1.0 expressions")
                 .map_err(|error| AvatarRuntimeError::new(AvatarLoadErrorKind::ModelLoad, &error))?,
         };
+        let look_at = match &document {
+            AvatarSemanticDocument::Vrm0(_) => None,
+            AvatarSemanticDocument::Vrm1(vrm1) => Vrm1LookAtRuntime::new(vrm1, &model.skeleton),
+        };
 
         let mut locals = Vec::new();
         model.skeleton.sample_locals(None, 0.0, false, &mut locals);
@@ -731,6 +763,7 @@ impl AvatarCandidate {
             springs,
             blink_binds,
             expressions,
+            look_at,
             capabilities,
             guest,
             sim: CharacterSim::new(AVATAR_SIM_SEED, Vec3::ZERO),
@@ -750,6 +783,7 @@ impl AvatarCandidate {
             springs,
             blink_binds,
             expressions,
+            look_at,
             capabilities,
             guest,
             sim,
@@ -768,6 +802,7 @@ impl AvatarCandidate {
                 springs,
                 blink_binds,
                 expressions,
+                look_at,
                 capabilities,
                 guest,
                 sim,
@@ -791,6 +826,7 @@ pub(super) struct ActiveAvatar {
     pub(super) springs: Option<SpringSolver>,
     pub(super) blink_binds: Vec<(usize, usize, f32)>,
     pub(super) expressions: ResolvedExpressionRuntime,
+    pub(super) look_at: Option<Vrm1LookAtRuntime>,
     #[allow(dead_code)]
     pub(super) capabilities: AvatarCapabilities,
     pub(super) guest: CharacterGuest,
@@ -849,6 +885,7 @@ mod tests {
 
     fn generated_vrm1_avatar(
         with_spring_bone: bool,
+        look_at_kind: Option<&str>,
     ) -> (tempfile::NamedTempFile, usize, usize, usize) {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let source_bytes = std::fs::read(root.join("assets/AvatarSample_A.vrm")).unwrap();
@@ -878,6 +915,13 @@ mod tests {
         for (name, node) in &source.humanoid {
             if required_bones.contains(&name.as_str()) {
                 human_bones.insert(name.clone(), serde_json::json!({ "node": node }));
+            }
+        }
+        if look_at_kind.is_some() {
+            for name in ["leftEye", "rightEye"] {
+                if let Some(node) = source.humanoid_node(name) {
+                    human_bones.insert(name.into(), serde_json::json!({ "node": node }));
+                }
             }
         }
 
@@ -933,6 +977,34 @@ mod tests {
                 }
             }
         });
+        if let Some(kind) = look_at_kind {
+            json["extensions"]["VRMC_vrm"]["lookAt"] = if kind == "malformed" {
+                serde_json::json!({ "type": "bone" })
+            } else {
+                serde_json::json!({
+                    "type": kind,
+                    "offsetFromHeadBone": [0.0, 0.05, 0.0],
+                    "rangeMapHorizontalInner": { "inputMaxValue": 90.0, "outputScale": 10.0 },
+                    "rangeMapHorizontalOuter": { "inputMaxValue": 90.0, "outputScale": 12.0 },
+                    "rangeMapVerticalDown": { "inputMaxValue": 90.0, "outputScale": 8.0 },
+                    "rangeMapVerticalUp": { "inputMaxValue": 90.0, "outputScale": 6.0 }
+                })
+            };
+            if kind == "expression" {
+                for (name, target) in [
+                    ("lookUp", 1),
+                    ("lookDown", 1),
+                    ("lookLeft", 1),
+                    ("lookRight", 1),
+                ] {
+                    json["extensions"]["VRMC_vrm"]["expressions"]["preset"][name] = serde_json::json!({
+                        "morphTargetBinds": [
+                            { "node": expression_node, "index": target, "weight": 1.0 }
+                        ]
+                    });
+                }
+            }
+        }
         let root_node = source
             .nodes
             .parents
@@ -998,6 +1070,10 @@ mod tests {
                 .transform
                 .transform_point3(Vec3::new(1.0, 2.0, 3.0)),
             Vec3::new(-1.0, 2.0, -3.0),
+        );
+        approx_vec3(
+            presentation.model_point_from_world(Vec3::new(-1.0, 2.0, -3.0)),
+            Vec3::new(1.0, 2.0, 3.0),
         );
     }
 
@@ -1442,7 +1518,8 @@ mod tests {
         let gpu = Gpu::new_headless().expect("headless GPU is required for VRM1 integration");
         let renderer = Renderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT).unwrap();
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let (model_file, root_node, spine_node, expression_node) = generated_vrm1_avatar(false);
+        let (model_file, root_node, spine_node, expression_node) =
+            generated_vrm1_avatar(false, None);
         let request = AvatarLoadRequest::new(
             model_file.path().to_owned(),
             Some(root.join("assets/idle_loop.vrma")),
@@ -1529,7 +1606,7 @@ mod tests {
         let gpu = Gpu::new_headless().expect("headless GPU is required for VRM1 integration");
         let renderer = Renderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT).unwrap();
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let (model_file, _, _, _) = generated_vrm1_avatar(true);
+        let (model_file, _, _, _) = generated_vrm1_avatar(true, Some("bone"));
         let request =
             AvatarLoadRequest::new(model_file.path().to_owned(), None, "GeneratedVrm1Spring");
         let candidate =
@@ -1539,9 +1616,113 @@ mod tests {
             candidate.springs.as_ref().map(SpringSolver::joint_count),
             Some(1)
         );
+        assert!(candidate.look_at.is_some());
         assert_eq!(
             candidate.presentation.transform,
             Mat4::from_rotation_y(core::f32::consts::PI)
+        );
+    }
+
+    #[test]
+    fn generated_bone_look_at_resolves_and_malformed_metadata_stays_nonfatal() {
+        let gpu = Gpu::new_headless().expect("headless GPU is required for VRM1 integration");
+        let renderer = Renderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT).unwrap();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+
+        let (bone_file, _, _, _) = generated_vrm1_avatar(false, Some("bone"));
+        let bone = AvatarCandidate::prepare(
+            &gpu,
+            &renderer,
+            &root.join("dist/character.js"),
+            &AvatarLoadRequest::new(bone_file.path().to_owned(), None, "BoneLookAt"),
+        )
+        .expect("generated bone LookAt avatar should load");
+        assert!(bone.look_at.is_some());
+
+        let (malformed_file, _, _, _) = generated_vrm1_avatar(false, Some("malformed"));
+        let malformed = AvatarCandidate::prepare(
+            &gpu,
+            &renderer,
+            &root.join("dist/character.js"),
+            &AvatarLoadRequest::new(malformed_file.path().to_owned(), None, "MalformedLookAt"),
+        )
+        .expect("malformed LookAt must not poison transactional preparation");
+        assert!(malformed.look_at.is_none());
+        assert!(matches!(
+            malformed.document,
+            AvatarSemanticDocument::Vrm1(Vrm1Doc { look_at: None, .. })
+        ));
+    }
+
+    #[test]
+    fn avatar_replacement_does_not_retain_procedural_gaze() {
+        let gpu = Gpu::new_headless().expect("headless GPU is required for VRM1 integration");
+        let renderer = Renderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT).unwrap();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let bundle = root.join("dist/character.js");
+        let (first_file, _, _, _) = generated_vrm1_avatar(false, Some("expression"));
+        let (second_file, _, _, _) = generated_vrm1_avatar(false, Some("expression"));
+        let first = AvatarCandidate::prepare(
+            &gpu,
+            &renderer,
+            &bundle,
+            &AvatarLoadRequest::new(first_file.path().to_owned(), None, "FirstLookAt"),
+        )
+        .unwrap();
+        let second = AvatarCandidate::prepare(
+            &gpu,
+            &renderer,
+            &bundle,
+            &AvatarLoadRequest::new(second_file.path().to_owned(), None, "SecondLookAt"),
+        )
+        .unwrap();
+        let slot = AvatarSceneSlot::new(0);
+        let (instance, mut active) = first.into_parts(slot);
+        let mut scene = Scene::default();
+        scene.models.push(instance);
+        let (mesh_slot, target) = match &mut active.expressions {
+            ResolvedExpressionRuntime::Vrm1(runtime) => {
+                let bind = runtime
+                    .expressions
+                    .iter()
+                    .find(|expression| expression.name == "lookLeft")
+                    .and_then(|expression| expression.morph_binds.first())
+                    .unwrap();
+                let key = (bind.mesh_slot, bind.target);
+                runtime.compose_with_procedural_look_at(
+                    &mut scene,
+                    slot,
+                    0.0,
+                    pocket_vrm::Vrm1ExpressionLookAt {
+                        look_left: 1.0,
+                        ..Default::default()
+                    },
+                );
+                key
+            }
+            ResolvedExpressionRuntime::Vrm0Legacy => unreachable!(),
+        };
+        assert_eq!(
+            scene.models[0]
+                .morph
+                .as_ref()
+                .unwrap()
+                .weight(mesh_slot, target),
+            1.0
+        );
+
+        let (replacement, mut replacement_active) = second.into_parts(slot);
+        slot.replace(&mut scene, replacement);
+        if let ResolvedExpressionRuntime::Vrm1(runtime) = &mut replacement_active.expressions {
+            runtime.compose_if_needed(&mut scene, slot, 0.0);
+        }
+        assert_eq!(
+            scene.models[0]
+                .morph
+                .as_ref()
+                .unwrap()
+                .weight(mesh_slot, target),
+            0.0
         );
     }
 }
