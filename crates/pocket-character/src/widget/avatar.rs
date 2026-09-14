@@ -26,6 +26,7 @@ use serde_json::Value;
 use crate::guest::CharacterGuest;
 
 use super::expression::{ResolvedExpressionRuntime, resolve_vrm1};
+use super::node_constraint::Vrm1NodeConstraintRuntime;
 
 #[cfg(test)]
 use super::camera::CameraRuntimeAdjustments;
@@ -363,6 +364,7 @@ fn vrm0_allowed_required_extensions() -> [&'static str; 1] {
 fn vrm1_allowed_required_extensions(
     json: &Value,
     spring_bone_supported: bool,
+    node_constraint_supported: bool,
 ) -> Result<Vec<&'static str>> {
     let materials = match json.get("materials") {
         None => &[][..],
@@ -410,8 +412,31 @@ fn vrm1_allowed_required_extensions(
         );
         allowed.push("VRMC_springBone");
     }
-    // Node constraints remain intentionally unsupported.
+    if extension_declaration_contains(json, "extensionsRequired", "VRMC_node_constraint")? {
+        ensure!(
+            node_constraint_supported,
+            "VRMC_node_constraint is required but its supported 1.0 semantics were not parsed"
+        );
+        allowed.push("VRMC_node_constraint");
+    }
     Ok(allowed)
+}
+
+fn extension_declaration_contains(json: &Value, key: &str, name: &str) -> Result<bool> {
+    let Some(value) = json.get(key) else {
+        return Ok(false);
+    };
+    let declarations = value
+        .as_array()
+        .with_context(|| format!("VRM 1.0 glTF {key} must be an array"))?;
+    let mut found = false;
+    for (index, value) in declarations.iter().enumerate() {
+        let extension = value
+            .as_str()
+            .with_context(|| format!("VRM 1.0 glTF {key}[{index}] must be a string"))?;
+        found |= extension == name;
+    }
+    Ok(found)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -576,6 +601,7 @@ pub(super) struct AvatarCandidate {
     pub(super) blink_binds: Vec<(usize, usize, f32)>,
     pub(super) expressions: ResolvedExpressionRuntime,
     pub(super) look_at: Option<Vrm1LookAtRuntime>,
+    pub(super) node_constraints: Option<Vrm1NodeConstraintRuntime>,
     pub(super) capabilities: AvatarCapabilities,
     pub(super) guest: CharacterGuest,
     pub(super) sim: CharacterSim,
@@ -598,6 +624,7 @@ impl AvatarCandidate {
             })?;
         let presentation = AvatarPresentation::for_version(document.version());
 
+        let mut node_constraint_required = false;
         let model = match document.version() {
             AvatarVersion::Vrm0 => {
                 ModelAsset::load_glb_bytes_opts_with_allowed_required_extensions(
@@ -623,12 +650,25 @@ impl AvatarCandidate {
                     AvatarSemanticDocument::Vrm1(document)
                         if document.spring_bone_semantics.is_some()
                 );
-                let allowed_required_extensions =
-                    vrm1_allowed_required_extensions(&glb.json, spring_bone_supported).map_err(
-                        |error| {
-                            AvatarRuntimeError::new(AvatarLoadErrorKind::UnsupportedVrm, &error)
-                        },
-                    )?;
+                let node_constraint_supported = matches!(
+                    &document,
+                    AvatarSemanticDocument::Vrm1(document)
+                        if document.node_constraint_semantics.is_some()
+                );
+                node_constraint_required = extension_declaration_contains(
+                    &glb.json,
+                    "extensionsRequired",
+                    "VRMC_node_constraint",
+                )
+                .map_err(|error| AvatarRuntimeError::new(AvatarLoadErrorKind::VrmParse, &error))?;
+                let allowed_required_extensions = vrm1_allowed_required_extensions(
+                    &glb.json,
+                    spring_bone_supported,
+                    node_constraint_supported,
+                )
+                .map_err(|error| {
+                    AvatarRuntimeError::new(AvatarLoadErrorKind::UnsupportedVrm, &error)
+                })?;
                 ModelAsset::load_glb_bytes_opts_with_allowed_required_extensions(
                     gpu,
                     &renderer.model_material_layout,
@@ -692,6 +732,38 @@ impl AvatarCandidate {
         model.skeleton.sample_locals(None, 0.0, false, &mut locals);
         let mut globals = Vec::new();
         model.skeleton.globals_from_locals(&locals, &mut globals);
+
+        let node_constraints = match &document {
+            AvatarSemanticDocument::Vrm0(_) => None,
+            AvatarSemanticDocument::Vrm1(vrm1) => match &vrm1.node_constraint_semantics {
+                Some(semantics) => match Vrm1NodeConstraintRuntime::new(semantics, &model.skeleton)
+                {
+                    Ok(runtime) if runtime.is_empty() => None,
+                    Ok(runtime) => Some(runtime),
+                    Err(error) if node_constraint_required => {
+                        return Err(AvatarRuntimeError::new(
+                            AvatarLoadErrorKind::UnsupportedVrm,
+                            &error.context("resolving required VRMC_node_constraint runtime"),
+                        ));
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "disabling invalid optional VRMC_node_constraint extension: {error:#}"
+                        );
+                        None
+                    }
+                },
+                None if node_constraint_required => {
+                    let error =
+                        anyhow!("required VRMC_node_constraint runtime could not be constructed");
+                    return Err(AvatarRuntimeError::new(
+                        AvatarLoadErrorKind::UnsupportedVrm,
+                        &error,
+                    ));
+                }
+                None => None,
+            },
+        };
 
         let springs = match &document {
             AvatarSemanticDocument::Vrm0(vrm0) => {
@@ -764,6 +836,7 @@ impl AvatarCandidate {
             blink_binds,
             expressions,
             look_at,
+            node_constraints,
             capabilities,
             guest,
             sim: CharacterSim::new(AVATAR_SIM_SEED, Vec3::ZERO),
@@ -784,6 +857,7 @@ impl AvatarCandidate {
             blink_binds,
             expressions,
             look_at,
+            node_constraints,
             capabilities,
             guest,
             sim,
@@ -803,6 +877,7 @@ impl AvatarCandidate {
                 blink_binds,
                 expressions,
                 look_at,
+                node_constraints,
                 capabilities,
                 guest,
                 sim,
@@ -827,6 +902,7 @@ pub(super) struct ActiveAvatar {
     pub(super) blink_binds: Vec<(usize, usize, f32)>,
     pub(super) expressions: ResolvedExpressionRuntime,
     pub(super) look_at: Option<Vrm1LookAtRuntime>,
+    pub(super) node_constraints: Option<Vrm1NodeConstraintRuntime>,
     #[allow(dead_code)]
     pub(super) capabilities: AvatarCapabilities,
     pub(super) guest: CharacterGuest,
@@ -852,6 +928,11 @@ mod tests {
 
     use super::*;
     use crate::settings::CameraSettings;
+    use pocket_character_core::TrackingMode;
+    use pocket3d::app::Game;
+    use pocket3d::input::Input;
+
+    use super::super::{Widget, WidgetConfig};
 
     fn approx_vec3(actual: Vec3, expected: Vec3) {
         assert!(
@@ -883,9 +964,51 @@ mod tests {
         glb
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ConstraintFixture {
+        None,
+        ValidOptional,
+        ValidAimOptional,
+        ValidRequired,
+        MalformedOptional,
+        MalformedRequired,
+        CyclicOptional,
+        CyclicRequired,
+        UnsupportedRequired,
+    }
+
+    impl ConstraintFixture {
+        fn is_present(self) -> bool {
+            self != Self::None
+        }
+
+        fn is_required(self) -> bool {
+            matches!(
+                self,
+                Self::ValidRequired
+                    | Self::MalformedRequired
+                    | Self::CyclicRequired
+                    | Self::UnsupportedRequired
+            )
+        }
+    }
+
+    fn set_node_constraint(node: &mut Value, extension: Value) {
+        let node = node
+            .as_object_mut()
+            .expect("fixture node must be an object");
+        let extensions = node
+            .entry("extensions")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .expect("fixture node extensions must be an object");
+        extensions.insert("VRMC_node_constraint".to_owned(), extension);
+    }
+
     fn generated_vrm1_avatar(
         with_spring_bone: bool,
         look_at_kind: Option<&str>,
+        constraint_fixture: ConstraintFixture,
     ) -> (tempfile::NamedTempFile, usize, usize, usize) {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let source_bytes = std::fs::read(root.join("assets/AvatarSample_A.vrm")).unwrap();
@@ -1012,6 +1135,8 @@ mod tests {
             .position(|&parent| parent == usize::MAX)
             .unwrap();
         let spine_node = source.humanoid_node("spine").unwrap();
+        let left_hand_node = source.humanoid_node("leftHand").unwrap();
+        let right_hand_node = source.humanoid_node("rightHand").unwrap();
         let nodes = json["nodes"].as_array_mut().unwrap();
         let tail_node = nodes[spine_node]["children"]
             .as_array()
@@ -1021,6 +1146,67 @@ mod tests {
         nodes[root_node]["scale"] = serde_json::json!([0.001, 0.001, 0.001]);
         nodes[spine_node]["rotation"] =
             serde_json::json!(glam::Quat::from_rotation_y(0.17).to_array());
+        match constraint_fixture {
+            ConstraintFixture::None => {}
+            ConstraintFixture::ValidOptional | ConstraintFixture::ValidRequired => {
+                set_node_constraint(
+                    &mut nodes[left_hand_node],
+                    serde_json::json!({
+                        "specVersion": "1.0",
+                        "constraint": { "rotation": { "source": right_hand_node } }
+                    }),
+                );
+            }
+            ConstraintFixture::ValidAimOptional => {
+                set_node_constraint(
+                    &mut nodes[left_hand_node],
+                    serde_json::json!({
+                        "specVersion": "1.0",
+                        "constraint": {
+                            "aim": {
+                                "source": right_hand_node,
+                                "aimAxis": "PositiveX"
+                            }
+                        }
+                    }),
+                );
+            }
+            ConstraintFixture::MalformedOptional | ConstraintFixture::MalformedRequired => {
+                set_node_constraint(
+                    &mut nodes[left_hand_node],
+                    serde_json::json!({
+                        "specVersion": "1.0",
+                        "constraint": { "rotation": {} }
+                    }),
+                );
+            }
+            ConstraintFixture::CyclicOptional | ConstraintFixture::CyclicRequired => {
+                set_node_constraint(
+                    &mut nodes[left_hand_node],
+                    serde_json::json!({
+                        "specVersion": "1.0",
+                        "constraint": { "rotation": { "source": right_hand_node } }
+                    }),
+                );
+                set_node_constraint(
+                    &mut nodes[right_hand_node],
+                    serde_json::json!({
+                        "specVersion": "1.0",
+                        "constraint": { "rotation": { "source": left_hand_node } }
+                    }),
+                );
+            }
+            ConstraintFixture::UnsupportedRequired => {
+                set_node_constraint(
+                    &mut nodes[left_hand_node],
+                    serde_json::json!({
+                        "specVersion": "1.0",
+                        "constraint": { "futureConstraint": { "source": right_hand_node } }
+                    }),
+                );
+            }
+        }
+
         if with_spring_bone {
             json["extensions"]["VRMC_springBone"] = serde_json::json!({
                 "specVersion": "1.0",
@@ -1030,26 +1216,45 @@ mod tests {
                 }]
             });
         }
-        json["extensionsUsed"] = if with_spring_bone {
-            serde_json::json!([
-                "VRMC_vrm",
-                "VRMC_springBone",
-                "KHR_texture_transform",
-                "KHR_materials_unlit"
-            ])
-        } else {
-            serde_json::json!(["VRMC_vrm", "KHR_texture_transform", "KHR_materials_unlit"])
-        };
-        json["extensionsRequired"] = if with_spring_bone {
-            serde_json::json!(["VRMC_vrm", "VRMC_springBone"])
-        } else {
-            serde_json::json!(["VRMC_vrm"])
-        };
+
+        let mut extensions_used = vec![
+            serde_json::json!("VRMC_vrm"),
+            serde_json::json!("KHR_texture_transform"),
+            serde_json::json!("KHR_materials_unlit"),
+        ];
+        let mut extensions_required = vec![serde_json::json!("VRMC_vrm")];
+        if with_spring_bone {
+            extensions_used.push(serde_json::json!("VRMC_springBone"));
+            extensions_required.push(serde_json::json!("VRMC_springBone"));
+        }
+        if constraint_fixture.is_present() {
+            extensions_used.push(serde_json::json!("VRMC_node_constraint"));
+        }
+        if constraint_fixture.is_required() {
+            extensions_required.push(serde_json::json!("VRMC_node_constraint"));
+        }
+        json["extensionsUsed"] = Value::Array(extensions_used);
+        json["extensionsRequired"] = Value::Array(extensions_required);
 
         let mut file = tempfile::Builder::new().suffix(".vrm").tempfile().unwrap();
         file.write_all(&glb_with_json_and_bin(&json, source_glb.bin))
             .unwrap();
         (file, root_node, spine_node, expression_node)
+    }
+
+    fn prepare_constraint_fixture(
+        gpu: &Gpu,
+        renderer: &Renderer,
+        bundle_path: &Path,
+        fixture: ConstraintFixture,
+    ) -> std::result::Result<AvatarCandidate, AvatarRuntimeError> {
+        let (file, _, _, _) = generated_vrm1_avatar(false, None, fixture);
+        AvatarCandidate::prepare(
+            gpu,
+            renderer,
+            bundle_path,
+            &AvatarLoadRequest::new(file.path().to_owned(), None, format!("{fixture:?}")),
+        )
     }
 
     #[test]
@@ -1421,7 +1626,7 @@ mod tests {
             }]
         });
         assert_eq!(
-            vrm1_allowed_required_extensions(&json, false).unwrap(),
+            vrm1_allowed_required_extensions(&json, false, false).unwrap(),
             ["VRMC_vrm", "VRMC_materials_mtoon"]
         );
 
@@ -1432,7 +1637,7 @@ mod tests {
                 }
             }]
         });
-        let error = vrm1_allowed_required_extensions(&json, false).unwrap_err();
+        let error = vrm1_allowed_required_extensions(&json, false, false).unwrap_err();
         assert!(format!("{error:#}").contains("KHR_materials_unlit"));
 
         let json = serde_json::json!({
@@ -1443,16 +1648,26 @@ mod tests {
                 }
             }]
         });
-        let error = vrm1_allowed_required_extensions(&json, false).unwrap_err();
+        let error = vrm1_allowed_required_extensions(&json, false, false).unwrap_err();
         assert!(format!("{error:#}").contains("KHR_materials_unlit"));
     }
 
     #[test]
-    fn vrm1_allowlist_does_not_claim_spring_or_constraint_runtime_support() {
+    fn vrm1_allowlist_only_claims_validated_optional_runtimes_when_required() {
         let json = serde_json::json!({"materials": []});
         assert_eq!(
-            vrm1_allowed_required_extensions(&json, false).unwrap(),
+            vrm1_allowed_required_extensions(&json, false, false).unwrap(),
             ["VRMC_vrm"]
+        );
+
+        let json = serde_json::json!({
+            "extensionsUsed": ["VRMC_node_constraint"],
+            "extensionsRequired": ["VRMC_node_constraint"]
+        });
+        assert!(vrm1_allowed_required_extensions(&json, false, false).is_err());
+        assert_eq!(
+            vrm1_allowed_required_extensions(&json, false, true).unwrap(),
+            ["VRMC_vrm", "VRMC_node_constraint"]
         );
     }
 
@@ -1461,9 +1676,9 @@ mod tests {
         let json = serde_json::json!({
             "extensions": {"VRMC_springBone": {"specVersion": "1.0"}}
         });
-        assert!(vrm1_allowed_required_extensions(&json, false).is_err());
+        assert!(vrm1_allowed_required_extensions(&json, false, false).is_err());
         assert_eq!(
-            vrm1_allowed_required_extensions(&json, true).unwrap(),
+            vrm1_allowed_required_extensions(&json, true, false).unwrap(),
             ["VRMC_vrm", "VRMC_springBone"]
         );
     }
@@ -1519,7 +1734,7 @@ mod tests {
         let renderer = Renderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT).unwrap();
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let (model_file, root_node, spine_node, expression_node) =
-            generated_vrm1_avatar(false, None);
+            generated_vrm1_avatar(false, None, ConstraintFixture::None);
         let request = AvatarLoadRequest::new(
             model_file.path().to_owned(),
             Some(root.join("assets/idle_loop.vrma")),
@@ -1583,6 +1798,7 @@ mod tests {
             candidate.presentation.transform,
             Mat4::from_rotation_y(core::f32::consts::PI)
         );
+        assert!(candidate.node_constraints.is_none());
 
         let (instance, mut active) = candidate.into_parts(AvatarSceneSlot::new(0));
         let mut scene = Scene::default();
@@ -1602,11 +1818,460 @@ mod tests {
     }
 
     #[test]
+    fn widget_tick_keeps_constraints_in_model_space_through_final_palette() {
+        let gpu = Gpu::new_headless().expect("headless GPU is required for VRM1 integration");
+        let renderer = Renderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT).unwrap();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let (model_file, _, spine_node, _) =
+            generated_vrm1_avatar(true, Some("bone"), ConstraintFixture::ValidAimOptional);
+        let request = AvatarLoadRequest::new(
+            model_file.path().to_owned(),
+            Some(root.join("assets/idle_loop.vrma")),
+            "GeneratedVrm1FullTick",
+        );
+        let candidate =
+            AvatarCandidate::prepare(&gpu, &renderer, &root.join("dist/character.js"), &request)
+                .expect("generated full-pipeline VRM1 candidate should prepare");
+        let (left_hand, right_hand, left_eye) = match &candidate.document {
+            AvatarSemanticDocument::Vrm1(document) => (
+                document
+                    .humanoid
+                    .node_for(pocket_vrm::Vrm1HumanBone::LeftHand)
+                    .unwrap(),
+                document
+                    .humanoid
+                    .node_for(pocket_vrm::Vrm1HumanBone::RightHand)
+                    .unwrap(),
+                document
+                    .humanoid
+                    .node_for(pocket_vrm::Vrm1HumanBone::LeftEye)
+                    .unwrap(),
+            ),
+            AvatarSemanticDocument::Vrm0(_) => unreachable!(),
+        };
+        assert!(candidate.clips.iter().any(|(name, _)| name == "idle_loop"));
+        assert!(candidate.clips.iter().any(|(name, clip)| {
+            name == "idle_loop"
+                && clip
+                    .channels
+                    .iter()
+                    .any(|channel| channel.node == right_hand)
+        }));
+        assert!(candidate.look_at.is_some());
+        assert!(candidate.node_constraints.is_some());
+        assert_eq!(
+            candidate.springs.as_ref().map(SpringSolver::joint_count),
+            Some(1)
+        );
+
+        let mut widget = Widget::new(WidgetConfig {
+            model_path: model_file.path().to_owned(),
+            vrma_path: root.join("assets/idle_loop.vrma"),
+            bundle_path: root.join("dist/character.js"),
+            menu_bundle_path: PathBuf::new(),
+            menu_pak_path: PathBuf::new(),
+            size: (450, 600),
+            cli_max_fps_override: None,
+            frames: None,
+        });
+        widget.commit_avatar_candidate(candidate);
+        {
+            let active = widget.active_avatar.as_mut().unwrap();
+            active.sim.tracking = TrackingMode::Mouse;
+            active.sim.mouse_target = Vec3::new(1.25, 1.75, 4.0);
+        }
+
+        <Widget as Game>::tick(&mut widget, 0.25, &Input::default());
+
+        let active = widget.active_avatar.as_ref().unwrap();
+        let instance = &widget.scene.models[active.scene_slot.index()];
+        let presentation = Mat4::from_rotation_y(core::f32::consts::PI);
+        assert_eq!(instance.transform, presentation);
+        assert_eq!(widget.tick_count, 1);
+        assert!(
+            active.locals[right_hand]
+                .rotation
+                .angle_between(active.asset.skeleton.rest[right_hand].rotation)
+                > 1.0e-4,
+            "VRMA should update its source joint before constraint evaluation"
+        );
+        assert!(
+            active.locals[left_eye]
+                .rotation
+                .angle_between(active.asset.skeleton.rest[left_eye].rotation)
+                > 1.0e-4,
+            "bone LookAt should update skeleton locals before constraints"
+        );
+        assert!(
+            active.locals[left_hand]
+                .rotation
+                .angle_between(active.asset.skeleton.rest[left_hand].rotation)
+                > 1.0e-4,
+            "the generated Aim constraint should produce a non-rest destination"
+        );
+
+        let mut recomputed_globals = vec![Mat4::IDENTITY; active.locals.len()];
+        active
+            .asset
+            .skeleton
+            .globals_from_locals(&active.locals, &mut recomputed_globals);
+        for (actual, expected) in active.globals.iter().zip(&recomputed_globals) {
+            assert!(
+                actual
+                    .to_cols_array()
+                    .into_iter()
+                    .zip(expected.to_cols_array())
+                    .all(|(a, b)| (a - b).abs() < 1.0e-5),
+                "final globals must be reconstructed solely from model-space locals"
+            );
+        }
+
+        let pose = instance
+            .pose
+            .as_ref()
+            .expect("Widget::tick must publish a final pose");
+        assert_eq!(pose.len(), active.globals.len());
+        for (actual, expected) in pose.iter().zip(&active.globals) {
+            assert!(
+                actual
+                    .to_cols_array()
+                    .into_iter()
+                    .zip(expected.to_cols_array())
+                    .all(|(a, b)| (a - b).abs() < 1.0e-5)
+            );
+        }
+
+        let mut global_rotations = vec![glam::Quat::IDENTITY; active.locals.len()];
+        for &node in &active.asset.skeleton.order {
+            let local = active.locals[node].rotation.normalize();
+            let parent = active.asset.skeleton.parents[node];
+            global_rotations[node] = if parent == usize::MAX {
+                local
+            } else {
+                (global_rotations[parent] * local).normalize()
+            };
+        }
+        let parent = active.asset.skeleton.parents[left_hand];
+        let parent_rotation = if parent == usize::MAX {
+            glam::Quat::IDENTITY
+        } else {
+            global_rotations[parent]
+        };
+        let aimed = parent_rotation * active.locals[left_hand].rotation * Vec3::X;
+        let direction = (active.globals[right_hand].w_axis.truncate()
+            - active.globals[left_hand].w_axis.truncate())
+        .normalize();
+        assert!(
+            aimed.normalize().dot(direction) > 0.999,
+            "Aim must use the final model-space skeleton, never the instance transform"
+        );
+
+        let mut palette = Vec::new();
+        active.asset.palette_from_globals(pose, &mut palette);
+        let mut palette_index = 0;
+        let mut constrained_palette_entry = None;
+        for skin in &active.asset.skins {
+            for (joint, &node) in skin.joints.iter().enumerate() {
+                if node == left_hand {
+                    constrained_palette_entry = Some((
+                        palette_index,
+                        active.globals[left_hand] * skin.inverse_bind[joint],
+                    ));
+                    break;
+                }
+                palette_index += 1;
+            }
+            if constrained_palette_entry.is_some() {
+                break;
+            }
+        }
+        let (palette_index, expected_palette) =
+            constrained_palette_entry.expect("constrained hand should be a skinned joint");
+        assert!(
+            palette[palette_index]
+                .to_cols_array()
+                .into_iter()
+                .zip(expected_palette.to_cols_array())
+                .all(|(a, b)| (a - b).abs() < 1.0e-5),
+            "skin palette must observe the constrained final pose"
+        );
+        assert!(
+            active.springs.is_some(),
+            "SpringBone remains live after the tick"
+        );
+        assert!(active.locals[spine_node].rotation.is_finite());
+    }
+
+    #[test]
+    fn generated_node_constraint_loading_policy_and_lifecycle_are_transactional() {
+        let gpu = Gpu::new_headless().expect("headless GPU is required for constraint integration");
+        let renderer = Renderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT).unwrap();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let bundle = root.join("dist/character.js");
+
+        let optional =
+            prepare_constraint_fixture(&gpu, &renderer, &bundle, ConstraintFixture::ValidOptional)
+                .expect("valid optional constraints should prepare");
+        assert!(optional.node_constraints.is_some());
+
+        let required =
+            prepare_constraint_fixture(&gpu, &renderer, &bundle, ConstraintFixture::ValidRequired)
+                .expect("valid required constraints should prepare");
+        assert!(required.node_constraints.is_some());
+
+        for fixture in [
+            ConstraintFixture::MalformedOptional,
+            ConstraintFixture::CyclicOptional,
+        ] {
+            let candidate = prepare_constraint_fixture(&gpu, &renderer, &bundle, fixture)
+                .expect("invalid optional constraints should downgrade atomically");
+            assert!(candidate.node_constraints.is_none(), "{fixture:?}");
+        }
+
+        for fixture in [
+            ConstraintFixture::MalformedRequired,
+            ConstraintFixture::CyclicRequired,
+            ConstraintFixture::UnsupportedRequired,
+        ] {
+            let error = match prepare_constraint_fixture(&gpu, &renderer, &bundle, fixture) {
+                Ok(_) => panic!("invalid required constraints must reject {fixture:?}"),
+                Err(error) => error,
+            };
+            assert!(
+                error.message().contains("VRMC_node_constraint")
+                    || error.message().contains("node constraint"),
+                "{fixture:?}: {error:#}"
+            );
+        }
+
+        let slot = AvatarSceneSlot::new(0);
+        let (_instance, old_active) = optional.into_parts(slot);
+        assert!(old_active.node_constraints.is_some());
+        let failed_replacement =
+            prepare_constraint_fixture(&gpu, &renderer, &bundle, ConstraintFixture::CyclicRequired);
+        assert!(failed_replacement.is_err());
+        assert!(
+            old_active.node_constraints.is_some(),
+            "failed replacement must not mutate the active constraint runtime"
+        );
+
+        let replacement =
+            prepare_constraint_fixture(&gpu, &renderer, &bundle, ConstraintFixture::None)
+                .expect("constraint-free replacement should prepare");
+        let (_instance, replacement_active) = replacement.into_parts(slot);
+        assert!(
+            replacement_active.node_constraints.is_none(),
+            "successful replacement must not retain the old runtime"
+        );
+    }
+
+    #[test]
+    fn official_constraint_twist_sample_prepares_evaluates_and_feeds_springs() {
+        let fixture = Path::new(r"C:\Users\Breeze\Downloads\VRM1_Constraint_Twist_Sample.vrm");
+        if !fixture.is_file() {
+            eprintln!(
+                "skipping local official VRMC_node_constraint fixture: {} is unavailable",
+                fixture.display()
+            );
+            return;
+        }
+
+        let bytes = std::fs::read(fixture).expect("reading official constraint fixture");
+        let document =
+            Vrm1Doc::from_glb_bytes(&bytes).expect("parsing official constraint fixture");
+        let glb =
+            pocket_vrm::glb::parse_glb(&bytes).expect("reading official fixture declarations");
+        assert_eq!(document.node_count, 171);
+        assert!(
+            extension_declaration_contains(&glb.json, "extensionsUsed", "VRMC_node_constraint")
+                .unwrap()
+        );
+        assert!(
+            !extension_declaration_contains(
+                &glb.json,
+                "extensionsRequired",
+                "VRMC_node_constraint"
+            )
+            .unwrap()
+        );
+
+        let semantics = document
+            .node_constraint_semantics
+            .clone()
+            .expect("official fixture should contain typed constraints");
+        let spring_semantics = document
+            .spring_bone_semantics
+            .clone()
+            .expect("official fixture should contain SpringBone chains");
+        assert_eq!(semantics.constraints.len(), 14);
+        assert_eq!(spring_semantics.springs.len(), 22);
+        let mut metadata_counts = (0usize, 0usize, 0usize);
+        for constraint in &semantics.constraints {
+            match constraint.kind {
+                pocket_vrm::Vrm1NodeConstraintKind::Roll { .. } => metadata_counts.0 += 1,
+                pocket_vrm::Vrm1NodeConstraintKind::Aim { .. } => metadata_counts.1 += 1,
+                pocket_vrm::Vrm1NodeConstraintKind::Rotation { .. } => metadata_counts.2 += 1,
+            }
+        }
+        assert_eq!(metadata_counts, (8, 6, 0));
+
+        let gpu = Gpu::new_headless().expect("headless GPU is required for official fixture smoke");
+        let renderer = Renderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT).unwrap();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let request = AvatarLoadRequest::new(fixture.to_owned(), None, "ConstraintTwistSample");
+        let mut candidate =
+            AvatarCandidate::prepare(&gpu, &renderer, &root.join("dist/character.js"), &request)
+                .expect("official optional constraint fixture should prepare");
+        let runtime = candidate
+            .node_constraints
+            .as_ref()
+            .expect("official fixture should resolve a runtime");
+        assert_eq!(runtime.kind_counts(), (8, 6, 0));
+        assert_eq!(runtime.ordered_destinations().len(), 14);
+        assert!(candidate.springs.is_some());
+
+        let roll = semantics
+            .constraints
+            .iter()
+            .find_map(|constraint| match constraint.kind {
+                pocket_vrm::Vrm1NodeConstraintKind::Roll {
+                    source,
+                    axis,
+                    weight,
+                } => Some((constraint.destination, source, axis, weight)),
+                _ => None,
+            })
+            .expect("official fixture should contain Roll");
+        candidate.locals.clone_from(&candidate.asset.skeleton.rest);
+        let source_rest = candidate.asset.skeleton.rest[roll.1].rotation;
+        let destination_rest = candidate.asset.skeleton.rest[roll.0].rotation;
+        let (source_current, expected_roll) = [Vec3::X, Vec3::Y, Vec3::Z]
+            .into_iter()
+            .find_map(|axis| {
+                let source_current = source_rest * glam::Quat::from_axis_angle(axis, 0.8);
+                let expected = pocket_vrm::apply_roll_constraint(
+                    source_rest,
+                    source_current,
+                    destination_rest,
+                    roll.2,
+                    roll.3,
+                );
+                (expected.angle_between(destination_rest) > 1.0e-3)
+                    .then_some((source_current, expected))
+            })
+            .expect("generated source motion should exercise official Roll");
+        candidate.locals[roll.1].rotation = source_current;
+        candidate.node_constraints.as_mut().unwrap().evaluate(
+            &candidate.asset.skeleton,
+            &mut candidate.locals,
+            &mut candidate.globals,
+        );
+        assert!(
+            candidate.locals[roll.0]
+                .rotation
+                .normalize()
+                .dot(expected_roll.normalize())
+                .abs()
+                > 1.0 - 1.0e-5
+        );
+
+        candidate.locals.clone_from(&candidate.asset.skeleton.rest);
+        candidate.node_constraints.as_mut().unwrap().evaluate(
+            &candidate.asset.skeleton,
+            &mut candidate.locals,
+            &mut candidate.globals,
+        );
+        let aim = semantics
+            .constraints
+            .iter()
+            .find_map(|constraint| match constraint.kind {
+                pocket_vrm::Vrm1NodeConstraintKind::Aim {
+                    source,
+                    axis,
+                    weight: 1.0,
+                } => Some((constraint.destination, source, axis)),
+                _ => None,
+            })
+            .expect("official fixture should contain a full-weight Aim");
+        let mut global_rotations = vec![glam::Quat::IDENTITY; candidate.locals.len()];
+        for &node in &candidate.asset.skeleton.order {
+            let local = candidate.locals[node].rotation.normalize();
+            let parent = candidate.asset.skeleton.parents[node];
+            global_rotations[node] = if parent == usize::MAX {
+                local
+            } else {
+                (global_rotations[parent] * local).normalize()
+            };
+        }
+        let parent = candidate.asset.skeleton.parents[aim.0];
+        let parent_rotation = if parent == usize::MAX {
+            glam::Quat::IDENTITY
+        } else {
+            global_rotations[parent]
+        };
+        let aimed =
+            parent_rotation * candidate.locals[aim.0].rotation * pocket_vrm::aim_axis_vector(aim.2);
+        let direction = (candidate.globals[aim.1].w_axis.truncate()
+            - candidate.globals[aim.0].w_axis.truncate())
+        .normalize();
+        assert!(aimed.normalize().dot(direction) > 0.999);
+
+        let is_strict_ancestor = |ancestor: usize, mut node: usize| {
+            node = candidate.asset.skeleton.parents[node];
+            while node != usize::MAX {
+                if node == ancestor {
+                    return true;
+                }
+                node = candidate.asset.skeleton.parents[node];
+            }
+            false
+        };
+        let constrained_spring_ancestor = semantics
+            .constraints
+            .iter()
+            .find_map(|constraint| {
+                spring_semantics
+                    .springs
+                    .iter()
+                    .filter_map(|spring| spring.joints.first())
+                    .any(|joint| is_strict_ancestor(constraint.destination, joint.node))
+                    .then_some(constraint.destination)
+            })
+            .expect("official fixture should constrain an ancestor of a SpringBone chain");
+        let constrained_rotation = candidate.locals[constrained_spring_ancestor].rotation;
+        candidate.springs.as_mut().unwrap().step(
+            1.0 / 60.0,
+            &candidate.asset.skeleton,
+            &mut candidate.locals,
+            Mat4::IDENTITY,
+        );
+        assert!(
+            candidate.locals[constrained_spring_ancestor]
+                .rotation
+                .normalize()
+                .dot(constrained_rotation.normalize())
+                .abs()
+                > 1.0 - 1.0e-5
+        );
+        candidate
+            .asset
+            .skeleton
+            .globals_from_locals(&candidate.locals, &mut candidate.globals);
+        assert!(candidate.globals.iter().all(|matrix| {
+            matrix
+                .to_cols_array()
+                .into_iter()
+                .all(|component| component.is_finite())
+        }));
+    }
+
+    #[test]
     fn generated_vrm1_candidate_builds_spring_solver() {
         let gpu = Gpu::new_headless().expect("headless GPU is required for VRM1 integration");
         let renderer = Renderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT).unwrap();
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let (model_file, _, _, _) = generated_vrm1_avatar(true, Some("bone"));
+        let (model_file, _, _, _) =
+            generated_vrm1_avatar(true, Some("bone"), ConstraintFixture::None);
         let request =
             AvatarLoadRequest::new(model_file.path().to_owned(), None, "GeneratedVrm1Spring");
         let candidate =
@@ -1629,7 +2294,8 @@ mod tests {
         let renderer = Renderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT).unwrap();
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
 
-        let (bone_file, _, _, _) = generated_vrm1_avatar(false, Some("bone"));
+        let (bone_file, _, _, _) =
+            generated_vrm1_avatar(false, Some("bone"), ConstraintFixture::None);
         let bone = AvatarCandidate::prepare(
             &gpu,
             &renderer,
@@ -1639,7 +2305,8 @@ mod tests {
         .expect("generated bone LookAt avatar should load");
         assert!(bone.look_at.is_some());
 
-        let (malformed_file, _, _, _) = generated_vrm1_avatar(false, Some("malformed"));
+        let (malformed_file, _, _, _) =
+            generated_vrm1_avatar(false, Some("malformed"), ConstraintFixture::None);
         let malformed = AvatarCandidate::prepare(
             &gpu,
             &renderer,
@@ -1660,8 +2327,10 @@ mod tests {
         let renderer = Renderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT).unwrap();
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let bundle = root.join("dist/character.js");
-        let (first_file, _, _, _) = generated_vrm1_avatar(false, Some("expression"));
-        let (second_file, _, _, _) = generated_vrm1_avatar(false, Some("expression"));
+        let (first_file, _, _, _) =
+            generated_vrm1_avatar(false, Some("expression"), ConstraintFixture::None);
+        let (second_file, _, _, _) =
+            generated_vrm1_avatar(false, Some("expression"), ConstraintFixture::None);
         let first = AvatarCandidate::prepare(
             &gpu,
             &renderer,

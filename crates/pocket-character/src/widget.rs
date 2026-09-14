@@ -2,8 +2,9 @@
 //!
 //! Tick order mirrors airi's VRMModel update (mixer → humanoid → lookAt →
 //! blink → expressions → constraints → springs), mapped onto the Pocket
-//! shape: sample clip locals → eye look-at → spring bones → globals →
-//! palette; blink lands as morph weights, uploaded only when it changes.
+//! shape: sample clip locals → eye look-at → expressions → constraints →
+//! spring bones → globals → palette; blink lands as morph weights, uploaded
+//! only when it changes.
 
 use std::fmt::Display;
 use std::path::PathBuf;
@@ -34,6 +35,7 @@ mod camera;
 mod controls;
 mod diagnostics;
 mod expression;
+mod node_constraint;
 
 use aa::AaRuntime;
 use avatar::{
@@ -1644,7 +1646,10 @@ impl Game for Widget {
                 ResolvedExpressionRuntime::Vrm0Legacy => {}
             }
 
-            // --- constraints (future insertion point) -------------------
+            // --- constraints --------------------------------------------
+            if let Some(constraints) = active.node_constraints.as_mut() {
+                constraints.evaluate(&model.skeleton, &mut active.locals, &mut active.globals);
+            }
 
             // --- springs ------------------------------------------------
             if let Some(springs) = active.springs.as_mut() {
