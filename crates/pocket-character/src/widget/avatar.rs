@@ -396,9 +396,9 @@ fn vrm1_allowed_required_extensions(
 
     let mut allowed = vec!["VRMC_vrm"];
     if has_mtoon {
-        // The parent does not implement MToon. It only permits the extension
-        // when the same material advertises the glTF unlit fallback that the
-        // existing renderer understands.
+        // Stage B covers only selected opaque/masked MToon surfaces. The
+        // required-extension allowlist still depends on each material's
+        // KHR_materials_unlit fallback for later-pass and BLEND semantics.
         allowed.push("VRMC_materials_mtoon");
     }
     if json
@@ -673,9 +673,10 @@ impl AvatarCandidate {
                 .map_err(|error| {
                     AvatarRuntimeError::new(AvatarLoadErrorKind::UnsupportedVrm, &error)
                 })?;
-                ModelAsset::load_glb_bytes_opts_with_material_descriptors(
+                ModelAsset::load_glb_bytes_opts_with_native_mtoon(
                     gpu,
                     &renderer.model_material_layout,
+                    &renderer.mtoon_material_layout,
                     &renderer.samplers,
                     &model_bytes,
                     &request.model_path.to_string_lossy(),
@@ -938,6 +939,57 @@ mod tests {
     use pocket3d::input::Input;
 
     use super::super::{Widget, WidgetConfig};
+
+    fn maybe_capture_ppm(name: &str, rgba: &[u8], size: (u32, u32)) {
+        let Ok(directory) = std::env::var("MTOON_STAGE_B_CAPTURE_DIR") else {
+            return;
+        };
+        let mut bytes = format!("P6\n{} {}\n255\n", size.0, size.1).into_bytes();
+        for pixel in rgba.as_chunks::<4>().0 {
+            bytes.extend_from_slice(&pixel[..3]);
+        }
+        std::fs::write(Path::new(&directory).join(name), bytes).unwrap();
+    }
+
+    fn render_avatar_smoke(
+        gpu: &Gpu,
+        renderer: &mut Renderer,
+        asset: Arc<ModelAsset>,
+        capture_name: &str,
+    ) -> usize {
+        let target = pocket3d::gpu::OffscreenTarget::new(gpu, 256, 256);
+        let (min, max) = asset.aabb;
+        let center = (min + max) * 0.5;
+        let radius = (max - min).length().max(1.0);
+        let camera = pocket3d::camera::Camera {
+            pos: center + Vec3::new(0.0, 0.0, radius * 1.5),
+            fov_y: 45.0_f32.to_radians(),
+            znear: 0.01,
+            zfar: radius * 10.0,
+            ..Default::default()
+        };
+        let mut scene = pocket3d::scene::Scene::default();
+        scene
+            .models
+            .push(pocket3d::model::ModelInstance::new(asset));
+        renderer.render(
+            gpu,
+            &target.view,
+            target.size,
+            &scene,
+            &camera,
+            &pocket3d::hud::Hud::default(),
+        );
+        gpu.device.poll(wgpu::PollType::Wait).unwrap();
+        let rgba = target.read_rgba(gpu).unwrap();
+        maybe_capture_ppm(capture_name, &rgba, target.size);
+        let background = &rgba[..4];
+        rgba.as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|pixel| pixel.iter().zip(background).any(|(a, b)| a != b))
+            .count()
+    }
 
     fn approx_vec3(actual: Vec3, expected: Vec3) {
         assert!(
@@ -1721,6 +1773,24 @@ mod tests {
             .expect("bundled default idle should be optional but loadable");
         assert!(success.clips.iter().any(|(name, _)| name == "idle_loop"));
         assert_eq!(success.capabilities.idle_clip.as_deref(), Some("idle_loop"));
+        assert!(
+            success
+                .asset
+                .primitives
+                .iter()
+                .all(|primitive| primitive.mtoon_bind_group.is_none())
+        );
+        let mut renderer = renderer;
+        let changed = render_avatar_smoke(
+            &gpu,
+            &mut renderer,
+            success.asset.clone(),
+            "mtoon-stage-b-legacy-regression.ppm",
+        );
+        assert!(
+            changed > 500,
+            "legacy avatar frame should contain a visible avatar"
+        );
 
         let failure_request = AvatarLoadRequest::new(
             model_path,
@@ -1734,7 +1804,7 @@ mod tests {
     }
 
     #[test]
-    fn local_vrm1_mtoon_stays_on_unlit_fallback() {
+    fn local_vrm1_mtoon_selects_native_stage_b_or_safe_fallback() {
         let fixture = Path::new(r"C:\Users\Breeze\Downloads\AvatarSample_VRM1.0.vrm");
         if !fixture.is_file() {
             eprintln!(
@@ -1744,13 +1814,13 @@ mod tests {
             return;
         }
 
-        let gpu = Gpu::new_headless().expect("headless GPU is required for MToon fallback smoke");
+        let gpu = Gpu::new_headless().expect("headless GPU is required for MToon smoke");
         let renderer = Renderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT).unwrap();
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let request = AvatarLoadRequest::new(fixture.to_owned(), None, "AvatarSample_VRM1");
         let candidate =
             AvatarCandidate::prepare(&gpu, &renderer, &root.join("dist/character.js"), &request)
-                .expect("VRM1 MToon fixture must prepare through its unlit fallback");
+                .expect("VRM1 MToon fixture must prepare");
         let authored = candidate.asset.materials();
         assert!(!authored.is_empty());
         assert!(
@@ -1758,13 +1828,277 @@ mod tests {
                 .iter()
                 .all(|material| { material.kind() == pocket3d::material::MaterialKind::Mtoon })
         );
-        assert!(
-            candidate
-                .asset
-                .primitives
-                .iter()
-                .all(|primitive| primitive.unlit)
+        let native = candidate
+            .asset
+            .primitives
+            .iter()
+            .filter(|primitive| primitive.mtoon_bind_group.is_some())
+            .count();
+        let fallback = candidate.asset.primitives.len() - native;
+        eprintln!("real VRM1 Stage B primitives: native {native}, fallback {fallback}");
+        assert_eq!(
+            native, 0,
+            "preferred fixture authors MatCap on every MToon material"
         );
+        assert!(candidate.asset.primitives.iter().all(|primitive| {
+            primitive.mtoon_bind_group.is_none()
+                || primitive.alpha_mode != pocket3d::material::MaterialAlphaMode::Blend
+        }));
+        let mut renderer = renderer;
+        let changed = render_avatar_smoke(
+            &gpu,
+            &mut renderer,
+            candidate.asset.clone(),
+            "mtoon-stage-b-preferred-fallback.ppm",
+        );
+        eprintln!("preferred VRM1 fallback pixels distinct from clear: {changed}");
+        assert!(
+            changed > 500,
+            "fallback VRM1 frame should contain a visible avatar"
+        );
+    }
+
+    #[test]
+    fn local_real_vrm1_eligible_mtoon_uses_native_stage_b() {
+        let fixture = Path::new(r"C:\Users\Breeze\Downloads\VRM1_Constraint_Twist_Sample.vrm");
+        if !fixture.is_file() {
+            eprintln!(
+                "skipping local native MToon smoke fixture: {}",
+                fixture.display()
+            );
+            return;
+        }
+        let gpu = Gpu::new_headless().expect("headless GPU is required for MToon smoke");
+        let renderer = Renderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT).unwrap();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let request =
+            AvatarLoadRequest::new(fixture.to_owned(), None, "VRM1_Constraint_Twist_Sample");
+        let candidate =
+            AvatarCandidate::prepare(&gpu, &renderer, &root.join("dist/character.js"), &request)
+                .expect("real VRM1 MToon fixture must prepare");
+        let native = candidate
+            .asset
+            .primitives
+            .iter()
+            .filter(|primitive| primitive.mtoon_bind_group.is_some())
+            .count();
+        let fallback = candidate.asset.primitives.len() - native;
+        eprintln!("eligible real VRM1 Stage B primitives: native {native}, fallback {fallback}");
+        assert!(native > 0);
+        assert!(candidate.asset.primitives.iter().all(|primitive| {
+            primitive.mtoon_bind_group.is_none()
+                || primitive.alpha_mode != pocket3d::material::MaterialAlphaMode::Blend
+        }));
+        let mut renderer = renderer;
+        let changed = render_avatar_smoke(
+            &gpu,
+            &mut renderer,
+            candidate.asset.clone(),
+            "mtoon-stage-b-native.ppm",
+        );
+        eprintln!("native VRM1 rendered pixels distinct from clear: {changed}");
+        assert!(
+            changed > 500,
+            "native MToon frame should contain a visible avatar"
+        );
+    }
+
+    #[test]
+    fn local_real_vrm1_native_mtoon_samples_uv1_and_texture_transform_override() {
+        let fixture = Path::new(r"C:\Users\Breeze\Downloads\VRM1_Constraint_Twist_Sample.vrm");
+        if !fixture.is_file() {
+            eprintln!(
+                "skipping local UV1 MToon smoke fixture: {}",
+                fixture.display()
+            );
+            return;
+        }
+        let gpu = Gpu::new_headless().expect("headless GPU is required for MToon UV smoke");
+        let renderer = Renderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT).unwrap();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let bundle = root.join("dist/character.js");
+        let original = AvatarCandidate::prepare(
+            &gpu,
+            &renderer,
+            &bundle,
+            &AvatarLoadRequest::new(fixture.to_owned(), None, "VRM1_UV_Source"),
+        )
+        .unwrap();
+        let native_indices: std::collections::HashSet<usize> = original
+            .asset
+            .primitives
+            .iter()
+            .filter(|primitive| primitive.mtoon_bind_group.is_some())
+            .filter_map(|primitive| primitive.material_index)
+            .collect();
+        assert!(!native_indices.is_empty());
+
+        let source = std::fs::read(fixture).unwrap();
+        let json_length = u32::from_le_bytes(source[12..16].try_into().unwrap()) as usize;
+        assert_eq!(&source[16..20], b"JSON");
+        let json_end = 20 + json_length;
+        let mut json: Value = serde_json::from_slice(&source[20..json_end]).unwrap();
+        let bin_length =
+            u32::from_le_bytes(source[json_end..json_end + 4].try_into().unwrap()) as usize;
+        assert_eq!(&source[json_end + 4..json_end + 8], b"BIN\0");
+        let bin = &source[json_end + 8..json_end + 8 + bin_length];
+        for mesh in json["meshes"].as_array_mut().unwrap() {
+            for primitive in mesh["primitives"].as_array_mut().unwrap() {
+                if let Some(uv0) = primitive["attributes"]["TEXCOORD_0"].as_u64() {
+                    // Reuse authored UV0 values as UV1 to isolate selection from geometry.
+                    primitive["attributes"]["TEXCOORD_1"] = serde_json::json!(uv0);
+                }
+            }
+        }
+        for (index, material) in json["materials"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .enumerate()
+        {
+            if !native_indices.contains(&index) {
+                continue;
+            }
+            let base = &mut material["pbrMetallicRoughness"]["baseColorTexture"];
+            if base.is_object() {
+                base["texCoord"] = serde_json::json!(1);
+            }
+            let shade = &mut material["extensions"]["VRMC_materials_mtoon"]["shadeMultiplyTexture"];
+            if shade.is_object() {
+                shade["texCoord"] = serde_json::json!(0);
+                shade["extensions"]["KHR_texture_transform"] = serde_json::json!({
+                    "texCoord": 1,
+                    "offset": [0.015, 0.025],
+                    "rotation": 0.1,
+                    "scale": [0.98, 1.02]
+                });
+            }
+        }
+        json["extensionsUsed"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!("KHR_texture_transform"));
+        let mut adapted = tempfile::Builder::new().suffix(".vrm").tempfile().unwrap();
+        adapted
+            .as_file_mut()
+            .write_all(&glb_with_json_and_bin(&json, bin))
+            .unwrap();
+        let candidate = AvatarCandidate::prepare(
+            &gpu,
+            &renderer,
+            &bundle,
+            &AvatarLoadRequest::new(adapted.path().to_owned(), None, "VRM1_UV1_Transform"),
+        )
+        .expect("real VRM1 with UV1 and KHR transform must prepare");
+        let adapted_native = candidate
+            .asset
+            .primitives
+            .iter()
+            .filter(|primitive| primitive.mtoon_bind_group.is_some())
+            .count();
+        let original_native = original
+            .asset
+            .primitives
+            .iter()
+            .filter(|primitive| primitive.mtoon_bind_group.is_some())
+            .count();
+        assert_eq!(adapted_native, original_native);
+        for index in native_indices {
+            let material = &candidate.asset.materials()[index];
+            let base = material.inputs.base_color_texture.as_ref().unwrap();
+            assert_eq!(base.effective_tex_coord(), 1);
+            let pocket3d::material::MaterialModel::Mtoon(mtoon) = &material.model else {
+                panic!("native material must retain typed MToon descriptor");
+            };
+            let shade = mtoon.shade_multiply_texture.as_ref().unwrap();
+            assert_eq!(shade.tex_coord, 0);
+            assert_eq!(shade.effective_tex_coord(), 1);
+            assert_eq!(shade.transform.offset, [0.015, 0.025]);
+        }
+        let mut renderer = renderer;
+        let changed = render_avatar_smoke(
+            &gpu,
+            &mut renderer,
+            candidate.asset.clone(),
+            "mtoon-stage-b-native-uv1.ppm",
+        );
+        assert!(
+            changed > 500,
+            "native UV1 frame should contain a visible avatar"
+        );
+    }
+
+    #[test]
+    fn local_real_vrm1_mask_normal_map_uses_native_stage_b() {
+        let fixture = Path::new(r"C:\Users\Breeze\Downloads\5447297406763866907.vrm");
+        if !fixture.is_file() {
+            eprintln!(
+                "skipping local MASK MToon smoke fixture: {}",
+                fixture.display()
+            );
+            return;
+        }
+        let gpu = Gpu::new_headless().expect("headless GPU is required for MToon smoke");
+        let renderer = Renderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT).unwrap();
+        let source = std::fs::read(fixture).unwrap();
+        let json_length = u32::from_le_bytes(source[12..16].try_into().unwrap()) as usize;
+        assert_eq!(&source[16..20], b"JSON");
+        let json_end = 20 + json_length;
+        let mut json: Value = serde_json::from_slice(&source[20..json_end]).unwrap();
+        let bin_length =
+            u32::from_le_bytes(source[json_end..json_end + 4].try_into().unwrap()) as usize;
+        assert_eq!(&source[json_end + 4..json_end + 8], b"BIN\0");
+        let bin = &source[json_end + 8..json_end + 8 + bin_length];
+        let mask_material = json["materials"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|material| {
+                material["name"]
+                    .as_str()
+                    .is_some_and(|name| name.contains("HairBack"))
+            })
+            .unwrap();
+        // Only remove out-of-scope emission; the MASK and normal-map source is
+        // otherwise authored exactly as in the real model.
+        mask_material["emissiveFactor"] = serde_json::json!([0.0, 0.0, 0.0]);
+        mask_material
+            .as_object_mut()
+            .unwrap()
+            .remove("emissiveTexture");
+        let mut adapted = tempfile::Builder::new().suffix(".vrm").tempfile().unwrap();
+        adapted
+            .as_file_mut()
+            .write_all(&glb_with_json_and_bin(&json, bin))
+            .unwrap();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let request = AvatarLoadRequest::new(adapted.path().to_owned(), None, "VRM1_Mask_Normal");
+        let candidate =
+            AvatarCandidate::prepare(&gpu, &renderer, &root.join("dist/character.js"), &request)
+                .expect("real VRM1 MASK MToon fixture must prepare");
+        let native_mask = candidate
+            .asset
+            .primitives
+            .iter()
+            .filter(|primitive| {
+                primitive.mtoon_bind_group.is_some()
+                    && primitive.alpha_mode == pocket3d::material::MaterialAlphaMode::Mask
+            })
+            .count();
+        eprintln!("real VRM1 native MASK primitives: {native_mask}");
+        assert!(
+            native_mask > 0,
+            "real fixture should exercise native MASK with normal map"
+        );
+        let mut renderer = renderer;
+        let changed = render_avatar_smoke(
+            &gpu,
+            &mut renderer,
+            candidate.asset.clone(),
+            "mtoon-stage-b-native-mask.ppm",
+        );
+        eprintln!("native MASK frame pixels distinct from clear: {changed}");
+        assert!(changed > 500);
     }
 
     #[test]
