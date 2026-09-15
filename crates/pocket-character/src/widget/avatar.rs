@@ -640,6 +640,10 @@ impl AvatarCandidate {
                 )
             }
             AvatarVersion::Vrm1 => {
+                let mtoon_descriptors = match &document {
+                    AvatarSemanticDocument::Vrm1(document) => document.mtoon_material_descriptors(),
+                    AvatarSemanticDocument::Vrm0(_) => unreachable!(),
+                };
                 let glb = pocket_vrm::glb::parse_glb(&model_bytes)
                     .context("parsing VRM 1.0 glTF material extensions")
                     .map_err(|error| {
@@ -669,7 +673,7 @@ impl AvatarCandidate {
                 .map_err(|error| {
                     AvatarRuntimeError::new(AvatarLoadErrorKind::UnsupportedVrm, &error)
                 })?;
-                ModelAsset::load_glb_bytes_opts_with_allowed_required_extensions(
+                ModelAsset::load_glb_bytes_opts_with_material_descriptors(
                     gpu,
                     &renderer.model_material_layout,
                     &renderer.samplers,
@@ -679,6 +683,7 @@ impl AvatarCandidate {
                         max_texture_dim: Some(2048),
                     },
                     allowed_required_extensions,
+                    &mtoon_descriptors,
                 )
             }
         }
@@ -1726,6 +1731,40 @@ mod tests {
             .expect("optional default idle failure must not fail avatar preparation");
         assert!(failure.clips.is_empty());
         assert_eq!(failure.capabilities.idle_clip, None);
+    }
+
+    #[test]
+    fn local_vrm1_mtoon_stays_on_unlit_fallback() {
+        let fixture = Path::new(r"C:\Users\Breeze\Downloads\AvatarSample_VRM1.0.vrm");
+        if !fixture.is_file() {
+            eprintln!(
+                "skipping local VRM1 MToon smoke fixture: {} is unavailable",
+                fixture.display()
+            );
+            return;
+        }
+
+        let gpu = Gpu::new_headless().expect("headless GPU is required for MToon fallback smoke");
+        let renderer = Renderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT).unwrap();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let request = AvatarLoadRequest::new(fixture.to_owned(), None, "AvatarSample_VRM1");
+        let candidate =
+            AvatarCandidate::prepare(&gpu, &renderer, &root.join("dist/character.js"), &request)
+                .expect("VRM1 MToon fixture must prepare through its unlit fallback");
+        let authored = candidate.asset.materials();
+        assert!(!authored.is_empty());
+        assert!(
+            authored
+                .iter()
+                .all(|material| { material.kind() == pocket3d::material::MaterialKind::Mtoon })
+        );
+        assert!(
+            candidate
+                .asset
+                .primitives
+                .iter()
+                .all(|primitive| primitive.unlit)
+        );
     }
 
     #[test]
