@@ -1804,7 +1804,7 @@ mod tests {
     }
 
     #[test]
-    fn local_vrm1_mtoon_stage_e_routes_all_supported_outlines_natively() {
+    fn local_vrm1_mtoon_stage_f_preserves_all_native_routes() {
         let fixture = Path::new(r"C:\Users\Breeze\Downloads\AvatarSample_VRM1.0.vrm");
         if !fixture.is_file() {
             eprintln!(
@@ -1835,7 +1835,7 @@ mod tests {
             .filter(|primitive| primitive.mtoon_bind_group.is_some())
             .count();
         let fallback = candidate.asset.primitives.len() - native;
-        eprintln!("real VRM1 Stage E primitives: native {native}, fallback {fallback}");
+        eprintln!("real VRM1 Stage F primitives: native {native}, fallback {fallback}");
         let native_materials: std::collections::HashSet<usize> = candidate
             .asset
             .primitives
@@ -1971,13 +1971,141 @@ mod tests {
             &gpu,
             &mut renderer,
             candidate.asset.clone(),
-            "mtoon-stage-e-preferred.ppm",
+            "mtoon-stage-f-preferred.ppm",
         );
-        eprintln!("preferred VRM1 Stage E pixels distinct from clear: {changed}");
+        eprintln!("preferred VRM1 Stage F pixels distinct from clear: {changed}");
         assert!(
             changed > 500,
-            "Stage E VRM1 frame should contain a visible avatar"
+            "Stage F VRM1 frame should contain a visible avatar"
         );
+
+        // This preferred avatar authors zero UV-animation speeds on all 15
+        // materials, so fixed-time Stage F rendering must be pixel-stable.
+        let target = pocket3d::gpu::OffscreenTarget::new(&gpu, 256, 256);
+        let (min, max) = candidate.asset.aabb;
+        let center = (min + max) * 0.5;
+        let radius = (max - min).length().max(1.0);
+        let camera = pocket3d::camera::Camera {
+            pos: center + Vec3::new(0.0, 0.0, radius * 1.5),
+            fov_y: 45.0_f32.to_radians(),
+            znear: 0.01,
+            zfar: radius * 10.0,
+            ..Default::default()
+        };
+        let mut scene = pocket3d::scene::Scene::default();
+        scene
+            .models
+            .push(pocket3d::model::ModelInstance::new(candidate.asset));
+        let frames = [0.0, 1000.0].map(|time| {
+            scene.time = time;
+            renderer.render(
+                &gpu,
+                &target.view,
+                target.size,
+                &scene,
+                &camera,
+                &pocket3d::hud::Hud::default(),
+            );
+            target.read_rgba(&gpu).unwrap()
+        });
+        assert_eq!(frames[0], frames[1]);
+    }
+
+    #[test]
+    fn official_mtoon_stage_f_fixture_routes_and_animates_all_three_quads() {
+        let fixture = std::env::var_os("MTOON_STAGE_F_FIXTURE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::temp_dir().join("VRMC_materials_mtoon_UV_Animation_Test.vrm")
+            });
+        if !fixture.is_file() {
+            eprintln!(
+                "skipping official MToon Stage F fixture: {} is unavailable",
+                fixture.display()
+            );
+            return;
+        }
+
+        let gpu = Gpu::new_headless().expect("headless GPU is required for MToon Stage F");
+        let mut renderer = Renderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT).unwrap();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let request = AvatarLoadRequest::new(fixture, None, "MToonUvAnimationTest");
+        let candidate =
+            AvatarCandidate::prepare(&gpu, &renderer, &root.join("dist/character.js"), &request)
+                .expect("official MToon UV Animation Test must prepare");
+
+        let authored = candidate.asset.materials();
+        assert_eq!(authored.len(), 3);
+        let expected = [
+            ("ScrollX", [1.0, 0.0, 0.0]),
+            ("ScrollY", [0.0, 1.0, 0.0]),
+            ("ScrollRot", [0.0, 0.0, 1.0]),
+        ];
+        for (material, (name, speeds)) in authored.iter().zip(expected) {
+            assert_eq!(material.name.as_deref(), Some(name));
+            let pocket3d::material::MaterialModel::Mtoon(mtoon) = &material.model else {
+                panic!("official Stage F fixture material must be typed MToon")
+            };
+            assert_eq!(
+                [
+                    mtoon.uv_animation_scroll_x_speed_factor,
+                    mtoon.uv_animation_scroll_y_speed_factor,
+                    mtoon.uv_animation_rotation_speed_factor,
+                ],
+                speeds
+            );
+        }
+        let native = candidate
+            .asset
+            .primitives
+            .iter()
+            .filter(|primitive| primitive.mtoon_bind_group.is_some())
+            .count();
+        assert_eq!((native, candidate.asset.primitives.len() - native), (3, 0));
+
+        let target = pocket3d::gpu::OffscreenTarget::new(&gpu, 384, 768);
+        let camera = pocket3d::camera::Camera {
+            pos: Vec3::new(0.0, 0.0, 5.0),
+            fov_y: 45.0_f32.to_radians(),
+            znear: 0.01,
+            zfar: 50.0,
+            ..Default::default()
+        };
+        let mut scene = pocket3d::scene::Scene::default();
+        scene
+            .models
+            .push(pocket3d::model::ModelInstance::new(candidate.asset));
+        let frames = [0.0, 0.5, 1.0].map(|time| {
+            scene.time = time;
+            renderer.render(
+                &gpu,
+                &target.view,
+                target.size,
+                &scene,
+                &camera,
+                &pocket3d::hud::Hud::default(),
+            );
+            target.read_rgba(&gpu).unwrap()
+        });
+        let changed_in_band = |a: &[u8], b: &[u8], y0: usize, y1: usize| {
+            (y0..y1)
+                .flat_map(|y| (0..target.size.0 as usize).map(move |x| (x, y)))
+                .filter(|&(x, y)| {
+                    let offset = (y * target.size.0 as usize + x) * 4;
+                    a[offset..offset + 4] != b[offset..offset + 4]
+                })
+                .count()
+        };
+        for (label, y0, y1) in [
+            ("rotation", 96, 192),
+            ("scroll-y", 192, 288),
+            ("scroll-x", 288, 384),
+        ] {
+            let first = changed_in_band(&frames[0], &frames[1], y0, y1);
+            let second = changed_in_band(&frames[1], &frames[2], y0, y1);
+            eprintln!("official Stage F {label}: changed pixels {first}/{second}");
+            assert!(first > 100 && second > 100, "{label} quad must animate");
+        }
     }
 
     #[test]
