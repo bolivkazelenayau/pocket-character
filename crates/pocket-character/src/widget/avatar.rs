@@ -396,7 +396,7 @@ fn vrm1_allowed_required_extensions(
 
     let mut allowed = vec!["VRMC_vrm"];
     if has_mtoon {
-        // Stage B covers only selected opaque/masked MToon surfaces. The
+        // Stage B+C cover selected opaque/masked MToon surfaces. The
         // required-extension allowlist still depends on each material's
         // KHR_materials_unlit fallback for later-pass and BLEND semantics.
         allowed.push("VRMC_materials_mtoon");
@@ -1804,7 +1804,7 @@ mod tests {
     }
 
     #[test]
-    fn local_vrm1_mtoon_selects_native_stage_b_or_safe_fallback() {
+    fn local_vrm1_mtoon_selects_native_stage_c_or_safe_fallback() {
         let fixture = Path::new(r"C:\Users\Breeze\Downloads\AvatarSample_VRM1.0.vrm");
         if !fixture.is_file() {
             eprintln!(
@@ -1835,10 +1835,40 @@ mod tests {
             .filter(|primitive| primitive.mtoon_bind_group.is_some())
             .count();
         let fallback = candidate.asset.primitives.len() - native;
-        eprintln!("real VRM1 Stage B primitives: native {native}, fallback {fallback}");
+        eprintln!("real VRM1 Stage C primitives: native {native}, fallback {fallback}");
+        let native_materials: std::collections::HashSet<usize> = candidate
+            .asset
+            .primitives
+            .iter()
+            .filter(|primitive| primitive.mtoon_bind_group.is_some())
+            .filter_map(|primitive| primitive.material_index)
+            .collect();
         assert_eq!(
-            native, 0,
-            "preferred fixture authors MatCap on every MToon material"
+            native_materials,
+            [0, 4, 11, 12, 13, 14].into_iter().collect()
+        );
+        assert_eq!(authored.len(), 15);
+        assert_eq!(
+            authored
+                .iter()
+                .filter(|material| {
+                    material.inputs.alpha_mode == pocket3d::material::MaterialAlphaMode::Blend
+                })
+                .count(),
+            4
+        );
+        assert_eq!(
+            authored
+                .iter()
+                .filter(|material| {
+                    matches!(
+                        &material.model,
+                        pocket3d::material::MaterialModel::Mtoon(mtoon)
+                            if mtoon.outline_width_mode != pocket3d::material::MtoonOutlineWidthMode::None
+                    )
+                })
+                .count(),
+            5
         );
         assert!(candidate.asset.primitives.iter().all(|primitive| {
             primitive.mtoon_bind_group.is_none()
@@ -1849,12 +1879,12 @@ mod tests {
             &gpu,
             &mut renderer,
             candidate.asset.clone(),
-            "mtoon-stage-b-preferred-fallback.ppm",
+            "mtoon-stage-c-preferred.ppm",
         );
         eprintln!("preferred VRM1 fallback pixels distinct from clear: {changed}");
         assert!(
             changed > 500,
-            "fallback VRM1 frame should contain a visible avatar"
+            "Stage C VRM1 frame should contain a visible avatar"
         );
     }
 
