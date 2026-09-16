@@ -1804,7 +1804,7 @@ mod tests {
     }
 
     #[test]
-    fn local_vrm1_mtoon_selects_native_stage_d_or_safe_fallback() {
+    fn local_vrm1_mtoon_stage_e_routes_all_supported_outlines_natively() {
         let fixture = Path::new(r"C:\Users\Breeze\Downloads\AvatarSample_VRM1.0.vrm");
         if !fixture.is_file() {
             eprintln!(
@@ -1835,7 +1835,7 @@ mod tests {
             .filter(|primitive| primitive.mtoon_bind_group.is_some())
             .count();
         let fallback = candidate.asset.primitives.len() - native;
-        eprintln!("real VRM1 Stage D primitives: native {native}, fallback {fallback}");
+        eprintln!("real VRM1 Stage E primitives: native {native}, fallback {fallback}");
         let native_materials: std::collections::HashSet<usize> = candidate
             .asset
             .primitives
@@ -1843,11 +1843,8 @@ mod tests {
             .filter(|primitive| primitive.mtoon_bind_group.is_some())
             .filter_map(|primitive| primitive.material_index)
             .collect();
-        assert_eq!(
-            native_materials,
-            [0, 1, 2, 4, 5, 6, 11, 12, 13, 14].into_iter().collect()
-        );
-        assert_eq!((native, fallback), (10, 5));
+        assert_eq!(native_materials, (0..15).collect());
+        assert_eq!((native, fallback), (15, 0));
         let fallback_materials: std::collections::HashSet<usize> = candidate
             .asset
             .primitives
@@ -1855,17 +1852,59 @@ mod tests {
             .filter(|primitive| primitive.mtoon_bind_group.is_none())
             .filter_map(|primitive| primitive.material_index)
             .collect();
-        assert_eq!(fallback_materials, [3, 7, 8, 9, 10].into_iter().collect());
-        for &index in &fallback_materials {
-            assert!(matches!(
-                &authored[index].model,
-                pocket3d::material::MaterialModel::Mtoon(mtoon)
-                    if mtoon.outline_width_mode
-                        != pocket3d::material::MtoonOutlineWidthMode::None
-                        && mtoon.uv_animation_scroll_x_speed_factor == 0.0
-                        && mtoon.uv_animation_scroll_y_speed_factor == 0.0
-                        && mtoon.uv_animation_rotation_speed_factor == 0.0
-            ));
+        assert!(fallback_materials.is_empty());
+        let outlined = [3, 7, 8, 9, 10];
+        let outlined_primitives: std::collections::HashSet<usize> = candidate
+            .asset
+            .primitives
+            .iter()
+            .filter(|primitive| primitive.mtoon_outline)
+            .filter_map(|primitive| primitive.material_index)
+            .collect();
+        assert_eq!(outlined_primitives, outlined.into_iter().collect());
+        for &index in &outlined {
+            let pocket3d::material::MaterialModel::Mtoon(mtoon) = &authored[index].model else {
+                unreachable!()
+            };
+            assert_eq!(
+                mtoon.outline_width_mode,
+                pocket3d::material::MtoonOutlineWidthMode::WorldCoordinates
+            );
+            assert!((mtoon.outline_width_factor - 0.00075).abs() < 1e-8);
+            assert_eq!(
+                mtoon.outline_color_factor,
+                [0.061246056, 0.008568122, 0.014443838]
+            );
+            assert_eq!(mtoon.outline_lighting_mix_factor, 0.0);
+            assert_eq!(
+                authored[index].inputs.alpha_mode,
+                pocket3d::material::MaterialAlphaMode::Mask
+            );
+            assert_eq!(authored[index].inputs.alpha_cutoff, 0.5);
+            assert_eq!(mtoon.render_queue_offset_number, 0);
+            assert!(!mtoon.transparent_with_z_write);
+            assert_eq!(mtoon.uv_animation_scroll_x_speed_factor, 0.0);
+            assert_eq!(mtoon.uv_animation_scroll_y_speed_factor, 0.0);
+            assert_eq!(mtoon.uv_animation_rotation_speed_factor, 0.0);
+            if index == 3 {
+                let width = mtoon.outline_width_multiply_texture.as_ref().unwrap();
+                assert_eq!(width.texture_index, 26);
+                assert_eq!(width.effective_tex_coord(), 0);
+                assert_eq!(
+                    width.transform,
+                    pocket3d::material::TextureTransform::default()
+                );
+                assert_eq!(
+                    width.sampler.mag_filter,
+                    Some(pocket3d::material::GltfMagFilter::Linear)
+                );
+                assert_eq!(
+                    width.sampler.min_filter,
+                    Some(pocket3d::material::GltfMinFilter::Linear)
+                );
+            } else {
+                assert!(mtoon.outline_width_multiply_texture.is_none());
+            }
         }
         assert_eq!(authored.len(), 15);
         assert_eq!(
@@ -1932,17 +1971,17 @@ mod tests {
             &gpu,
             &mut renderer,
             candidate.asset.clone(),
-            "mtoon-stage-d-preferred.ppm",
+            "mtoon-stage-e-preferred.ppm",
         );
-        eprintln!("preferred VRM1 fallback pixels distinct from clear: {changed}");
+        eprintln!("preferred VRM1 Stage E pixels distinct from clear: {changed}");
         assert!(
             changed > 500,
-            "Stage D VRM1 frame should contain a visible avatar"
+            "Stage E VRM1 frame should contain a visible avatar"
         );
     }
 
     #[test]
-    fn local_real_vrm1_eligible_mtoon_preserves_stage_b_routes() {
+    fn local_real_vrm1_eligible_mtoon_preserves_native_routes_through_stage_e() {
         let fixture = Path::new(r"C:\Users\Breeze\Downloads\VRM1_Constraint_Twist_Sample.vrm");
         if !fixture.is_file() {
             eprintln!(
@@ -1966,8 +2005,8 @@ mod tests {
             .filter(|primitive| primitive.mtoon_bind_group.is_some())
             .count();
         let fallback = candidate.asset.primitives.len() - native;
-        eprintln!("eligible real VRM1 Stage B primitives: native {native}, fallback {fallback}");
-        assert_eq!((native, fallback), (6, 7));
+        eprintln!("eligible real VRM1 Stage E primitives: native {native}, fallback {fallback}");
+        assert_eq!((native, fallback), (13, 0));
         assert!(candidate.asset.primitives.iter().all(|primitive| {
             primitive.mtoon_bind_group.is_none()
                 || primitive.alpha_mode != pocket3d::material::MaterialAlphaMode::Blend
