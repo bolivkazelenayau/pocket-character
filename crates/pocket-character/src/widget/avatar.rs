@@ -363,42 +363,16 @@ fn vrm0_allowed_required_extensions() -> [&'static str; 1] {
 
 fn vrm1_allowed_required_extensions(
     json: &Value,
+    mtoon_supported: bool,
     spring_bone_supported: bool,
     node_constraint_supported: bool,
 ) -> Result<Vec<&'static str>> {
-    let materials = match json.get("materials") {
-        None => &[][..],
-        Some(value) => value
-            .as_array()
-            .with_context(|| "VRM 1.0 glTF materials must be an array")?,
-    };
-    let mut has_mtoon = false;
-    for (index, material) in materials.iter().enumerate() {
-        let material = material
-            .as_object()
-            .with_context(|| format!("VRM 1.0 material {index} must be an object"))?;
-        let Some(extensions) = material.get("extensions") else {
-            continue;
-        };
-        let extensions = extensions
-            .as_object()
-            .with_context(|| format!("VRM 1.0 material {index}.extensions must be an object"))?;
-        if extensions.contains_key("VRMC_materials_mtoon") {
-            has_mtoon = true;
-            ensure!(
-                extensions
-                    .get("KHR_materials_unlit")
-                    .is_some_and(Value::is_object),
-                "VRM 1.0 material {index} uses VRMC_materials_mtoon without the supported KHR_materials_unlit fallback"
-            );
-        }
-    }
-
     let mut allowed = vec!["VRMC_vrm"];
-    if has_mtoon {
-        // Stage B+C cover selected opaque/masked MToon surfaces. The
-        // required-extension allowlist still depends on each material's
-        // KHR_materials_unlit fallback for later-pass and BLEND semantics.
+    if extension_declaration_contains(json, "extensionsRequired", "VRMC_materials_mtoon")? {
+        ensure!(
+            mtoon_supported,
+            "VRMC_materials_mtoon is required but its supported 1.0 semantics were not parsed"
+        );
         allowed.push("VRMC_materials_mtoon");
     }
     if json
@@ -659,6 +633,10 @@ impl AvatarCandidate {
                     AvatarSemanticDocument::Vrm1(document)
                         if document.node_constraint_semantics.is_some()
                 );
+                let mtoon_supported = matches!(
+                    &document,
+                    AvatarSemanticDocument::Vrm1(document) if document.materials_mtoon.present
+                );
                 node_constraint_required = extension_declaration_contains(
                     &glb.json,
                     "extensionsRequired",
@@ -667,6 +645,7 @@ impl AvatarCandidate {
                 .map_err(|error| AvatarRuntimeError::new(AvatarLoadErrorKind::VrmParse, &error))?;
                 let allowed_required_extensions = vrm1_allowed_required_extensions(
                     &glb.json,
+                    mtoon_supported,
                     spring_bone_supported,
                     node_constraint_supported,
                 )
@@ -1019,6 +998,166 @@ mod tests {
         glb.extend_from_slice(b"BIN\0");
         glb.extend_from_slice(&bin_bytes);
         glb
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum MtoonPolicyFixture {
+        OptionalNative,
+        OptionalNativeWithUnlit,
+        RequiredNative,
+        RequiredNativeWithUnlit,
+        OptionalFuture,
+        RequiredFuture,
+        OptionalUnsupportedUv,
+        OptionalUnsupportedUvWithUnlit,
+        RequiredUnsupportedUv,
+        RequiredUnknownDependency,
+    }
+
+    impl MtoonPolicyFixture {
+        fn is_required(self) -> bool {
+            matches!(
+                self,
+                Self::RequiredNative
+                    | Self::RequiredNativeWithUnlit
+                    | Self::RequiredFuture
+                    | Self::RequiredUnsupportedUv
+                    | Self::RequiredUnknownDependency
+            )
+        }
+
+        fn has_unlit(self) -> bool {
+            matches!(
+                self,
+                Self::OptionalNativeWithUnlit
+                    | Self::RequiredNativeWithUnlit
+                    | Self::OptionalUnsupportedUvWithUnlit
+            )
+        }
+    }
+
+    fn generated_mtoon_policy_avatar(fixture: MtoonPolicyFixture) -> tempfile::NamedTempFile {
+        let required_bones = [
+            "hips",
+            "spine",
+            "head",
+            "leftUpperLeg",
+            "leftLowerLeg",
+            "leftFoot",
+            "rightUpperLeg",
+            "rightLowerLeg",
+            "rightFoot",
+            "leftUpperArm",
+            "leftLowerArm",
+            "leftHand",
+            "rightUpperArm",
+            "rightLowerArm",
+            "rightHand",
+        ];
+        let human_bones = required_bones
+            .iter()
+            .enumerate()
+            .map(|(node, name)| ((*name).to_owned(), serde_json::json!({"node":node})))
+            .collect::<serde_json::Map<_, _>>();
+        let nodes = required_bones
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                if index == 0 {
+                    serde_json::json!({"name":name,"mesh":0})
+                } else {
+                    serde_json::json!({"name":name})
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut bin = Vec::new();
+        for value in [-0.75_f32, -0.75, 0.0, 0.75, -0.75, 0.0, 0.0, 0.75, 0.0] {
+            bin.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in [0.0_f32, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0] {
+            bin.extend_from_slice(&value.to_le_bytes());
+        }
+
+        let spec_version = if matches!(
+            fixture,
+            MtoonPolicyFixture::OptionalFuture | MtoonPolicyFixture::RequiredFuture
+        ) {
+            "1.1"
+        } else {
+            "1.0"
+        };
+        let mut mtoon = serde_json::json!({"specVersion":spec_version});
+        if matches!(
+            fixture,
+            MtoonPolicyFixture::OptionalUnsupportedUv
+                | MtoonPolicyFixture::OptionalUnsupportedUvWithUnlit
+                | MtoonPolicyFixture::RequiredUnsupportedUv
+        ) {
+            mtoon["shadeMultiplyTexture"] = serde_json::json!({"index":0,"texCoord":2});
+        }
+        let mut material_extensions =
+            serde_json::Map::from_iter([("VRMC_materials_mtoon".to_owned(), mtoon)]);
+        if fixture.has_unlit() {
+            material_extensions.insert("KHR_materials_unlit".to_owned(), serde_json::json!({}));
+        }
+        let mut extensions_used = vec![
+            serde_json::json!("VRMC_vrm"),
+            serde_json::json!("VRMC_materials_mtoon"),
+        ];
+        if fixture.has_unlit() {
+            extensions_used.push(serde_json::json!("KHR_materials_unlit"));
+        }
+        let mut extensions_required = vec![serde_json::json!("VRMC_vrm")];
+        if fixture.is_required() {
+            extensions_required.push(serde_json::json!("VRMC_materials_mtoon"));
+        }
+        if fixture == MtoonPolicyFixture::RequiredUnknownDependency {
+            extensions_used.push(serde_json::json!("X_mtoon_future_dependency"));
+            extensions_required.push(serde_json::json!("X_mtoon_future_dependency"));
+        }
+
+        let json = serde_json::json!({
+            "asset":{"version":"2.0"},
+            "scene":0,
+            "scenes":[{"nodes":(0..required_bones.len()).collect::<Vec<_>>() }],
+            "nodes":nodes,
+            "meshes":[{"primitives":[{
+                "attributes":{"POSITION":0,"NORMAL":1},
+                "material":0
+            }]}],
+            "materials":[{
+                "name":"StageH",
+                "doubleSided":true,
+                "pbrMetallicRoughness":{"baseColorFactor":[0.8,0.6,0.4,1.0]},
+                "extensions":Value::Object(material_extensions)
+            }],
+            "images":[{"uri":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}],
+            "textures":[{"source":0}],
+            "buffers":[{"byteLength":bin.len()}],
+            "bufferViews":[
+                {"buffer":0,"byteOffset":0,"byteLength":36,"target":34962},
+                {"buffer":0,"byteOffset":36,"byteLength":36,"target":34962}
+            ],
+            "accessors":[
+                {"bufferView":0,"componentType":5126,"count":3,"type":"VEC3","min":[-0.75,-0.75,0.0],"max":[0.75,0.75,0.0]},
+                {"bufferView":1,"componentType":5126,"count":3,"type":"VEC3"}
+            ],
+            "extensionsUsed":extensions_used,
+            "extensionsRequired":extensions_required,
+            "extensions":{"VRMC_vrm":{
+                "specVersion":"1.0",
+                "meta":{
+                    "name":"Stage H policy fixture",
+                    "authors":["pocket-character tests"],
+                    "licenseUrl":"https://example.invalid/license"
+                },
+                "humanoid":{"humanBones":human_bones}
+            }}
+        });
+        let mut file = tempfile::Builder::new().suffix(".vrm").tempfile().unwrap();
+        file.write_all(&glb_with_json_and_bin(&json, &bin)).unwrap();
+        file
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1673,47 +1812,109 @@ mod tests {
     }
 
     #[test]
-    fn vrm1_allowlist_only_accepts_supported_material_fallbacks() {
+    fn vrm1_allowlist_accepts_required_native_mtoon_without_unlit() {
         let json = serde_json::json!({
-            "materials": [{
-                "extensions": {
-                    "VRMC_materials_mtoon": {"specVersion": "1.0"},
-                    "KHR_materials_unlit": {}
-                }
-            }]
+            "extensionsUsed": ["VRMC_materials_mtoon"],
+            "extensionsRequired": ["VRMC_materials_mtoon"],
+            "materials": [{"extensions": {
+                "VRMC_materials_mtoon": {"specVersion": "1.0"}
+            }}]
         });
         assert_eq!(
-            vrm1_allowed_required_extensions(&json, false, false).unwrap(),
+            vrm1_allowed_required_extensions(&json, true, false, false).unwrap(),
             ["VRMC_vrm", "VRMC_materials_mtoon"]
         );
+        let error = vrm1_allowed_required_extensions(&json, false, false, false).unwrap_err();
+        assert!(format!("{error:#}").contains("supported 1.0 semantics"));
+    }
 
-        let json = serde_json::json!({
-            "materials": [{
-                "extensions": {
-                    "VRMC_materials_mtoon": {"specVersion": "1.0"}
-                }
-            }]
-        });
-        let error = vrm1_allowed_required_extensions(&json, false, false).unwrap_err();
-        assert!(format!("{error:#}").contains("KHR_materials_unlit"));
+    #[test]
+    fn generated_stage_h_optional_required_and_fallback_policy_is_transactional() {
+        let gpu = Gpu::new_headless().expect("headless GPU is required for Stage H policy tests");
+        let renderer = Renderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT).unwrap();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let bundle = root.join("dist/character.js");
+        let prepare = |fixture| {
+            let file = generated_mtoon_policy_avatar(fixture);
+            AvatarCandidate::prepare(
+                &gpu,
+                &renderer,
+                &bundle,
+                &AvatarLoadRequest::new(file.path().to_owned(), None, format!("{fixture:?}")),
+            )
+        };
 
-        let json = serde_json::json!({
-            "materials": [{
-                "extensions": {
-                    "VRMC_materials_mtoon": {"specVersion": "1.0"},
-                    "KHR_materials_unlit": null
-                }
-            }]
-        });
-        let error = vrm1_allowed_required_extensions(&json, false, false).unwrap_err();
-        assert!(format!("{error:#}").contains("KHR_materials_unlit"));
+        for fixture in [
+            MtoonPolicyFixture::OptionalNative,
+            MtoonPolicyFixture::OptionalNativeWithUnlit,
+            MtoonPolicyFixture::RequiredNative,
+            MtoonPolicyFixture::RequiredNativeWithUnlit,
+        ] {
+            let candidate = prepare(fixture)
+                .unwrap_or_else(|error| panic!("{fixture:?} must use native MToon: {error:#}"));
+            assert!(matches!(
+                candidate.asset.materials()[0].model,
+                pocket3d::material::MaterialModel::Mtoon(_)
+            ));
+            assert!(candidate.asset.primitives[0].mtoon_bind_group.is_some());
+        }
+
+        for (fixture, expected_unlit) in [
+            (MtoonPolicyFixture::OptionalFuture, false),
+            (MtoonPolicyFixture::OptionalUnsupportedUv, false),
+            (MtoonPolicyFixture::OptionalUnsupportedUvWithUnlit, true),
+        ] {
+            let candidate = prepare(fixture).unwrap_or_else(|error| {
+                panic!("{fixture:?} must fall back to the core material: {error:#}")
+            });
+            let material = &candidate.asset.materials()[0];
+            assert_eq!(
+                matches!(material.model, pocket3d::material::MaterialModel::Unlit(_)),
+                expected_unlit,
+                "{fixture:?}"
+            );
+            assert!(!matches!(
+                material.model,
+                pocket3d::material::MaterialModel::Mtoon(_)
+            ));
+            assert!(candidate.asset.primitives[0].mtoon_bind_group.is_none());
+        }
+
+        for fixture in [
+            MtoonPolicyFixture::RequiredFuture,
+            MtoonPolicyFixture::RequiredUnsupportedUv,
+            MtoonPolicyFixture::RequiredUnknownDependency,
+        ] {
+            let error = match prepare(fixture) {
+                Ok(_) => panic!("{fixture:?} must be rejected"),
+                Err(error) => error,
+            };
+            assert!(
+                error.message().contains("VRMC_materials_mtoon")
+                    || error.message().contains("TEXCOORD_2")
+                    || error.message().contains("X_mtoon_future_dependency"),
+                "{fixture:?}: {error:#}"
+            );
+        }
+
+        let successful = prepare(MtoonPolicyFixture::RequiredNative).unwrap();
+        let old_asset = successful.asset.clone();
+        assert!(matches!(
+            old_asset.materials()[0].model,
+            pocket3d::material::MaterialModel::Mtoon(_)
+        ));
+        assert!(prepare(MtoonPolicyFixture::RequiredUnsupportedUv).is_err());
+        assert!(matches!(
+            old_asset.materials()[0].model,
+            pocket3d::material::MaterialModel::Mtoon(_)
+        ));
     }
 
     #[test]
     fn vrm1_allowlist_only_claims_validated_optional_runtimes_when_required() {
         let json = serde_json::json!({"materials": []});
         assert_eq!(
-            vrm1_allowed_required_extensions(&json, false, false).unwrap(),
+            vrm1_allowed_required_extensions(&json, false, false, false).unwrap(),
             ["VRMC_vrm"]
         );
 
@@ -1721,9 +1922,9 @@ mod tests {
             "extensionsUsed": ["VRMC_node_constraint"],
             "extensionsRequired": ["VRMC_node_constraint"]
         });
-        assert!(vrm1_allowed_required_extensions(&json, false, false).is_err());
+        assert!(vrm1_allowed_required_extensions(&json, false, false, false).is_err());
         assert_eq!(
-            vrm1_allowed_required_extensions(&json, false, true).unwrap(),
+            vrm1_allowed_required_extensions(&json, false, false, true).unwrap(),
             ["VRMC_vrm", "VRMC_node_constraint"]
         );
     }
@@ -1733,9 +1934,9 @@ mod tests {
         let json = serde_json::json!({
             "extensions": {"VRMC_springBone": {"specVersion": "1.0"}}
         });
-        assert!(vrm1_allowed_required_extensions(&json, false, false).is_err());
+        assert!(vrm1_allowed_required_extensions(&json, false, false, false).is_err());
         assert_eq!(
-            vrm1_allowed_required_extensions(&json, true, false).unwrap(),
+            vrm1_allowed_required_extensions(&json, false, true, false).unwrap(),
             ["VRMC_vrm", "VRMC_springBone"]
         );
     }
