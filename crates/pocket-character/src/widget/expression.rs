@@ -9,7 +9,11 @@
 use std::collections::{BTreeMap, HashMap};
 
 use anyhow::Result;
-use pocket_vrm::{Vrm1Doc, Vrm1ExpressionKind, Vrm1ExpressionLookAt, Vrm1ExpressionOverride};
+use pocket_vrm::{
+    Vrm1Doc, Vrm1ExpressionKind, Vrm1ExpressionLookAt, Vrm1ExpressionOverride,
+    Vrm1MaterialColorBindType,
+};
+use pocket3d::material::{MaterialAsset, MaterialKind, MaterialStateSet, TextureRole};
 use pocket3d::model::ModelAsset;
 use pocket3d::scene::Scene;
 
@@ -19,13 +23,8 @@ use super::avatar::AvatarSceneSlot;
 pub(super) enum ResolvedExpressionClass {
     Blink,
     LookAt,
+    Mouth,
     Other,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum UnsupportedExpressionPart {
-    MaterialColorBinds,
-    TextureTransformBinds,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -36,15 +35,30 @@ pub(super) struct ResolvedMorphBind {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub(super) struct ResolvedMaterialColorBind {
+    pub(super) material: usize,
+    pub(super) kind: Vrm1MaterialColorBindType,
+    pub(super) target_value: [f32; 4],
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct ResolvedTextureTransformBind {
+    pub(super) material: usize,
+    pub(super) scale: [f32; 2],
+    pub(super) offset: [f32; 2],
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct ResolvedExpression {
     pub(super) name: String,
     pub(super) morph_binds: Vec<ResolvedMorphBind>,
+    pub(super) material_color_binds: Vec<ResolvedMaterialColorBind>,
+    pub(super) texture_transform_binds: Vec<ResolvedTextureTransformBind>,
     pub(super) is_binary: bool,
     pub(super) class: ResolvedExpressionClass,
     pub(super) override_blink: Vrm1ExpressionOverride,
     pub(super) override_look_at: Vrm1ExpressionOverride,
     pub(super) override_mouth: Vrm1ExpressionOverride,
-    pub(super) unsupported_parts: Vec<UnsupportedExpressionPart>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -179,23 +193,29 @@ impl Vrm1ExpressionRuntime {
         {
             return;
         }
-        let assignments = self.composed_weights(procedural_blink, procedural_look_at);
+        let effective_weights = self.effective_weights(procedural_blink, procedural_look_at);
+        let assignments = self.composed_morph_weights(&effective_weights);
         let instance = scene_slot.get_mut(scene);
-        let Some(morph) = instance.morph.as_mut() else {
-            self.dirty = false;
-            self.last_procedural_blink = procedural_blink;
-            self.last_procedural_look_at = Some(procedural_look_at);
-            return;
-        };
-
-        // Rewriting the complete managed set prevents a dropped expression or
-        // a new command batch from leaving stale weights behind. Unrelated
-        // morph targets are never touched.
-        for &(mesh_slot, target) in &self.managed_targets {
-            morph.set_weight(mesh_slot, target, 0.0);
+        if let Some(morph) = instance.morph.as_mut() {
+            // Rewriting the complete managed set prevents a dropped expression
+            // or a new command batch from leaving stale weights behind.
+            for &(mesh_slot, target) in &self.managed_targets {
+                morph.set_weight(mesh_slot, target, 0.0);
+            }
+            for ((mesh_slot, target), weight) in assignments {
+                morph.set_weight(mesh_slot, target, weight);
+            }
         }
-        for ((mesh_slot, target), weight) in assignments {
-            morph.set_weight(mesh_slot, target, weight);
+
+        let asset = instance.asset.clone();
+        instance.materials.reset_from_assets(asset.materials());
+        for (expression, weight) in self.expressions.iter().zip(effective_weights) {
+            apply_material_expression(
+                &mut instance.materials,
+                asset.materials(),
+                expression,
+                weight,
+            );
         }
         self.dirty = false;
         self.last_procedural_blink = procedural_blink;
@@ -219,65 +239,46 @@ impl Vrm1ExpressionRuntime {
         self.composed_weights(procedural_blink, procedural_look_at)
     }
 
+    #[cfg(test)]
     fn composed_weights(
         &self,
         procedural_blink: f32,
         procedural_look_at: Vrm1ExpressionLookAt,
     ) -> Vec<((usize, usize), f32)> {
+        let effective = self.effective_weights(procedural_blink, procedural_look_at);
+        self.composed_morph_weights(&effective)
+    }
+
+    #[cfg(test)]
+    fn effective_weights_for_test(
+        &self,
+        procedural_blink: f32,
+        procedural_look_at: Vrm1ExpressionLookAt,
+    ) -> Vec<f32> {
+        self.effective_weights(procedural_blink, procedural_look_at)
+    }
+
+    fn effective_weights(
+        &self,
+        procedural_blink: f32,
+        procedural_look_at: Vrm1ExpressionLookAt,
+    ) -> Vec<f32> {
         let procedural_blink = if procedural_blink.is_finite() {
             procedural_blink.clamp(0.0, 1.0)
         } else {
             0.0
         };
-        let mut override_blocks = false;
-        let mut override_blend = 0.0;
-        for (index, expression) in self.expressions.iter().enumerate() {
-            if expression.class == ResolvedExpressionClass::Blink {
-                continue;
-            }
-            let output = expression_output(self.inputs[index], expression.is_binary);
-            if output <= 0.0 {
-                continue;
-            }
-            match expression.override_blink {
-                Vrm1ExpressionOverride::None => {}
-                Vrm1ExpressionOverride::Block => override_blocks = true,
-                Vrm1ExpressionOverride::Blend => override_blend += output,
-            }
-        }
-        let blink_multiplier = if override_blocks {
-            0.0
-        } else {
-            (1.0 - override_blend).max(0.0)
-        };
-        let blink_override_active = override_blocks || override_blend > 0.0;
+        let blink_override = self.override_state(ResolvedExpressionClass::Blink, |expression| {
+            expression.override_blink
+        });
+        let look_at_override = self.override_state(ResolvedExpressionClass::LookAt, |expression| {
+            expression.override_look_at
+        });
+        let mouth_override = self.override_state(ResolvedExpressionClass::Mouth, |expression| {
+            expression.override_mouth
+        });
 
-        let mut look_at_blocks = false;
-        let mut look_at_blend = 0.0;
-        for (index, expression) in self.expressions.iter().enumerate() {
-            // An override targeting its own procedural class is invalid and
-            // ignored, matching the existing blink behavior.
-            if expression.class == ResolvedExpressionClass::LookAt {
-                continue;
-            }
-            let output = expression_output(self.inputs[index], expression.is_binary);
-            if output <= 0.0 {
-                continue;
-            }
-            match expression.override_look_at {
-                Vrm1ExpressionOverride::None => {}
-                Vrm1ExpressionOverride::Block => look_at_blocks = true,
-                Vrm1ExpressionOverride::Blend => look_at_blend += output,
-            }
-        }
-        let look_at_multiplier = if look_at_blocks {
-            0.0
-        } else {
-            (1.0 - look_at_blend).max(0.0)
-        };
-        let look_at_override_active = look_at_blocks || look_at_blend > 0.0;
-
-        let mut totals = BTreeMap::<(usize, usize), f32>::new();
+        let mut effective = Vec::with_capacity(self.expressions.len());
         for (index, expression) in self.expressions.iter().enumerate() {
             let output = match expression.class {
                 ResolvedExpressionClass::Other => {
@@ -298,8 +299,8 @@ impl Vrm1ExpressionRuntime {
                     procedural_output(
                         self.inputs[index].max(procedural),
                         expression.is_binary,
-                        blink_multiplier,
-                        blink_override_active,
+                        blink_override.multiplier,
+                        blink_override.active,
                     )
                 }
                 ResolvedExpressionClass::LookAt => {
@@ -318,11 +319,52 @@ impl Vrm1ExpressionRuntime {
                     procedural_output(
                         self.inputs[index].max(procedural),
                         expression.is_binary,
-                        look_at_multiplier,
-                        look_at_override_active,
+                        look_at_override.multiplier,
+                        look_at_override.active,
                     )
                 }
+                ResolvedExpressionClass::Mouth => procedural_output(
+                    self.inputs[index],
+                    expression.is_binary,
+                    mouth_override.multiplier,
+                    mouth_override.active,
+                ),
             };
+            effective.push(output);
+        }
+        effective
+    }
+
+    fn override_state(
+        &self,
+        target: ResolvedExpressionClass,
+        select: impl Fn(&ResolvedExpression) -> Vrm1ExpressionOverride,
+    ) -> OverrideState {
+        let mut blocked = false;
+        let mut blend = 0.0;
+        for (index, expression) in self.expressions.iter().enumerate() {
+            if expression.class == target {
+                continue;
+            }
+            let output = expression_output(self.inputs[index], expression.is_binary);
+            if output <= 0.0 {
+                continue;
+            }
+            match select(expression) {
+                Vrm1ExpressionOverride::None => {}
+                Vrm1ExpressionOverride::Block => blocked = true,
+                Vrm1ExpressionOverride::Blend => blend += output,
+            }
+        }
+        OverrideState {
+            multiplier: if blocked { 0.0 } else { (1.0 - blend).max(0.0) },
+            active: blocked || blend > 0.0,
+        }
+    }
+
+    fn composed_morph_weights(&self, effective: &[f32]) -> Vec<((usize, usize), f32)> {
+        let mut totals = BTreeMap::<(usize, usize), f32>::new();
+        for (expression, &output) in self.expressions.iter().zip(effective) {
             if output == 0.0 {
                 continue;
             }
@@ -331,6 +373,137 @@ impl Vrm1ExpressionRuntime {
             }
         }
         totals.into_iter().collect()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct OverrideState {
+    multiplier: f32,
+    active: bool,
+}
+
+fn apply_material_expression(
+    states: &mut MaterialStateSet,
+    materials: &[MaterialAsset],
+    expression: &ResolvedExpression,
+    weight: f32,
+) {
+    if weight == 0.0 {
+        return;
+    }
+    for bind in &expression.material_color_binds {
+        let Some(authored_material) = materials.get(bind.material) else {
+            continue;
+        };
+        let authored = authored_material.authored_state();
+        let Some(state) = states.get_mut(bind.material) else {
+            continue;
+        };
+        match bind.kind {
+            Vrm1MaterialColorBindType::Color => {
+                add_base_relative4(
+                    &mut state.base_color_factor,
+                    authored.base_color_factor,
+                    bind.target_value,
+                    weight,
+                );
+            }
+            Vrm1MaterialColorBindType::EmissionColor
+                if authored_material.kind() != MaterialKind::Unlit =>
+            {
+                add_base_relative3(
+                    &mut state.emissive_factor,
+                    authored.emissive_factor,
+                    bind.target_value,
+                    weight,
+                );
+            }
+            Vrm1MaterialColorBindType::ShadeColor => {
+                if let (Some(state), Some(authored)) =
+                    (state.mtoon.as_mut(), authored.mtoon.as_ref())
+                {
+                    add_base_relative3(
+                        &mut state.shade_color_factor,
+                        authored.shade_color_factor,
+                        bind.target_value,
+                        weight,
+                    );
+                }
+            }
+            Vrm1MaterialColorBindType::MatcapColor => {
+                if let (Some(state), Some(authored)) =
+                    (state.mtoon.as_mut(), authored.mtoon.as_ref())
+                {
+                    add_base_relative3(
+                        &mut state.matcap_factor,
+                        authored.matcap_factor,
+                        bind.target_value,
+                        weight,
+                    );
+                }
+            }
+            Vrm1MaterialColorBindType::RimColor => {
+                if let (Some(state), Some(authored)) =
+                    (state.mtoon.as_mut(), authored.mtoon.as_ref())
+                {
+                    add_base_relative3(
+                        &mut state.parametric_rim_color_factor,
+                        authored.parametric_rim_color_factor,
+                        bind.target_value,
+                        weight,
+                    );
+                }
+            }
+            Vrm1MaterialColorBindType::OutlineColor => {
+                if let (Some(state), Some(authored)) =
+                    (state.mtoon.as_mut(), authored.mtoon.as_ref())
+                {
+                    add_base_relative3(
+                        &mut state.outline_color_factor,
+                        authored.outline_color_factor,
+                        bind.target_value,
+                        weight,
+                    );
+                }
+            }
+            Vrm1MaterialColorBindType::EmissionColor => {}
+        }
+    }
+
+    for bind in &expression.texture_transform_binds {
+        let Some(authored_material) = materials.get(bind.material) else {
+            continue;
+        };
+        let authored = authored_material.authored_state();
+        let Some(state) = states.get_mut(bind.material) else {
+            continue;
+        };
+        for (&role, authored_transform) in &authored.texture_transforms {
+            if role == TextureRole::Matcap {
+                continue;
+            }
+            let Some(transform) = state.texture_transforms.get_mut(&role) else {
+                continue;
+            };
+            for axis in 0..2 {
+                transform.scale[axis] +=
+                    (bind.scale[axis] - authored_transform.scale[axis]) * weight;
+                transform.offset[axis] +=
+                    (bind.offset[axis] - authored_transform.offset[axis]) * weight;
+            }
+        }
+    }
+}
+
+fn add_base_relative4(value: &mut [f32; 4], base: [f32; 4], target: [f32; 4], weight: f32) {
+    for channel in 0..4 {
+        value[channel] += (target[channel] - base[channel]) * weight;
+    }
+}
+
+fn add_base_relative3(value: &mut [f32; 3], base: [f32; 3], target: [f32; 4], weight: f32) {
+    for channel in 0..3 {
+        value[channel] += (target[channel] - base[channel]) * weight;
     }
 }
 
@@ -390,7 +563,6 @@ pub(super) fn resolve_vrm1(
     let mut resolved = Vec::new();
     let mut warned_shared_mesh = false;
     let mut warned_invalid_bind = false;
-    let mut warned_unsupported = false;
     for expression in &document.expressions {
         let mut morph_binds = Vec::new();
         for bind in &expression.morph_target_binds {
@@ -466,41 +638,54 @@ pub(super) fn resolve_vrm1(
             });
         }
 
-        let mut unsupported_parts = Vec::new();
-        if expression.has_material_color_binds {
-            unsupported_parts.push(UnsupportedExpressionPart::MaterialColorBinds);
-        }
-        if expression.has_texture_transform_binds {
-            unsupported_parts.push(UnsupportedExpressionPart::TextureTransformBinds);
-        }
-        if !unsupported_parts.is_empty() && !warned_unsupported {
-            log::warn!(
-                "VRM 1.0 material/texture expression binds are unsupported; retaining resolved morph binds"
-            );
-            warned_unsupported = true;
-        }
-        if morph_binds.is_empty() {
-            continue;
-        }
-
         let class = if expression.kind == Vrm1ExpressionKind::Preset {
             match expression.name.as_str() {
                 "blink" | "blinkLeft" | "blinkRight" => ResolvedExpressionClass::Blink,
                 "lookUp" | "lookDown" | "lookLeft" | "lookRight" => ResolvedExpressionClass::LookAt,
+                "aa" | "ih" | "ou" | "ee" | "oh" => ResolvedExpressionClass::Mouth,
                 _ => ResolvedExpressionClass::Other,
             }
         } else {
             ResolvedExpressionClass::Other
         };
+        let material_color_binds = expression
+            .material_color_binds
+            .iter()
+            .map(|bind| ResolvedMaterialColorBind {
+                material: bind.material,
+                kind: bind.kind,
+                target_value: bind.target_value,
+            })
+            .collect::<Vec<_>>();
+        let texture_transform_binds = expression
+            .texture_transform_binds
+            .iter()
+            .map(|bind| ResolvedTextureTransformBind {
+                material: bind.material,
+                scale: bind.scale,
+                offset: bind.offset,
+            })
+            .collect::<Vec<_>>();
+        let has_override = expression.override_blink != Vrm1ExpressionOverride::None
+            || expression.override_look_at != Vrm1ExpressionOverride::None
+            || expression.override_mouth != Vrm1ExpressionOverride::None;
+        if morph_binds.is_empty()
+            && material_color_binds.is_empty()
+            && texture_transform_binds.is_empty()
+            && !has_override
+        {
+            continue;
+        }
         resolved.push(ResolvedExpression {
             name: expression.name.clone(),
             morph_binds,
+            material_color_binds,
+            texture_transform_binds,
             is_binary: expression.is_binary,
             class,
             override_blink: expression.override_blink,
             override_look_at: expression.override_look_at,
             override_mouth: expression.override_mouth,
-            unsupported_parts,
         });
     }
     Ok(ResolvedExpressionRuntime::Vrm1(Vrm1ExpressionRuntime::new(
@@ -511,6 +696,10 @@ pub(super) fn resolve_vrm1(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pocket3d::material::{
+        GltfSampler, MaterialAlphaMode, MaterialInputs, MaterialModel, MtoonMaterial,
+        MtoonOutlineWidthMode, ScaledTextureInfo, TextureInfo, TextureTransform,
+    };
 
     fn bind(mesh_slot: usize, target: usize, weight: f32) -> ResolvedMorphBind {
         ResolvedMorphBind {
@@ -530,17 +719,101 @@ mod tests {
         ResolvedExpression {
             name: name.into(),
             morph_binds,
+            material_color_binds: Vec::new(),
+            texture_transform_binds: Vec::new(),
             is_binary,
             class,
             override_blink,
             override_look_at: Vrm1ExpressionOverride::None,
             override_mouth: Vrm1ExpressionOverride::None,
-            unsupported_parts: Vec::new(),
         }
     }
 
     fn runtime(expressions: Vec<ResolvedExpression>) -> Vrm1ExpressionRuntime {
         Vrm1ExpressionRuntime::new(expressions)
+    }
+
+    fn texture(role: TextureRole, scale: [f32; 2], offset: [f32; 2]) -> TextureInfo {
+        TextureInfo {
+            texture_index: role as usize,
+            image_index: role as usize,
+            sampler: GltfSampler::default(),
+            tex_coord: 0,
+            transform: TextureTransform {
+                scale,
+                offset,
+                rotation: 0.375,
+                tex_coord_override: Some(1),
+            },
+            role,
+            color_space: role.color_space(),
+        }
+    }
+
+    fn mtoon_material() -> MaterialAsset {
+        MaterialAsset {
+            gltf_material_index: 0,
+            name: Some("expression-test".into()),
+            inputs: MaterialInputs {
+                base_color_factor: [0.2, 0.4, 0.6, 0.8],
+                base_color_texture: Some(texture(TextureRole::BaseColor, [2.0, 3.0], [0.1, 0.2])),
+                normal_texture: Some(ScaledTextureInfo {
+                    texture: texture(TextureRole::Normal, [4.0, 5.0], [-0.2, 0.3]),
+                    scale: 1.0,
+                }),
+                emissive_factor: [0.1, 0.2, 0.3],
+                emissive_texture: Some(texture(TextureRole::Emissive, [1.5, 1.25], [0.4, 0.5])),
+                alpha_mode: MaterialAlphaMode::Blend,
+                alpha_cutoff: 0.5,
+                double_sided: false,
+            },
+            model: MaterialModel::Mtoon(Box::new(MtoonMaterial {
+                spec_version: "1.0".into(),
+                transparent_with_z_write: false,
+                render_queue_offset_number: 0,
+                shade_color_factor: [0.3, 0.4, 0.5],
+                shade_multiply_texture: Some(texture(
+                    TextureRole::ShadeMultiply,
+                    [1.1, 1.2],
+                    [0.01, 0.02],
+                )),
+                shading_shift_factor: 0.0,
+                shading_shift_texture: Some(ScaledTextureInfo {
+                    texture: texture(TextureRole::ShadingShift, [0.8, 0.9], [0.03, 0.04]),
+                    scale: 1.0,
+                }),
+                shading_toony_factor: 0.9,
+                gi_equalization_factor: 0.9,
+                matcap_factor: [0.4, 0.5, 0.6],
+                matcap_texture: Some(texture(TextureRole::Matcap, [9.0, 10.0], [0.9, 1.0])),
+                parametric_rim_color_factor: [0.5, 0.6, 0.7],
+                parametric_rim_fresnel_power_factor: 5.0,
+                parametric_rim_lift_factor: 0.0,
+                rim_multiply_texture: Some(texture(
+                    TextureRole::RimMultiply,
+                    [1.3, 1.4],
+                    [0.05, 0.06],
+                )),
+                rim_lighting_mix_factor: 1.0,
+                outline_width_mode: MtoonOutlineWidthMode::WorldCoordinates,
+                outline_width_factor: 0.01,
+                outline_width_multiply_texture: Some(texture(
+                    TextureRole::OutlineWidth,
+                    [1.6, 1.7],
+                    [0.07, 0.08],
+                )),
+                outline_color_factor: [0.6, 0.7, 0.8],
+                outline_lighting_mix_factor: 1.0,
+                uv_animation_mask_texture: Some(texture(
+                    TextureRole::UvAnimationMask,
+                    [1.8, 1.9],
+                    [0.09, 0.1],
+                )),
+                uv_animation_scroll_x_speed_factor: 0.5,
+                uv_animation_scroll_y_speed_factor: -0.25,
+                uv_animation_rotation_speed_factor: 0.75,
+            })),
+        }
     }
 
     fn with_look_at_override(
@@ -803,6 +1076,248 @@ mod tests {
                 },
             ),
             vec![((0, 0), 0.70000005)]
+        );
+    }
+
+    fn assert_close<const N: usize>(actual: [f32; N], expected: [f32; N]) {
+        for index in 0..N {
+            assert!(
+                (actual[index] - expected[index]).abs() < 1e-6,
+                "channel {index}: {} != {}",
+                actual[index],
+                expected[index]
+            );
+        }
+    }
+
+    #[test]
+    fn material_colors_accumulate_base_relative_deltas_without_clamping() {
+        let materials = vec![mtoon_material()];
+        let mut states = MaterialStateSet::from_assets(&materials);
+        let mut a = expression(
+            "a",
+            ResolvedExpressionClass::Other,
+            false,
+            Vrm1ExpressionOverride::None,
+            Vec::new(),
+        );
+        a.material_color_binds = vec![
+            ResolvedMaterialColorBind {
+                material: 0,
+                kind: Vrm1MaterialColorBindType::Color,
+                target_value: [1.0, 0.0, 0.0, 0.4],
+            },
+            ResolvedMaterialColorBind {
+                material: 0,
+                kind: Vrm1MaterialColorBindType::EmissionColor,
+                target_value: [1.0, 1.0, 1.0, 99.0],
+            },
+            ResolvedMaterialColorBind {
+                material: 0,
+                kind: Vrm1MaterialColorBindType::ShadeColor,
+                target_value: [1.0, 1.0, 1.0, 99.0],
+            },
+            ResolvedMaterialColorBind {
+                material: 0,
+                kind: Vrm1MaterialColorBindType::MatcapColor,
+                target_value: [1.0, 1.0, 1.0, 99.0],
+            },
+            ResolvedMaterialColorBind {
+                material: 0,
+                kind: Vrm1MaterialColorBindType::RimColor,
+                target_value: [1.0, 1.0, 1.0, 99.0],
+            },
+            ResolvedMaterialColorBind {
+                material: 0,
+                kind: Vrm1MaterialColorBindType::OutlineColor,
+                target_value: [1.0, 1.0, 1.0, 99.0],
+            },
+        ];
+        let mut b = a.clone();
+        b.name = "b".into();
+        b.material_color_binds[0].target_value = [0.0, 1.0, 0.0, 0.2];
+
+        apply_material_expression(&mut states, &materials, &a, 0.25);
+        apply_material_expression(&mut states, &materials, &b, 0.5);
+        let state = states.get(0).unwrap();
+        assert_close(state.base_color_factor, [0.3, 0.6, 0.15, 0.4]);
+        assert_close(state.emissive_factor, [0.775, 0.8, 0.825]);
+        let mtoon = state.mtoon.as_ref().unwrap();
+        assert_close(mtoon.shade_color_factor, [0.825, 0.85, 0.875]);
+        assert_close(mtoon.matcap_factor, [0.85, 0.875, 0.9]);
+        assert_close(mtoon.parametric_rim_color_factor, [0.875, 0.9, 0.925]);
+        assert_close(mtoon.outline_color_factor, [0.9, 0.925, 0.95]);
+
+        let forward = state.clone();
+        states.reset_from_assets(&materials);
+        apply_material_expression(&mut states, &materials, &b, 0.5);
+        apply_material_expression(&mut states, &materials, &a, 0.25);
+        let reverse = states.get(0).unwrap();
+        assert_close(reverse.base_color_factor, forward.base_color_factor);
+        assert_close(reverse.emissive_factor, forward.emissive_factor);
+        assert_close(
+            reverse.mtoon.as_ref().unwrap().shade_color_factor,
+            forward.mtoon.as_ref().unwrap().shade_color_factor,
+        );
+
+        states.reset_from_assets(&materials);
+        apply_material_expression(&mut states, &materials, &a, 1.0);
+        apply_material_expression(&mut states, &materials, &a, 1.0);
+        assert!(states.get(0).unwrap().base_color_factor[0] > 1.0);
+    }
+
+    #[test]
+    fn texture_transforms_use_each_texture_base_and_exclude_matcap() {
+        let materials = vec![mtoon_material()];
+        let mut states = MaterialStateSet::from_assets(&materials);
+        let authored = states.get(0).unwrap().clone();
+        let mut a = expression(
+            "a",
+            ResolvedExpressionClass::Other,
+            false,
+            Vrm1ExpressionOverride::None,
+            Vec::new(),
+        );
+        a.texture_transform_binds = vec![ResolvedTextureTransformBind {
+            material: 0,
+            scale: [1.0, 1.0],
+            offset: [0.0, 0.0],
+        }];
+        let mut b = a.clone();
+        b.name = "b".into();
+        b.texture_transform_binds[0].scale = [3.0, 2.0];
+        b.texture_transform_binds[0].offset = [0.5, -0.5];
+
+        apply_material_expression(&mut states, &materials, &a, 0.25);
+        apply_material_expression(&mut states, &materials, &b, 0.5);
+        let state = states.get(0).unwrap();
+        let base = state
+            .texture_transforms
+            .get(&TextureRole::BaseColor)
+            .unwrap();
+        assert_close(base.scale, [2.25, 2.0]);
+        assert_close(base.offset, [0.275, -0.2]);
+        assert_eq!(base.rotation, 0.375);
+        assert_eq!(base.tex_coord_override, Some(1));
+        let normal = state.texture_transforms.get(&TextureRole::Normal).unwrap();
+        assert_close(normal.scale, [2.75, 2.5]);
+        assert_close(normal.offset, [0.2, -0.175]);
+        assert_eq!(
+            state.texture_transforms.get(&TextureRole::Matcap),
+            authored.texture_transforms.get(&TextureRole::Matcap)
+        );
+        for role in [
+            TextureRole::BaseColor,
+            TextureRole::Normal,
+            TextureRole::Emissive,
+            TextureRole::ShadeMultiply,
+            TextureRole::ShadingShift,
+            TextureRole::RimMultiply,
+            TextureRole::OutlineWidth,
+            TextureRole::UvAnimationMask,
+        ] {
+            assert_ne!(
+                state.texture_transforms.get(&role),
+                authored.texture_transforms.get(&role),
+                "{role:?}"
+            );
+        }
+
+        let forward = state.clone();
+        states.reset_from_assets(&materials);
+        apply_material_expression(&mut states, &materials, &b, 0.5);
+        apply_material_expression(&mut states, &materials, &a, 0.25);
+        let reverse = states.get(0).unwrap();
+        for (&role, forward_transform) in &forward.texture_transforms {
+            let reverse_transform = reverse.texture_transforms.get(&role).unwrap();
+            assert_close(reverse_transform.scale, forward_transform.scale);
+            assert_close(reverse_transform.offset, forward_transform.offset);
+            assert_eq!(reverse_transform.rotation, forward_transform.rotation);
+            assert_eq!(
+                reverse_transform.tex_coord_override,
+                forward_transform.tex_coord_override
+            );
+        }
+
+        states.reset_from_assets(&materials);
+        assert_eq!(states.get(0).unwrap(), &authored);
+        apply_material_expression(&mut states, &materials, &b, 1.0);
+        for role in [
+            TextureRole::BaseColor,
+            TextureRole::Normal,
+            TextureRole::Emissive,
+            TextureRole::ShadeMultiply,
+            TextureRole::ShadingShift,
+            TextureRole::RimMultiply,
+            TextureRole::OutlineWidth,
+            TextureRole::UvAnimationMask,
+        ] {
+            let transform = states
+                .get(0)
+                .unwrap()
+                .texture_transforms
+                .get(&role)
+                .unwrap();
+            assert_close(transform.scale, [3.0, 2.0]);
+            assert_close(transform.offset, [0.5, -0.5]);
+            assert_eq!(transform.rotation, 0.375, "{role:?}");
+            assert_eq!(transform.tex_coord_override, Some(1), "{role:?}");
+        }
+    }
+
+    #[test]
+    fn material_only_effects_use_binary_procedural_and_override_outputs() {
+        let color_bind = ResolvedMaterialColorBind {
+            material: 0,
+            kind: Vrm1MaterialColorBindType::Color,
+            target_value: [1.0; 4],
+        };
+        let mut binary = expression(
+            "materialOnly",
+            ResolvedExpressionClass::Other,
+            true,
+            Vrm1ExpressionOverride::None,
+            Vec::new(),
+        );
+        binary.material_color_binds.push(color_bind.clone());
+        let mut gaze = expression(
+            "lookLeft",
+            ResolvedExpressionClass::LookAt,
+            false,
+            Vrm1ExpressionOverride::None,
+            Vec::new(),
+        );
+        gaze.material_color_binds.push(color_bind.clone());
+        let mut mouth = expression(
+            "aa",
+            ResolvedExpressionClass::Mouth,
+            false,
+            Vrm1ExpressionOverride::None,
+            Vec::new(),
+        );
+        mouth.material_color_binds.push(color_bind);
+        let mut overrider = expression(
+            "happy",
+            ResolvedExpressionClass::Other,
+            false,
+            Vrm1ExpressionOverride::None,
+            Vec::new(),
+        );
+        overrider.override_mouth = Vrm1ExpressionOverride::Blend;
+        let mut runtime = runtime(vec![binary, gaze, mouth, overrider]);
+        assert_eq!(runtime.capability_names().len(), 4);
+        runtime.set_input("materialOnly", 0.5001);
+        runtime.set_input("aa", 0.8);
+        runtime.set_input("happy", 0.25);
+        assert_eq!(
+            runtime.effective_weights_for_test(
+                0.0,
+                Vrm1ExpressionLookAt {
+                    look_left: 0.35,
+                    ..Default::default()
+                }
+            ),
+            vec![1.0, 0.35, 0.6, 0.25]
         );
     }
 }

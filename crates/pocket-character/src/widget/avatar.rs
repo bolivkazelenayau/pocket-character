@@ -1821,6 +1821,26 @@ mod tests {
         let candidate =
             AvatarCandidate::prepare(&gpu, &renderer, &root.join("dist/character.js"), &request)
                 .expect("VRM1 MToon fixture must prepare");
+        let AvatarSemanticDocument::Vrm1(document) = &candidate.document else {
+            panic!("preferred fixture must parse as VRM 1.0");
+        };
+        assert_eq!(document.expressions.len(), 14);
+        assert_eq!(
+            document
+                .expressions
+                .iter()
+                .map(|expression| expression.material_color_binds.len())
+                .sum::<usize>(),
+            0
+        );
+        assert_eq!(
+            document
+                .expressions
+                .iter()
+                .map(|expression| expression.texture_transform_binds.len())
+                .sum::<usize>(),
+            0
+        );
         let authored = candidate.asset.materials();
         assert!(!authored.is_empty());
         assert!(
@@ -2009,6 +2029,121 @@ mod tests {
             target.read_rgba(&gpu).unwrap()
         });
         assert_eq!(frames[0], frames[1]);
+    }
+
+    #[test]
+    fn local_seed_san_stage_g_texture_expression_round_trips_to_authored_state() {
+        let fixture = Path::new(r"C:\Users\Breeze\Downloads\Seed-san.vrm");
+        if !fixture.is_file() {
+            eprintln!(
+                "skipping local Seed-san Stage G fixture: {} is unavailable",
+                fixture.display()
+            );
+            return;
+        }
+
+        let gpu = Gpu::new_headless().expect("headless GPU is required for Seed-san Stage G");
+        let renderer = Renderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT).unwrap();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let request = AvatarLoadRequest::new(fixture.to_owned(), None, "Seed-san");
+        let candidate =
+            AvatarCandidate::prepare(&gpu, &renderer, &root.join("dist/character.js"), &request)
+                .expect("Seed-san VRM1 fixture must prepare");
+
+        let AvatarSemanticDocument::Vrm1(document) = &candidate.document else {
+            panic!("Seed-san must parse as VRM 1.0");
+        };
+        assert_eq!(document.expressions.len(), 18);
+        assert_eq!(
+            document
+                .expressions
+                .iter()
+                .map(|expression| expression.material_color_binds.len())
+                .sum::<usize>(),
+            0
+        );
+        let transform_expressions = document
+            .expressions
+            .iter()
+            .filter(|expression| !expression.texture_transform_binds.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(transform_expressions.len(), 5);
+        assert_eq!(
+            transform_expressions
+                .iter()
+                .map(|expression| expression.name.as_str())
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["angry", "happy", "relaxed", "sad", "surprised"]
+                .into_iter()
+                .collect()
+        );
+        assert!(transform_expressions.iter().all(|expression| {
+            !expression.morph_target_binds.is_empty()
+                && expression.texture_transform_binds.len() == 1
+                && expression.texture_transform_binds[0].material == 11
+        }));
+
+        let ResolvedExpressionRuntime::Vrm1(runtime) = &candidate.expressions else {
+            unreachable!()
+        };
+        let happy = runtime
+            .expressions
+            .iter()
+            .find(|expression| expression.name == "happy")
+            .expect("Seed-san happy expression must resolve");
+        assert!(happy.is_binary);
+        assert!(!happy.morph_binds.is_empty());
+        assert_eq!(happy.texture_transform_binds.len(), 1);
+        assert_eq!(happy.texture_transform_binds[0].material, 11);
+        assert_eq!(happy.texture_transform_binds[0].scale, [1.0, 1.0]);
+        assert_eq!(happy.texture_transform_binds[0].offset, [0.25, 0.0]);
+        let morph_target = happy
+            .morph_binds
+            .first()
+            .map(|bind| (bind.mesh_slot, bind.target, bind.weight))
+            .unwrap();
+
+        let slot = AvatarSceneSlot::new(0);
+        let (instance, mut active) = candidate.into_parts(slot);
+        let authored = instance.materials.get(11).unwrap().clone();
+        assert!(!authored.texture_transforms.is_empty());
+        let mut scene = Scene::default();
+        scene.models.push(instance);
+        let ResolvedExpressionRuntime::Vrm1(runtime) = &mut active.expressions else {
+            unreachable!()
+        };
+        assert!(runtime.set_input("happy", 1.0));
+        runtime.compose_if_needed(&mut scene, slot, 0.0);
+        let composed = scene.models[0].materials.get(11).unwrap();
+        let mut transformed_roles = 0;
+        for (&role, authored_transform) in &authored.texture_transforms {
+            let composed_transform = composed.texture_transforms.get(&role).unwrap();
+            if role == pocket3d::material::TextureRole::Matcap {
+                assert_eq!(composed_transform, authored_transform);
+                continue;
+            }
+            transformed_roles += 1;
+            assert_eq!(composed_transform.scale, [1.0, 1.0]);
+            assert_eq!(composed_transform.offset, [0.25, 0.0]);
+            assert_eq!(composed_transform.rotation, authored_transform.rotation);
+            assert_eq!(
+                composed_transform.tex_coord_override,
+                authored_transform.tex_coord_override
+            );
+        }
+        assert!(transformed_roles > 0);
+        assert_eq!(
+            scene.models[0]
+                .morph
+                .as_ref()
+                .unwrap()
+                .weight(morph_target.0, morph_target.1),
+            morph_target.2
+        );
+
+        assert!(runtime.set_input("happy", 0.0));
+        runtime.compose_if_needed(&mut scene, slot, 0.0);
+        assert_eq!(scene.models[0].materials.get(11).unwrap(), &authored);
     }
 
     #[test]
