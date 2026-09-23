@@ -11,7 +11,7 @@
 //! `SetAllSnaps` variant lets a linked edit land as one settings update/save
 //! instead of three transient ones.
 
-use crate::settings::AntiAliasingPreference;
+use crate::settings::{AntiAliasingPreference, MtoonRenderMode};
 
 /// One authoritative settings/action boundary for the controls menu.
 ///
@@ -54,6 +54,7 @@ pub(crate) enum ControlAction {
     SettingsClosed,
     RequestMsaa(AntiAliasingPreference),
     RequestSmaa(bool),
+    SetMtoonRenderMode(MtoonRenderMode),
     RestoreDefaults,
 }
 

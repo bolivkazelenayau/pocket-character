@@ -53,6 +53,7 @@ interface ControlsState {
   requested_msaa: MsaaPreference;
   effective_msaa: number;
   requested_smaa: boolean;
+  mtoon_render_mode: MtoonRenderMode;
   effective_smaa: boolean;
   msaa_pending: boolean;
   smaa_pending: boolean;
@@ -62,6 +63,7 @@ interface ControlsState {
 }
 
 type AvatarStatus = "idle" | "loading" | "error";
+type MtoonRenderMode = "auto" | "native" | "fallback";
 
 interface WindowControlsState {
   configured_width: number;
@@ -101,7 +103,8 @@ type ActionName =
   | "settings_opened"
   | "settings_closed"
   | "restore_defaults"
-  | "open_avatar";
+  | "open_avatar"
+  | "set_mtoon_render_mode";
 
 // Latest host facts, or null before the first svc line arrives.
 const [controls, setControls] = createSignal<ControlsState | null>(null);
@@ -120,7 +123,7 @@ let pressedTarget: ReturnType<typeof hitFocusable> = null;
 type PointerTarget = NonNullable<ReturnType<typeof hitFocusable>>;
 const pointerRepeat = new PointerRepeat<PointerTarget>();
 
-function sendAction(action: ActionName, value?: number | boolean): boolean {
+function sendAction(action: ActionName, value?: number | boolean | string): boolean {
   const ops = getOps();
   if (!ops.svcOpen || !ops.svcSend || !ops.svcOpen("controls")) return false;
   ops.svcSend(JSON.stringify({ t: "action", action, ...(value === undefined ? {} : { value }) }));
@@ -299,6 +302,7 @@ function pollControls(): void {
           requested_msaa?: unknown;
           effective_msaa?: unknown;
           requested_smaa?: unknown;
+          mtoon_render_mode?: unknown;
           effective_smaa?: unknown;
           msaa_pending?: unknown;
           smaa_pending?: unknown;
@@ -321,6 +325,7 @@ function pollControls(): void {
                   : "error"
               : msg.avatar_status;
           const avatarError = msg.avatar_error === undefined ? null : msg.avatar_error;
+          const mtoonMode = msg.mtoon_render_mode === undefined ? "auto" : msg.mtoon_render_mode;
           if (
             !window ||
             typeof msg.effective_fov_deg !== "number" ||
@@ -338,6 +343,7 @@ function pollControls(): void {
             !Number.isSafeInteger(msg.effective_msaa) ||
             msg.effective_msaa < 1 ||
             typeof msg.requested_smaa !== "boolean" ||
+            (mtoonMode !== "auto" && mtoonMode !== "native" && mtoonMode !== "fallback") ||
             typeof msg.effective_smaa !== "boolean" ||
             typeof msg.msaa_pending !== "boolean" ||
             typeof msg.smaa_pending !== "boolean" ||
@@ -367,6 +373,7 @@ function pollControls(): void {
             requested_msaa: msg.requested_msaa as MsaaPreference,
             effective_msaa: msg.effective_msaa,
             requested_smaa: msg.requested_smaa,
+            mtoon_render_mode: mtoonMode,
             effective_smaa: msg.effective_smaa,
             msaa_pending: msg.msaa_pending,
             smaa_pending: msg.smaa_pending,
@@ -728,6 +735,29 @@ function GraphicsPanel() {
             <View class="w-[6] shrink-0" />
             <Text class="h-[11] text-[9] text-[#8fa8bc]">{smaaStatusText(state())}</Text>
           </View>
+        ) : null}
+        <View class="mt-[10] h-[18] flex-row items-center">
+          <Text class="text-xs font-bold text-[#7fd0ff]">MToon rendering</Text>
+        </View>
+        {([
+          ["auto", "Auto"],
+          ["native", "Native MToon"],
+          ["fallback", "glTF fallback (debug)"],
+        ] as const).map(([mode, label]) => (
+          <Focusable
+            debugName={`Mtoon${mode}`}
+            class={state()?.mtoon_render_mode === mode
+              ? "mt-[3] h-[20] w-full flex-col justify-center rounded-sm bg-[#2b5167] px-[6]"
+              : "mt-[3] h-[20] w-full flex-col justify-center rounded-sm bg-[#172b3b] px-[6] focus:bg-[#2b5167] active:bg-[#3a6f88]"}
+            onPress={() => sendAction("set_mtoon_render_mode", mode)}
+          >
+            <Text class="text-xs text-[#e8f1f8]">{label}</Text>
+          </Focusable>
+        ))}
+        {state()?.avatar_status === "loading" ? (
+          <Text class="mt-[5] text-xs text-[#b9e5ff]">Reloading avatar…</Text>
+        ) : state()?.avatar_status === "error" ? (
+          <Text class="mt-[5] text-xs text-[#ffd1d1]">{state()?.avatar_error ?? "Avatar could not be loaded."}</Text>
         ) : null}
       </View>
     </SettingsFrame>

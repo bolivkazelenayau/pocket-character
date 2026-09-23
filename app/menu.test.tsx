@@ -249,8 +249,12 @@ describe("PocketUI camera menu snap regression", () => {
       frame!(BTN_CIRCLE);
       frame!(0);
       expect(textUpdates).toContain("MSAA");
-      frame!(BTN_UP);
-      frame!(0);
+      // The graphics page includes additional focusable render choices.
+      // Return to its first tab before switching back to Camera.
+      for (let i = 0; i < 20; i++) {
+        frame!(BTN_UP);
+        frame!(0);
+      }
       frame!(BTN_CIRCLE);
       frame!(0);
 
@@ -263,7 +267,7 @@ describe("PocketUI camera menu snap regression", () => {
 
       // From the focused Camera tab, walk the actual focus order to YawValue,
       // click it through the host hit-test bridge, then commit a precise edit.
-      for (let i = 0; i < 12; i++) {
+      for (let i = 0; i < 13; i++) {
         frame!(BTN_DOWN);
         frame!(0);
       }
@@ -422,7 +426,7 @@ describe("PocketUI camera menu snap regression", () => {
 
       // The third tab is present in the retained focus order and uses the
       // same inline editor path for its logical-size fields.
-      for (let i = 0; i < 7; i++) {
+      for (let i = 0; i < 8; i++) {
         frame!(BTN_UP);
         frame!(0);
       }

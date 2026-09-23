@@ -241,6 +241,15 @@ impl WindowSettings {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MtoonRenderMode {
+    #[default]
+    Auto,
+    Native,
+    Fallback,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct RenderSettings {
     pub msaa: AntiAliasingPreference,
@@ -251,6 +260,7 @@ pub struct RenderSettings {
         deserialize_with = "deserialize_smaa_enabled"
     )]
     pub smaa_enabled: bool,
+    pub mtoon_render_mode: MtoonRenderMode,
 }
 
 #[derive(Deserialize)]
@@ -266,6 +276,8 @@ struct RenderSettingsInput {
         deserialize_with = "deserialize_smaa_enabled"
     )]
     smaa_enabled: bool,
+    #[serde(default)]
+    mtoon_render_mode: MtoonRenderMode,
 }
 
 impl<'de> Deserialize<'de> for RenderSettings {
@@ -284,6 +296,7 @@ impl<'de> Deserialize<'de> for RenderSettings {
             msaa,
             max_fps: input.max_fps,
             smaa_enabled: input.smaa_enabled,
+            mtoon_render_mode: input.mtoon_render_mode,
         })
     }
 }
@@ -294,6 +307,7 @@ impl Default for RenderSettings {
             msaa: AntiAliasingPreference::default(),
             max_fps: DEFAULT_MAX_FPS,
             smaa_enabled: false,
+            mtoon_render_mode: MtoonRenderMode::Auto,
         }
     }
 }
@@ -309,6 +323,7 @@ impl RenderSettings {
             msaa: self.msaa,
             max_fps,
             smaa_enabled: self.smaa_enabled,
+            mtoon_render_mode: self.mtoon_render_mode,
         }
     }
 }
@@ -721,6 +736,7 @@ mod tests {
         assert_eq!(settings.rendering.msaa, AntiAliasingPreference::X4);
         assert_eq!(settings.rendering.max_fps, 60.0);
         assert!(!settings.rendering.smaa_enabled);
+        assert_eq!(settings.rendering.mtoon_render_mode, MtoonRenderMode::Auto);
     }
 
     #[test]
@@ -744,6 +760,7 @@ mod tests {
                 msaa: AntiAliasingPreference::X8,
                 max_fps: 144.0,
                 smaa_enabled: true,
+                mtoon_render_mode: MtoonRenderMode::Auto,
             },
             ..AppSettings::default()
         };
@@ -765,6 +782,26 @@ mod tests {
         assert_eq!(settings.window.resizable, false);
         assert_eq!(settings.camera, CameraSettings::default());
         assert_eq!(settings.rendering, RenderSettings::default());
+    }
+
+    #[test]
+    fn mtoon_render_mode_round_trips_and_defaults_to_auto() {
+        let settings =
+            AppSettings::from_json(r#"{"rendering":{"mtoon_render_mode":"fallback"}}"#).unwrap();
+        assert_eq!(
+            settings.rendering.mtoon_render_mode,
+            MtoonRenderMode::Fallback
+        );
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains(r#""mtoon_render_mode":"fallback""#));
+        assert_eq!(AppSettings::from_json(&json).unwrap(), settings);
+        assert_eq!(
+            AppSettings::from_json(r#"{"rendering":{}}"#)
+                .unwrap()
+                .rendering
+                .mtoon_render_mode,
+            MtoonRenderMode::Auto
+        );
     }
 
     #[test]
@@ -948,6 +985,7 @@ mod tests {
                 msaa: AntiAliasingPreference::X2,
                 max_fps: 30.0,
                 smaa_enabled: false,
+                mtoon_render_mode: MtoonRenderMode::Auto,
             },
             ..AppSettings::default()
         };

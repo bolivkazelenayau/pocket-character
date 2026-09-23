@@ -965,6 +965,7 @@ fn restore_defaults_replaces_settings_and_live_state_atomically() {
             msaa: AntiAliasingPreference::X8,
             max_fps: 90.0,
             smaa_enabled: true,
+            mtoon_render_mode: crate::settings::MtoonRenderMode::Auto,
         },
         ..AppSettings::default()
     };

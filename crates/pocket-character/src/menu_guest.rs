@@ -188,6 +188,7 @@ pub(crate) enum MenuAction {
     SettingsClosed,
     RequestMsaa(AntiAliasingPreference),
     RequestSmaa(bool),
+    SetMtoonRenderMode(crate::settings::MtoonRenderMode),
     RestoreDefaults,
     OpenAvatar,
 }
@@ -298,6 +299,10 @@ fn decode_menu_action(line: &str) -> Option<MenuAction> {
             .as_ref()
             .and_then(|value| value.as_bool())
             .map(MenuAction::RequestSmaa),
+        "set_mtoon_render_mode" => wire
+            .value
+            .and_then(|value| serde_json::from_value(value).ok())
+            .map(MenuAction::SetMtoonRenderMode),
         "restore_defaults" => Some(MenuAction::RestoreDefaults),
         "open_avatar" => Some(MenuAction::OpenAvatar),
         _ => None,
@@ -335,6 +340,7 @@ struct MenuState {
     requested_msaa: AntiAliasingPreference,
     effective_msaa: u32,
     requested_smaa: bool,
+    mtoon_render_mode: crate::settings::MtoonRenderMode,
     effective_smaa: bool,
     msaa_pending: bool,
     smaa_pending: bool,
@@ -454,6 +460,7 @@ impl MenuGuest {
         requested_msaa: AntiAliasingPreference,
         effective_msaa: u32,
         requested_smaa: bool,
+        mtoon_render_mode: crate::settings::MtoonRenderMode,
         effective_smaa: bool,
         msaa_pending: bool,
         smaa_pending: bool,
@@ -477,6 +484,7 @@ impl MenuGuest {
             requested_msaa,
             effective_msaa,
             requested_smaa,
+            mtoon_render_mode,
             effective_smaa,
             msaa_pending,
             smaa_pending,
@@ -684,6 +692,7 @@ mod tests {
             requested_msaa: AntiAliasingPreference::X8,
             effective_msaa: 4,
             requested_smaa: true,
+            mtoon_render_mode: crate::settings::MtoonRenderMode::Auto,
             effective_smaa: false,
             msaa_pending: true,
             smaa_pending: false,
@@ -835,6 +844,10 @@ mod tests {
             (
                 r#"{"t":"action","action":"request_smaa","value":true}"#,
                 MenuAction::RequestSmaa(true),
+            ),
+            (
+                r#"{"t":"action","action":"set_mtoon_render_mode","value":"fallback"}"#,
+                MenuAction::SetMtoonRenderMode(crate::settings::MtoonRenderMode::Fallback),
             ),
             (
                 r#"{"t":"action","action":"restore_defaults"}"#,

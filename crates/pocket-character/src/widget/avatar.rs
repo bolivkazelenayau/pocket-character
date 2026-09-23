@@ -276,6 +276,7 @@ pub(crate) struct AvatarLoadRequest {
     /// VRMA can use a strict failure policy without changing this seam.
     pub(super) vrma_provenance: Option<VrmaProvenance>,
     pub(super) model_name: String,
+    pub(super) mtoon_render_mode: crate::settings::MtoonRenderMode,
 }
 
 impl AvatarLoadRequest {
@@ -290,6 +291,7 @@ impl AvatarLoadRequest {
             vrma_path,
             vrma_provenance,
             model_name: model_name.into(),
+            mtoon_render_mode: crate::settings::MtoonRenderMode::Auto,
         }
     }
 }
@@ -416,6 +418,7 @@ fn extension_declaration_contains(json: &Value, key: &str, name: &str) -> Result
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum AvatarLoadErrorKind {
     UnsupportedVrm,
+    NativeMtoonUnsupported,
     VrmParse,
     ModelLoad,
     RuntimeStartup,
@@ -426,6 +429,7 @@ impl AvatarLoadErrorKind {
     fn ui_message(self) -> &'static str {
         match self {
             Self::UnsupportedVrm => "Unsupported VRM format.",
+            Self::NativeMtoonUnsupported => "Native MToon cannot render this avatar. See log.",
             Self::VrmParse => "VRM parse failed.",
             Self::ModelLoad => "VRM model load failed.",
             Self::RuntimeStartup => "Avatar runtime failed.",
@@ -563,6 +567,7 @@ impl AvatarLoadStatus {
 /// Fully prepared replacement.  There are no fallible operations in the
 /// transition from this value to [`ActiveAvatar`].
 pub(super) struct AvatarCandidate {
+    pub(super) request: AvatarLoadRequest,
     pub(super) asset: Arc<ModelAsset>,
     pub(super) instance: ModelInstance,
     pub(super) document: AvatarSemanticDocument,
@@ -597,8 +602,10 @@ impl AvatarCandidate {
                 AvatarRuntimeError::new(semantic_parse_failure_kind(&model_bytes), &error)
             })?;
         let presentation = AvatarPresentation::for_version(document.version());
+        log::info!("MToon rendering requested: {:?}", request.mtoon_render_mode);
 
         let mut node_constraint_required = false;
+        let mut mtoon_declared_count = 0;
         let model = match document.version() {
             AvatarVersion::Vrm0 => {
                 ModelAsset::load_glb_bytes_opts_with_allowed_required_extensions(
@@ -609,6 +616,7 @@ impl AvatarCandidate {
                     &request.model_path.to_string_lossy(),
                     &ModelLoadOptions {
                         max_texture_dim: Some(2048),
+                        ..Default::default()
                     },
                     vrm0_allowed_required_extensions(),
                 )
@@ -623,6 +631,11 @@ impl AvatarCandidate {
                     .map_err(|error| {
                         AvatarRuntimeError::new(AvatarLoadErrorKind::VrmParse, &error)
                     })?;
+                mtoon_declared_count = glb.json.get("materials")
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(0, |materials| materials.iter().filter(|material| {
+                        material.get("extensions").and_then(|extensions| extensions.get("VRMC_materials_mtoon")).is_some()
+                    }).count());
                 let spring_bone_supported = matches!(
                     &document,
                     AvatarSemanticDocument::Vrm1(document)
@@ -637,6 +650,15 @@ impl AvatarCandidate {
                     &document,
                     AvatarSemanticDocument::Vrm1(document) if document.materials_mtoon.present
                 );
+                if request.mtoon_render_mode == crate::settings::MtoonRenderMode::Native
+                    && !mtoon_supported
+                    && mtoon_declared_count > 0
+                {
+                    return Err(AvatarRuntimeError::new(
+                        AvatarLoadErrorKind::NativeMtoonUnsupported,
+                        &anyhow::anyhow!("Native MToon requested, but the avatar's optional VRMC_materials_mtoon semantics cannot be represented by the native renderer"),
+                    ));
+                }
                 node_constraint_required = extension_declaration_contains(
                     &glb.json,
                     "extensionsRequired",
@@ -661,6 +683,11 @@ impl AvatarCandidate {
                     &request.model_path.to_string_lossy(),
                     &ModelLoadOptions {
                         max_texture_dim: Some(2048),
+                        mtoon_render_mode: match request.mtoon_render_mode {
+                            crate::settings::MtoonRenderMode::Auto => pocket3d::model::MtoonRenderMode::Auto,
+                            crate::settings::MtoonRenderMode::Native => pocket3d::model::MtoonRenderMode::Native,
+                            crate::settings::MtoonRenderMode::Fallback => pocket3d::model::MtoonRenderMode::Fallback,
+                        },
                     },
                     allowed_required_extensions,
                     &mtoon_descriptors,
@@ -669,6 +696,20 @@ impl AvatarCandidate {
         }
         .context("loading VRM model")
         .map_err(|error| AvatarRuntimeError::new(AvatarLoadErrorKind::ModelLoad, &error))?;
+        if document.version() == AvatarVersion::Vrm1 {
+            let native_count = model
+                .materials()
+                .iter()
+                .filter(|material| {
+                    matches!(material.model, pocket3d::material::MaterialModel::Mtoon(_))
+                })
+                .count();
+            log::info!(
+                "MToon rendering: {:?}; materials: {native_count} native / {} glTF fallback",
+                request.mtoon_render_mode,
+                mtoon_declared_count.saturating_sub(native_count)
+            );
+        }
 
         let mut clips = Vec::new();
         if let Some(vrma_path) = request.vrma_path.as_ref() {
@@ -809,6 +850,7 @@ impl AvatarCandidate {
 
         let presentation_aabb = presentation.aabb(model.aabb);
         Ok(Self {
+            request: request.clone(),
             asset: model,
             instance,
             document,
@@ -830,6 +872,7 @@ impl AvatarCandidate {
 
     pub(super) fn into_parts(self, scene_slot: AvatarSceneSlot) -> (ModelInstance, ActiveAvatar) {
         let Self {
+            request,
             asset,
             instance,
             document,
@@ -850,6 +893,7 @@ impl AvatarCandidate {
         (
             instance,
             ActiveAvatar {
+                request,
                 asset,
                 document,
                 presentation,
@@ -874,6 +918,7 @@ impl AvatarCandidate {
 
 /// The one avatar currently owned by the parent runtime.
 pub(super) struct ActiveAvatar {
+    pub(super) request: AvatarLoadRequest,
     pub(super) asset: Arc<ModelAsset>,
     pub(super) document: AvatarSemanticDocument,
     #[allow(dead_code)]
@@ -1908,6 +1953,81 @@ mod tests {
             old_asset.materials()[0].model,
             pocket3d::material::MaterialModel::Mtoon(_)
         ));
+    }
+
+    #[test]
+    fn generated_stage_i_modes_preserve_policy_and_failed_reload() {
+        use super::super::controls::ControlAction;
+        use crate::settings::MtoonRenderMode;
+
+        let gpu = Gpu::new_headless().expect("headless GPU is required for Stage I tests");
+        let renderer = Renderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT).unwrap();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let bundle = root.join("dist/character.js");
+        for (fixture, expected_unlit) in [
+            (MtoonPolicyFixture::RequiredNative, false),
+            (MtoonPolicyFixture::RequiredNativeWithUnlit, true),
+        ] {
+            let file = generated_mtoon_policy_avatar(fixture);
+            let mut request = AvatarLoadRequest::new(file.path().to_owned(), None, "StageI");
+            request.mtoon_render_mode = MtoonRenderMode::Fallback;
+            let candidate = AvatarCandidate::prepare(&gpu, &renderer, &bundle, &request).unwrap();
+            let material = &candidate.asset.materials()[0];
+            assert_eq!(
+                matches!(material.model, pocket3d::material::MaterialModel::Unlit(_)),
+                expected_unlit
+            );
+            assert_eq!(
+                matches!(
+                    material.model,
+                    pocket3d::material::MaterialModel::PocketLit(_)
+                ),
+                !expected_unlit
+            );
+            assert!(candidate.asset.primitives[0].mtoon_bind_group.is_none());
+        }
+        let unsupported = generated_mtoon_policy_avatar(MtoonPolicyFixture::RequiredUnsupportedUv);
+        let mut request = AvatarLoadRequest::new(unsupported.path().to_owned(), None, "StageI");
+        request.mtoon_render_mode = MtoonRenderMode::Fallback;
+        assert!(AvatarCandidate::prepare(&gpu, &renderer, &bundle, &request).is_err());
+
+        let file = generated_mtoon_policy_avatar(MtoonPolicyFixture::OptionalFuture);
+        let request = AvatarLoadRequest::new(file.path().to_owned(), None, "StageI");
+        let candidate = AvatarCandidate::prepare(&gpu, &renderer, &bundle, &request).unwrap();
+        let mut widget = Widget::new(WidgetConfig {
+            model_path: file.path().to_owned(),
+            vrma_path: PathBuf::new(),
+            bundle_path: bundle,
+            menu_bundle_path: PathBuf::new(),
+            menu_pak_path: PathBuf::new(),
+            size: (450, 600),
+            cli_max_fps_override: None,
+            frames: None,
+        });
+        widget.commit_avatar_candidate(candidate);
+        let old_asset = widget.active_avatar.as_ref().unwrap().asset.clone();
+        widget.apply_control_action(ControlAction::SetMtoonRenderMode(MtoonRenderMode::Native));
+        assert_eq!(
+            widget.pending_avatar_request.as_ref().unwrap().model_path,
+            file.path()
+        );
+        widget.process_pending_avatar_request(&gpu, &renderer);
+        assert!(
+            widget
+                .latest_avatar_load_error()
+                .unwrap()
+                .message()
+                .contains("Native MToon requested")
+        );
+        assert_eq!(
+            widget.avatar_load_status.ui_error_message(),
+            Some("Native MToon cannot render this avatar. See log.")
+        );
+        assert!(Arc::ptr_eq(
+            &widget.active_avatar.as_ref().unwrap().asset,
+            &old_asset
+        ));
+        assert!(Arc::ptr_eq(&widget.scene.models[0].asset, &old_asset));
     }
 
     #[test]

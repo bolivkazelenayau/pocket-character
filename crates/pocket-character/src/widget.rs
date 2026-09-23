@@ -498,7 +498,8 @@ impl Widget {
     /// Queue a parent-side replacement.  This is intentionally an internal
     /// seam: a future file picker can provide a request without becoming part
     /// of the render or guest ownership model.
-    pub(crate) fn request_avatar_replacement(&mut self, request: AvatarLoadRequest) {
+    pub(crate) fn request_avatar_replacement(&mut self, mut request: AvatarLoadRequest) {
+        request.mtoon_render_mode = self.settings.rendering.mtoon_render_mode;
         self.pending_avatar_request = Some(request);
         self.avatar_load_status.begin_loading();
     }
@@ -844,6 +845,7 @@ impl Widget {
             MenuAction::ResetRuntimeCamera => ControlAction::ResetRuntimeCamera,
             MenuAction::RequestMsaa(preference) => ControlAction::RequestMsaa(preference),
             MenuAction::RequestSmaa(enabled) => ControlAction::RequestSmaa(enabled),
+            MenuAction::SetMtoonRenderMode(mode) => ControlAction::SetMtoonRenderMode(mode),
             MenuAction::SetWindowWidth(value) => ControlAction::SetWindowWidth(value),
             MenuAction::SetWindowHeight(value) => ControlAction::SetWindowHeight(value),
             MenuAction::SetWindowResizable(value) => ControlAction::SetWindowResizable(value),
@@ -1054,6 +1056,7 @@ impl Widget {
     /// Replace every persisted preference with Rust's canonical factory state
     /// only after its one coherent settings document is safely written.
     fn restore_defaults(&mut self) {
+        let previous_mtoon_mode = self.settings.rendering.mtoon_render_mode;
         let defaults = AppSettings::default().sanitized();
         if !self.persist_settings_value(&defaults) {
             return;
@@ -1072,6 +1075,20 @@ impl Widget {
         self.window_runtime_request.always_on_top = Some(defaults.window.always_on_top);
         self.window_runtime_request.max_fps = Some(Some(defaults.rendering.max_fps));
         self.cli_max_fps_active = false;
+        if previous_mtoon_mode != defaults.rendering.mtoon_render_mode {
+            self.reload_current_avatar();
+        }
+    }
+
+    fn reload_current_avatar(&mut self) {
+        let request = self
+            .active_avatar
+            .as_ref()
+            .map(|active| active.request.clone())
+            .or_else(|| self.pending_avatar_request.clone());
+        if let Some(request) = request {
+            self.request_avatar_replacement(request);
+        }
     }
 
     pub(crate) fn apply_control_action(&mut self, action: ControlAction) -> ControlsSnapshot {
@@ -1170,6 +1187,13 @@ impl Widget {
             }
             ControlAction::RequestSmaa(enabled) => {
                 self.aa.request_smaa(enabled);
+            }
+            ControlAction::SetMtoonRenderMode(mode) => {
+                if mode != self.settings.rendering.mtoon_render_mode {
+                    self.settings.rendering.mtoon_render_mode = mode;
+                    self.persist_settings();
+                    self.reload_current_avatar();
+                }
             }
             ControlAction::SettingsOpened => self.open_settings(),
             ControlAction::SettingsClosed => self.close_settings(),
@@ -1463,8 +1487,9 @@ impl Game for Widget {
             renderer.smaa_enabled(),
         );
 
-        let startup_request =
+        let mut startup_request =
             startup_avatar_request(self.cfg.model_path.clone(), self.cfg.vrma_path.clone());
+        startup_request.mtoon_render_mode = self.settings.rendering.mtoon_render_mode;
         let candidate =
             AvatarCandidate::prepare(gpu, renderer, &self.cfg.bundle_path, &startup_request)?;
 
@@ -1732,6 +1757,7 @@ impl Game for Widget {
                             snapshot.requested_msaa(),
                             snapshot.effective_msaa(),
                             snapshot.requested_smaa(),
+                            self.settings.rendering.mtoon_render_mode,
                             snapshot.effective_smaa(),
                             snapshot.msaa_pending(),
                             snapshot.smaa_pending(),
