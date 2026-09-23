@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::Result;
-use glam::{Mat4, Vec2, Vec3};
+use glam::{Vec2, Vec3};
 use pocket_character_core::{CharacterSim, TrackingMode};
 use pocket3d::app::{Game, TextInputRequest, WindowRuntimeRequest, WindowRuntimeState};
 use pocket3d::camera::Camera;
@@ -1595,100 +1595,8 @@ impl Game for Widget {
         // observe partially updated avatar state.
         let guest_turn = {
             let active = self.active_avatar.as_mut().expect("active avatar checked");
-            let model = active.asset.clone();
-
-            // --- sim ----------------------------------------------------
-            let out = active.sim.tick(dt);
-
-            // --- clip ---------------------------------------------------
-            active.animation.clip_time += dt;
-            let clip = active
-                .clips
-                .get(active.animation.clip_index)
-                .map(|(_, c)| c);
-            model.skeleton.sample_locals(
-                clip,
-                active.animation.clip_time,
-                active.animation.clip_looping,
-                &mut active.locals,
-            );
-
-            // --- eyes ---------------------------------------------------
-            // Yaw/pitch from the head toward the look target (model space).
-            active.globals.resize(active.locals.len(), Mat4::IDENTITY);
-            model
-                .skeleton
-                .globals_from_locals(&active.locals, &mut active.globals);
-            let mut procedural_look_at = pocket_vrm::Vrm1ExpressionLookAt::default();
-            if let Some(vrm) = active.document.vrm0() {
-                let head = vrm
-                    .humanoid_node("head")
-                    .map(|n| active.globals[n].w_axis.truncate());
-                if let Some(head_pos) = head {
-                    // Character forward is -Z; yaw > 0 = its left (-X), pitch > 0 = up.
-                    let d = out.look_target - head_pos;
-                    let yaw = (-d.x).atan2(-d.z).to_degrees();
-                    let pitch = d.y.atan2(Vec3::new(d.x, 0.0, d.z).length()).to_degrees();
-                    pocket_vrm::apply_eye_look(
-                        &mut active.locals,
-                        &model.skeleton.rest,
-                        vrm.humanoid_node("leftEye"),
-                        vrm.humanoid_node("rightEye"),
-                        &vrm.look_at,
-                        yaw,
-                        pitch,
-                    );
-                }
-            }
-            if let Some(look_at) = active.look_at.as_ref() {
-                let target_model = active.presentation.model_point_from_world(out.look_target);
-                let output = look_at.evaluate(target_model, &active.locals, &active.globals);
-                output.apply_bone_rotations(&mut active.locals);
-                procedural_look_at = output.expression_weights();
-            }
-
-            // --- expressions --------------------------------------------
-            // Gaze and blink share the VRM 1.0 compositor so overlapping
-            // morph binds accumulate once and procedural overrides see both.
             let scene_slot = active.scene_slot;
-            match &mut active.expressions {
-                ResolvedExpressionRuntime::Vrm0Legacy if out.blink_changed => {
-                    let inst = scene_slot.get_mut(&mut self.scene);
-                    if let Some(morph) = inst.morph.as_mut() {
-                        for &(slot, target, w) in &active.blink_binds {
-                            morph.set_weight(slot, target, out.blink * w);
-                        }
-                    }
-                }
-                ResolvedExpressionRuntime::Vrm1(runtime) => {
-                    runtime.compose_with_procedural_look_at(
-                        &mut self.scene,
-                        scene_slot,
-                        out.blink,
-                        procedural_look_at,
-                    );
-                }
-                ResolvedExpressionRuntime::Vrm0Legacy => {}
-            }
-
-            // --- constraints --------------------------------------------
-            if let Some(constraints) = active.node_constraints.as_mut() {
-                constraints.evaluate(&model.skeleton, &mut active.locals, &mut active.globals);
-            }
-
-            // --- springs ------------------------------------------------
-            if let Some(springs) = active.springs.as_mut() {
-                springs.step(dt, &model.skeleton, &mut active.locals, Mat4::IDENTITY);
-            }
-
-            // --- final pose ---------------------------------------------
-            model
-                .skeleton
-                .globals_from_locals(&active.locals, &mut active.globals);
-            {
-                let inst = scene_slot.get_mut(&mut self.scene);
-                inst.pose = Some(active.globals.clone());
-            }
+            let out = active.advance_pose(scene_slot.get_mut(&mut self.scene), dt);
 
             // --- guest turn ---------------------------------------------
             let mut events: Vec<TickEvent> = std::mem::take(&mut self.pending_events);

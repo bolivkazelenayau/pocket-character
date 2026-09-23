@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, ensure};
 use glam::{Mat4, Vec3};
-use pocket_character_core::CharacterSim;
+use pocket_character_core::{CharacterSim, SimOutputs};
 use pocket_vrm::{
     HumanoidView, SpringSolver, Vrm1Doc, Vrm1LookAtRuntime, VrmDoc, retarget_with_humanoid,
 };
@@ -584,6 +584,7 @@ pub(super) struct AvatarCandidate {
     pub(super) capabilities: AvatarCapabilities,
     pub(super) guest: CharacterGuest,
     pub(super) sim: CharacterSim,
+    pub(super) animation: AvatarAnimationState,
 }
 
 impl AvatarCandidate {
@@ -820,9 +821,6 @@ impl AvatarCandidate {
         instance.transform = presentation.transform;
         instance.cutout = 0.5;
         instance.lit = 0.25;
-        // Give the renderer a valid rest pose during the frame in which a
-        // replacement commits; the next tick replaces it with the live pose.
-        instance.pose = Some(globals.clone());
 
         let bundle = std::fs::read_to_string(bundle_path)
             .with_context(|| format!("reading bundle {}", bundle_path.display()))
@@ -849,7 +847,7 @@ impl AvatarCandidate {
         }
 
         let presentation_aabb = presentation.aabb(model.aabb);
-        Ok(Self {
+        let mut candidate = Self {
             request: request.clone(),
             asset: model,
             instance,
@@ -867,7 +865,71 @@ impl AvatarCandidate {
             capabilities,
             guest,
             sim: CharacterSim::new(AVATAR_SIM_SEED, Vec3::ZERO),
-        })
+            animation: fresh_animation_state(),
+        };
+        candidate.warm_initial_pose()?;
+        Ok(candidate)
+    }
+
+    fn warm_initial_pose(&mut self) -> std::result::Result<(), AvatarRuntimeError> {
+        let Self {
+            asset,
+            instance,
+            document,
+            presentation,
+            locals,
+            globals,
+            clips,
+            springs,
+            blink_binds,
+            expressions,
+            look_at,
+            node_constraints,
+            sim,
+            animation,
+            ..
+        } = self;
+        AvatarPoseState {
+            asset,
+            document,
+            presentation: *presentation,
+            locals,
+            globals,
+            clips,
+            springs,
+            blink_binds,
+            expressions,
+            look_at,
+            node_constraints,
+            sim,
+            animation,
+        }
+        .advance(instance, 0.0);
+
+        self.validate_initial_pose()
+    }
+
+    fn validate_initial_pose(&self) -> std::result::Result<(), AvatarRuntimeError> {
+        let pose = self
+            .instance
+            .pose
+            .as_ref()
+            .expect("pose update sets instance pose");
+        if pose.len() != self.asset.skeleton.rest.len() || !pose.iter().all(|m| m.is_finite()) {
+            return Err(AvatarRuntimeError::new(
+                AvatarLoadErrorKind::RuntimeStartup,
+                &anyhow!("initial avatar pose is invalid"),
+            ));
+        }
+        let mut palette = Vec::new();
+        self.asset.palette_from_globals(pose, &mut palette);
+        if !palette.iter().all(|transform| transform.is_finite()) {
+            return Err(AvatarRuntimeError::new(
+                AvatarLoadErrorKind::RuntimeStartup,
+                &anyhow!("initial avatar skin palette is invalid"),
+            ));
+        }
+        Ok(())
     }
 
     pub(super) fn into_parts(self, scene_slot: AvatarSceneSlot) -> (ModelInstance, ActiveAvatar) {
@@ -889,6 +951,7 @@ impl AvatarCandidate {
             capabilities,
             guest,
             sim,
+            animation,
         } = self;
         (
             instance,
@@ -910,7 +973,7 @@ impl AvatarCandidate {
                 capabilities,
                 guest,
                 sim,
-                animation: fresh_animation_state(),
+                animation,
             },
         )
     }
@@ -938,6 +1001,140 @@ pub(super) struct ActiveAvatar {
     pub(super) guest: CharacterGuest,
     pub(super) sim: CharacterSim,
     pub(super) animation: AvatarAnimationState,
+}
+
+impl ActiveAvatar {
+    pub(super) fn advance_pose(&mut self, instance: &mut ModelInstance, dt: f32) -> SimOutputs {
+        let Self {
+            asset,
+            document,
+            presentation,
+            locals,
+            globals,
+            clips,
+            springs,
+            blink_binds,
+            expressions,
+            look_at,
+            node_constraints,
+            sim,
+            animation,
+            ..
+        } = self;
+        AvatarPoseState {
+            asset,
+            document,
+            presentation: *presentation,
+            locals,
+            globals,
+            clips,
+            springs,
+            blink_binds,
+            expressions,
+            look_at,
+            node_constraints,
+            sim,
+            animation,
+        }
+        .advance(instance, dt)
+    }
+}
+
+/// Shared first-frame and runtime pose path. A candidate owns its instance
+/// until this has completed, so a replacement cannot expose the rest pose.
+struct AvatarPoseState<'a> {
+    asset: &'a Arc<ModelAsset>,
+    document: &'a AvatarSemanticDocument,
+    presentation: AvatarPresentation,
+    locals: &'a mut Vec<NodeTrs>,
+    globals: &'a mut Vec<Mat4>,
+    clips: &'a [(String, Clip)],
+    springs: &'a mut Option<SpringSolver>,
+    blink_binds: &'a [(usize, usize, f32)],
+    expressions: &'a mut ResolvedExpressionRuntime,
+    look_at: &'a Option<Vrm1LookAtRuntime>,
+    node_constraints: &'a mut Option<Vrm1NodeConstraintRuntime>,
+    sim: &'a mut CharacterSim,
+    animation: &'a mut AvatarAnimationState,
+}
+
+impl AvatarPoseState<'_> {
+    fn advance(self, instance: &mut ModelInstance, dt: f32) -> SimOutputs {
+        let out = self.sim.tick(dt);
+
+        self.animation.clip_time += dt;
+        let clip = self
+            .clips
+            .get(self.animation.clip_index)
+            .map(|(_, clip)| clip);
+        self.asset.skeleton.sample_locals(
+            clip,
+            self.animation.clip_time,
+            self.animation.clip_looping,
+            self.locals,
+        );
+
+        self.globals.resize(self.locals.len(), Mat4::IDENTITY);
+        self.asset
+            .skeleton
+            .globals_from_locals(self.locals, self.globals);
+        let mut procedural_look_at = pocket_vrm::Vrm1ExpressionLookAt::default();
+        if let Some(vrm) = self.document.vrm0() {
+            let head = vrm
+                .humanoid_node("head")
+                .map(|node| self.globals[node].w_axis.truncate());
+            if let Some(head_pos) = head {
+                let direction = out.look_target - head_pos;
+                let yaw = (-direction.x).atan2(-direction.z).to_degrees();
+                let pitch = direction
+                    .y
+                    .atan2(Vec3::new(direction.x, 0.0, direction.z).length())
+                    .to_degrees();
+                pocket_vrm::apply_eye_look(
+                    self.locals,
+                    &self.asset.skeleton.rest,
+                    vrm.humanoid_node("leftEye"),
+                    vrm.humanoid_node("rightEye"),
+                    &vrm.look_at,
+                    yaw,
+                    pitch,
+                );
+            }
+        }
+        if let Some(look_at) = self.look_at.as_ref() {
+            let target_model = self.presentation.model_point_from_world(out.look_target);
+            let output = look_at.evaluate(target_model, self.locals, self.globals);
+            output.apply_bone_rotations(self.locals);
+            procedural_look_at = output.expression_weights();
+        }
+
+        match self.expressions {
+            ResolvedExpressionRuntime::Vrm0Legacy if out.blink_changed => {
+                if let Some(morph) = instance.morph.as_mut() {
+                    for &(slot, target, weight) in self.blink_binds {
+                        morph.set_weight(slot, target, out.blink * weight);
+                    }
+                }
+            }
+            ResolvedExpressionRuntime::Vrm1(runtime) => {
+                runtime.compose_on_instance(instance, out.blink, procedural_look_at);
+            }
+            ResolvedExpressionRuntime::Vrm0Legacy => {}
+        }
+
+        if let Some(constraints) = self.node_constraints.as_mut() {
+            constraints.evaluate(&self.asset.skeleton, self.locals, self.globals);
+        }
+        if let Some(springs) = self.springs.as_mut() {
+            springs.step(dt, &self.asset.skeleton, self.locals, Mat4::IDENTITY);
+        }
+
+        self.asset
+            .skeleton
+            .globals_from_locals(self.locals, self.globals);
+        instance.pose = Some(self.globals.clone());
+        out
+    }
 }
 
 /// Camera state that survives an avatar swap.  The active model is used only
@@ -2897,6 +3094,101 @@ mod tests {
     }
 
     #[test]
+    fn replacement_has_final_skin_pose_before_its_first_render() {
+        let gpu = Gpu::new_headless().expect("headless GPU is required for VRM1 integration");
+        let renderer = Renderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT).unwrap();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let (model_file, _, spine_node, _) =
+            generated_vrm1_avatar(true, Some("bone"), ConstraintFixture::ValidAimOptional);
+        let request = AvatarLoadRequest::new(
+            model_file.path().to_owned(),
+            Some(root.join("assets/idle_loop.vrma")),
+            "PreparedReplacement",
+        );
+        let candidate =
+            AvatarCandidate::prepare(&gpu, &renderer, &root.join("dist/character.js"), &request)
+                .expect("replacement pose must prepare before it is committed");
+        assert!(
+            candidate.locals[spine_node]
+                .rotation
+                .angle_between(candidate.asset.skeleton.rest[spine_node].rotation)
+                > 1.0e-4,
+            "initial VRMA sample must be applied before the replacement is visible"
+        );
+
+        let mut widget = Widget::new(WidgetConfig {
+            model_path: model_file.path().to_owned(),
+            vrma_path: root.join("assets/idle_loop.vrma"),
+            bundle_path: root.join("dist/character.js"),
+            menu_bundle_path: PathBuf::new(),
+            menu_pak_path: PathBuf::new(),
+            size: (450, 600),
+            cli_max_fps_override: None,
+            frames: None,
+        });
+        widget.commit_avatar_candidate(candidate);
+        assert_eq!(
+            widget.tick_count, 0,
+            "no normal tick has run before first render"
+        );
+
+        let active = widget.active_avatar.as_ref().unwrap();
+        let instance = &widget.scene.models[active.scene_slot.index()];
+        let pose = instance
+            .pose
+            .as_ref()
+            .expect("committed avatar must be posed");
+        assert_eq!(pose, &active.globals);
+        let mut palette = Vec::new();
+        active.asset.palette_from_globals(pose, &mut palette);
+        assert!(!palette.is_empty());
+        assert!(palette.iter().all(|transform| transform.is_finite()));
+
+        let mut rest_locals = Vec::new();
+        active
+            .asset
+            .skeleton
+            .sample_locals(None, 0.0, false, &mut rest_locals);
+        let mut rest_globals = Vec::new();
+        active
+            .asset
+            .skeleton
+            .globals_from_locals(&rest_locals, &mut rest_globals);
+        let mut rest_palette = Vec::new();
+        active
+            .asset
+            .palette_from_globals(&rest_globals, &mut rest_palette);
+        assert!(
+            palette
+                .iter()
+                .zip(rest_palette.iter())
+                .any(|(posed, rest)| {
+                    posed
+                        .to_cols_array()
+                        .into_iter()
+                        .zip(rest.to_cols_array())
+                        .any(|(a, b)| (a - b).abs() > 1.0e-4)
+                }),
+            "the first rendered skin palette must include the staged animation"
+        );
+
+        let old_pose = pose.clone();
+        let old_asset = active.asset.clone();
+        let mut invalid_replacement =
+            AvatarCandidate::prepare(&gpu, &renderer, &root.join("dist/character.js"), &request)
+                .unwrap();
+        invalid_replacement.instance.pose = Some(vec![Mat4::from_cols_array(&[f32::NAN; 16])]);
+        assert!(
+            invalid_replacement.validate_initial_pose().is_err(),
+            "the preparation validator must reject an invalid initial pose"
+        );
+        let active = widget.active_avatar.as_ref().unwrap();
+        let instance = &widget.scene.models[active.scene_slot.index()];
+        assert!(Arc::ptr_eq(&active.asset, &old_asset));
+        assert_eq!(instance.pose.as_ref(), Some(&old_pose));
+    }
+
+    #[test]
     fn widget_tick_keeps_constraints_in_model_space_through_final_palette() {
         let gpu = Gpu::new_headless().expect("headless GPU is required for VRM1 integration");
         let renderer = Renderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT).unwrap();
@@ -3459,6 +3751,13 @@ mod tests {
             1.0
         );
 
+        let replacement_initial_weight = second
+            .instance
+            .morph
+            .as_ref()
+            .unwrap()
+            .weight(mesh_slot, target);
+        assert_ne!(replacement_initial_weight, 1.0);
         let (replacement, mut replacement_active) = second.into_parts(slot);
         slot.replace(&mut scene, replacement);
         if let ResolvedExpressionRuntime::Vrm1(runtime) = &mut replacement_active.expressions {
@@ -3470,7 +3769,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .weight(mesh_slot, target),
-            0.0
+            replacement_initial_weight
         );
     }
 }

@@ -14,7 +14,7 @@ use pocket_vrm::{
     Vrm1MaterialColorBindType,
 };
 use pocket3d::material::{MaterialAsset, MaterialKind, MaterialStateSet, TextureRole};
-use pocket3d::model::ModelAsset;
+use pocket3d::model::{ModelAsset, ModelInstance};
 use pocket3d::scene::Scene;
 
 use super::avatar::AvatarSceneSlot;
@@ -187,6 +187,19 @@ impl Vrm1ExpressionRuntime {
         procedural_blink: f32,
         procedural_look_at: Vrm1ExpressionLookAt,
     ) {
+        self.compose_on_instance(
+            scene_slot.get_mut(scene),
+            procedural_blink,
+            procedural_look_at,
+        );
+    }
+
+    pub(super) fn compose_on_instance(
+        &mut self,
+        instance: &mut ModelInstance,
+        procedural_blink: f32,
+        procedural_look_at: Vrm1ExpressionLookAt,
+    ) {
         if !self.dirty
             && self.last_procedural_blink == procedural_blink
             && self.last_procedural_look_at == Some(procedural_look_at)
@@ -195,7 +208,6 @@ impl Vrm1ExpressionRuntime {
         }
         let effective_weights = self.effective_weights(procedural_blink, procedural_look_at);
         let assignments = self.composed_morph_weights(&effective_weights);
-        let instance = scene_slot.get_mut(scene);
         if let Some(morph) = instance.morph.as_mut() {
             // Rewriting the complete managed set prevents a dropped expression
             // or a new command batch from leaving stale weights behind.
