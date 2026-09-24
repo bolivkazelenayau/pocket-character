@@ -569,6 +569,7 @@ impl AvatarLoadStatus {
 pub(super) struct AvatarCandidate {
     pub(super) request: AvatarLoadRequest,
     pub(super) asset: Arc<ModelAsset>,
+    pub(super) mtoon_declared_count: usize,
     pub(super) instance: ModelInstance,
     pub(super) document: AvatarSemanticDocument,
     pub(super) presentation: AvatarPresentation,
@@ -698,15 +699,9 @@ impl AvatarCandidate {
         .context("loading VRM model")
         .map_err(|error| AvatarRuntimeError::new(AvatarLoadErrorKind::ModelLoad, &error))?;
         if document.version() == AvatarVersion::Vrm1 {
-            let native_count = model
-                .materials()
-                .iter()
-                .filter(|material| {
-                    matches!(material.model, pocket3d::material::MaterialModel::Mtoon(_))
-                })
-                .count();
+            let native_count = model.native_mtoon_material_count;
             log::info!(
-                "MToon rendering: {:?}; materials: {native_count} native / {} glTF fallback",
+                "MToon rendering: {:?} (asset load); materials: {native_count} native / {} glTF fallback",
                 request.mtoon_render_mode,
                 mtoon_declared_count.saturating_sub(native_count)
             );
@@ -817,6 +812,13 @@ impl AvatarCandidate {
         }
 
         let mut instance = ModelInstance::new(model.clone());
+        instance.mtoon_draw_route = match request.mtoon_render_mode {
+            crate::settings::MtoonRenderMode::Auto => pocket3d::model::MtoonRenderMode::Auto,
+            crate::settings::MtoonRenderMode::Native => pocket3d::model::MtoonRenderMode::Native,
+            crate::settings::MtoonRenderMode::Fallback => {
+                pocket3d::model::MtoonRenderMode::Fallback
+            }
+        };
         instance.morph = model.create_morph_state(gpu);
         instance.transform = presentation.transform;
         instance.cutout = 0.5;
@@ -850,6 +852,7 @@ impl AvatarCandidate {
         let mut candidate = Self {
             request: request.clone(),
             asset: model,
+            mtoon_declared_count,
             instance,
             document,
             presentation,
@@ -936,6 +939,7 @@ impl AvatarCandidate {
         let Self {
             request,
             asset,
+            mtoon_declared_count,
             instance,
             document,
             presentation,
@@ -958,6 +962,7 @@ impl AvatarCandidate {
             ActiveAvatar {
                 request,
                 asset,
+                mtoon_declared_count,
                 document,
                 presentation,
                 presentation_aabb,
@@ -983,6 +988,7 @@ impl AvatarCandidate {
 pub(super) struct ActiveAvatar {
     pub(super) request: AvatarLoadRequest,
     pub(super) asset: Arc<ModelAsset>,
+    pub(super) mtoon_declared_count: usize,
     pub(super) document: AvatarSemanticDocument,
     #[allow(dead_code)]
     pub(super) presentation: AvatarPresentation,
@@ -1004,6 +1010,24 @@ pub(super) struct ActiveAvatar {
 }
 
 impl ActiveAvatar {
+    pub(super) fn has_route(&self, mode: crate::settings::MtoonRenderMode) -> bool {
+        let semantics_supported = match &self.document {
+            AvatarSemanticDocument::Vrm0(_) => true,
+            AvatarSemanticDocument::Vrm1(document) => document.materials_mtoon.present,
+        };
+        match mode {
+            crate::settings::MtoonRenderMode::Fallback => true,
+            crate::settings::MtoonRenderMode::Auto => {
+                self.asset.native_mtoon_material_count == self.asset.native_mtoon_eligible_count
+            }
+            crate::settings::MtoonRenderMode::Native => {
+                self.mtoon_declared_count == 0
+                    || (semantics_supported
+                        && self.asset.native_mtoon_material_count == self.mtoon_declared_count)
+            }
+        }
+    }
+
     pub(super) fn advance_pose(&mut self, instance: &mut ModelInstance, dt: f32) -> SimOutputs {
         let Self {
             asset,
@@ -2225,6 +2249,211 @@ mod tests {
             &old_asset
         ));
         assert!(Arc::ptr_eq(&widget.scene.models[0].asset, &old_asset));
+    }
+
+    #[test]
+    fn stage_i_live_dual_route_switch_and_fallback_first_upgrade() {
+        use super::super::controls::ControlAction;
+        use crate::settings::MtoonRenderMode;
+
+        let gpu = Gpu::new_headless().expect("headless GPU is required for Stage I tests");
+        let renderer = Renderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT).unwrap();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let bundle = root.join("dist/character.js");
+        let file = generated_mtoon_policy_avatar(MtoonPolicyFixture::RequiredNative);
+        let make_widget = || {
+            Widget::new(WidgetConfig {
+                model_path: file.path().to_owned(),
+                vrma_path: PathBuf::new(),
+                bundle_path: bundle.clone(),
+                menu_bundle_path: PathBuf::new(),
+                menu_pak_path: PathBuf::new(),
+                size: (450, 600),
+                cli_max_fps_override: None,
+                frames: None,
+            })
+        };
+
+        let mut request = AvatarLoadRequest::new(file.path().to_owned(), None, "StageI");
+        request.mtoon_render_mode = MtoonRenderMode::Native;
+        let candidate = AvatarCandidate::prepare(&gpu, &renderer, &bundle, &request).unwrap();
+        let mut widget = make_widget();
+        widget.commit_avatar_candidate(candidate);
+        let asset = widget.active_avatar.as_ref().unwrap().asset.clone();
+        let original_instance = &widget.scene.models[0] as *const ModelInstance;
+        widget.scene.models[0].pose = Some(vec![Mat4::IDENTITY]);
+        widget.scene.models[0]
+            .materials
+            .get_mut(0)
+            .unwrap()
+            .base_color_factor = [0.3, 0.4, 0.5, 0.6];
+        let original_material = widget.scene.models[0].materials.get(0).unwrap().clone();
+        widget.scene.time = 4.25;
+        widget.active_avatar.as_mut().unwrap().animation.clip_time = 4.25;
+        let original_expressions = widget.active_avatar.as_ref().unwrap().expressions.clone();
+        for mode in [
+            MtoonRenderMode::Fallback,
+            MtoonRenderMode::Native,
+            MtoonRenderMode::Fallback,
+        ] {
+            widget.apply_control_action(ControlAction::SetMtoonRenderMode(mode));
+            assert!(
+                widget.pending_avatar_request.is_none(),
+                "dual-route switch queued a reload"
+            );
+            assert_eq!(widget.avatar_prepare_count, 0);
+            assert!(Arc::ptr_eq(&widget.scene.models[0].asset, &asset));
+            assert_eq!(
+                &widget.scene.models[0] as *const ModelInstance,
+                original_instance
+            );
+            assert_eq!(widget.scene.models[0].pose, Some(vec![Mat4::IDENTITY]));
+            assert_eq!(
+                widget.scene.models[0].materials.get(0).unwrap(),
+                &original_material
+            );
+            assert_eq!(
+                widget.active_avatar.as_ref().unwrap().expressions,
+                original_expressions
+            );
+            assert_eq!(
+                widget.active_avatar.as_ref().unwrap().animation.clip_time,
+                4.25
+            );
+            assert_eq!(widget.scene.time, 4.25);
+            assert_eq!(
+                widget.scene.models[0].asset.primitives[0]
+                    .draw_route(widget.scene.models[0].mtoon_draw_route)
+                    .native,
+                mode == MtoonRenderMode::Native
+            );
+        }
+        let mut switch_times = Vec::new();
+        for index in 0..20 {
+            let mode = if index % 2 == 0 {
+                MtoonRenderMode::Native
+            } else {
+                MtoonRenderMode::Fallback
+            };
+            let started = std::time::Instant::now();
+            widget.apply_control_action(ControlAction::SetMtoonRenderMode(mode));
+            switch_times.push(started.elapsed());
+            assert_eq!(widget.avatar_prepare_count, 0);
+        }
+        switch_times.sort();
+        eprintln!(
+            "dual-route settings switch median: {:?}",
+            switch_times[switch_times.len() / 2]
+        );
+
+        let mut fallback_request = request;
+        fallback_request.mtoon_render_mode = MtoonRenderMode::Fallback;
+        let fallback =
+            AvatarCandidate::prepare(&gpu, &renderer, &bundle, &fallback_request).unwrap();
+        let mut fallback_widget = make_widget();
+        fallback_widget.commit_avatar_candidate(fallback);
+        let old_asset = fallback_widget
+            .active_avatar
+            .as_ref()
+            .unwrap()
+            .asset
+            .clone();
+        assert_eq!(old_asset.native_mtoon_material_count, 0);
+        assert_eq!(old_asset.native_mtoon_eligible_count, 1);
+        assert!(
+            !fallback_widget
+                .active_avatar
+                .as_ref()
+                .unwrap()
+                .has_route(MtoonRenderMode::Auto)
+        );
+        fallback_widget
+            .apply_control_action(ControlAction::SetMtoonRenderMode(MtoonRenderMode::Native));
+        assert!(fallback_widget.pending_avatar_request.is_some());
+        assert!(Arc::ptr_eq(
+            &fallback_widget.scene.models[0].asset,
+            &old_asset
+        ));
+        fallback_widget.process_pending_avatar_request(&gpu, &renderer);
+        assert_eq!(fallback_widget.avatar_prepare_count, 1);
+        assert!(fallback_widget.pending_avatar_request.is_none());
+        let upgraded = fallback_widget
+            .active_avatar
+            .as_ref()
+            .unwrap()
+            .asset
+            .clone();
+        assert!(!Arc::ptr_eq(&upgraded, &old_asset));
+        assert_eq!(upgraded.native_mtoon_material_count, 1);
+        assert!(
+            fallback_widget
+                .active_avatar
+                .as_ref()
+                .unwrap()
+                .has_route(MtoonRenderMode::Auto)
+        );
+        fallback_widget
+            .apply_control_action(ControlAction::SetMtoonRenderMode(MtoonRenderMode::Fallback));
+        assert!(fallback_widget.pending_avatar_request.is_none());
+        assert_eq!(fallback_widget.avatar_prepare_count, 1);
+        assert!(Arc::ptr_eq(
+            &fallback_widget.scene.models[0].asset,
+            &upgraded
+        ));
+    }
+
+    #[test]
+    fn local_avatar_sample_dual_route_switch_latency() {
+        use super::super::controls::ControlAction;
+        use crate::settings::MtoonRenderMode;
+
+        let fixture = Path::new(r"C:\Users\Breeze\Downloads\AvatarSample_VRM1.0.vrm");
+        if !fixture.is_file() {
+            eprintln!(
+                "skipping local route latency fixture: {}",
+                fixture.display()
+            );
+            return;
+        }
+        let gpu = Gpu::new_headless().expect("headless GPU is required for route latency test");
+        let renderer = Renderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT).unwrap();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let bundle = root.join("dist/character.js");
+        let mut request = AvatarLoadRequest::new(fixture.to_owned(), None, "AvatarSample");
+        request.mtoon_render_mode = MtoonRenderMode::Native;
+        let candidate = AvatarCandidate::prepare(&gpu, &renderer, &bundle, &request).unwrap();
+        let mut widget = Widget::new(WidgetConfig {
+            model_path: fixture.to_owned(),
+            vrma_path: PathBuf::new(),
+            bundle_path: bundle,
+            menu_bundle_path: PathBuf::new(),
+            menu_pak_path: PathBuf::new(),
+            size: (450, 600),
+            cli_max_fps_override: None,
+            frames: None,
+        });
+        widget.commit_avatar_candidate(candidate);
+        let asset = widget.active_avatar.as_ref().unwrap().asset.clone();
+        assert!(asset.native_mtoon_material_count > 0);
+        let mut samples = Vec::new();
+        for index in 0..40 {
+            let mode = if index % 2 == 0 {
+                MtoonRenderMode::Fallback
+            } else {
+                MtoonRenderMode::Native
+            };
+            let started = std::time::Instant::now();
+            widget.apply_control_action(ControlAction::SetMtoonRenderMode(mode));
+            samples.push(started.elapsed());
+            assert_eq!(widget.avatar_prepare_count, 0);
+            assert!(widget.pending_avatar_request.is_none());
+            assert!(Arc::ptr_eq(&widget.scene.models[0].asset, &asset));
+        }
+        samples.sort();
+        eprintln!(
+            "AvatarSample dual-route settings switch median: {:?}",
+            samples[samples.len() / 2]
+        );
     }
 
     #[test]

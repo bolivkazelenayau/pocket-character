@@ -314,6 +314,8 @@ pub struct Widget {
     active_avatar: Option<ActiveAvatar>,
     pending_avatar_request: Option<AvatarLoadRequest>,
     avatar_load_status: AvatarLoadStatus,
+    #[cfg(test)]
+    avatar_prepare_count: usize,
 
     scene: Scene,
     camera: Camera,
@@ -412,6 +414,8 @@ impl Widget {
             active_avatar: None,
             pending_avatar_request: None,
             avatar_load_status: AvatarLoadStatus::default(),
+            #[cfg(test)]
+            avatar_prepare_count: 0,
             scene: Scene::default(),
             camera: Camera::default(),
             hud: Hud::default(),
@@ -567,6 +571,11 @@ impl Widget {
         let Some(request) = self.pending_avatar_request.take() else {
             return;
         };
+
+        #[cfg(test)]
+        {
+            self.avatar_prepare_count += 1;
+        }
 
         match AvatarCandidate::prepare(gpu, renderer, &self.cfg.bundle_path, &request) {
             Ok(candidate) => {
@@ -1076,8 +1085,50 @@ impl Widget {
         self.window_runtime_request.max_fps = Some(Some(defaults.rendering.max_fps));
         self.cli_max_fps_active = false;
         if previous_mtoon_mode != defaults.rendering.mtoon_render_mode {
-            self.reload_current_avatar();
+            self.switch_mtoon_render_mode(defaults.rendering.mtoon_render_mode);
         }
+    }
+
+    fn switch_mtoon_render_mode(&mut self, mode: crate::settings::MtoonRenderMode) {
+        let started = std::time::Instant::now();
+        if let Some(pending) = self.pending_avatar_request.as_mut() {
+            pending.mtoon_render_mode = mode;
+        }
+        if let Some(active) = self.active_avatar.as_mut()
+            && active.scene_slot.is_valid(&self.scene)
+            && active.has_route(mode)
+        {
+            let instance = active.scene_slot.get_mut(&mut self.scene);
+            instance.mtoon_draw_route = match mode {
+                crate::settings::MtoonRenderMode::Auto => pocket3d::model::MtoonRenderMode::Auto,
+                crate::settings::MtoonRenderMode::Native => {
+                    pocket3d::model::MtoonRenderMode::Native
+                }
+                crate::settings::MtoonRenderMode::Fallback => {
+                    pocket3d::model::MtoonRenderMode::Fallback
+                }
+            };
+            active.request.mtoon_render_mode = mode;
+            let native_count = if mode == crate::settings::MtoonRenderMode::Fallback {
+                0
+            } else {
+                active.asset.native_mtoon_material_count
+            };
+            log::info!(
+                "MToon rendering: {:?} (in-place, {:?}); materials: {} native / {} glTF fallback ({} native available)",
+                mode,
+                started.elapsed(),
+                native_count,
+                active.mtoon_declared_count.saturating_sub(native_count),
+                active.asset.native_mtoon_material_count
+            );
+            return;
+        }
+        log::info!(
+            "MToon rendering: {:?} (asset upgrade/reload requested)",
+            mode
+        );
+        self.reload_current_avatar();
     }
 
     fn reload_current_avatar(&mut self) {
@@ -1192,7 +1243,7 @@ impl Widget {
                 if mode != self.settings.rendering.mtoon_render_mode {
                     self.settings.rendering.mtoon_render_mode = mode;
                     self.persist_settings();
-                    self.reload_current_avatar();
+                    self.switch_mtoon_render_mode(mode);
                 }
             }
             ControlAction::SettingsOpened => self.open_settings(),
