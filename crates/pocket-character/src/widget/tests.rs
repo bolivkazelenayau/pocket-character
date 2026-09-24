@@ -9,6 +9,116 @@ fn test_widget() -> Widget {
     Widget::new(test_config())
 }
 
+#[test]
+fn dropped_files_choose_first_vrm_and_keep_current_render_mode() {
+    let mut settings = AppSettings::default();
+    settings.rendering.mtoon_render_mode = crate::settings::MtoonRenderMode::Native;
+    let mut widget = Widget::new_with_settings_path(test_config(), settings, None);
+    let first = PathBuf::from(r"C:\avatars\猫 Avatar.VRM");
+    let later = PathBuf::from(r"C:\avatars\later.vrm");
+    widget.handle_dropped_avatar_files(&[
+        PathBuf::from(r"C:\avatars\picture.png"),
+        first.clone(),
+        later,
+    ]);
+
+    let queued = widget.pending_avatar_request.as_ref().unwrap();
+    let picked = avatar_request_from_picker_result(Some(first), &widget.cfg.vrma_path).unwrap();
+    assert_eq!(queued.model_path, picked.model_path);
+    assert_eq!(queued.vrma_path, picked.vrma_path);
+    assert_eq!(queued.model_name, picked.model_name);
+    assert_eq!(
+        queued.mtoon_render_mode,
+        crate::settings::MtoonRenderMode::Native
+    );
+    assert!(matches!(
+        widget.avatar_load_status,
+        AvatarLoadStatus::Loading
+    ));
+}
+
+#[test]
+fn unsupported_drop_reports_error_without_queuing_replacement() {
+    let mut widget = test_widget();
+    widget.handle_dropped_avatar_files(&[PathBuf::from(r"C:\avatars\picture.png")]);
+    assert!(widget.pending_avatar_request.is_none());
+    assert_eq!(
+        widget.avatar_load_status.ui_error_message(),
+        Some("Drop a .vrm avatar file.")
+    );
+}
+
+#[test]
+fn window_file_events_reach_widget_frame() {
+    let mut widget = test_widget();
+    let mut input = Input::default();
+    let path = PathBuf::from(r"C:\avatars\space and 猫.VRM");
+    input.on_window_event(&pocket3d::winit::event::WindowEvent::HoveredFile(
+        path.clone(),
+    ));
+    widget.frame(1.0 / 60.0, &input);
+    assert!(widget.avatar_drop_hovered);
+
+    input.on_window_event(&pocket3d::winit::event::WindowEvent::DroppedFile(
+        path.clone(),
+    ));
+    widget.frame(1.0 / 60.0, &input);
+    assert!(!widget.avatar_drop_hovered);
+    assert_eq!(
+        widget.pending_avatar_request.as_ref().unwrap().model_path,
+        path
+    );
+    input.end_frame();
+    assert!(input.dropped_files().is_empty());
+}
+
+#[test]
+fn dropped_vrm_uses_transactional_prepare_and_commit() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let model_path = root.join("assets/AvatarSample_A.vrm");
+    let bundle_path = root.join("dist/character.js");
+    let mut config = test_config();
+    config.model_path = model_path.clone();
+    config.bundle_path = bundle_path.clone();
+    config.vrma_path = root.join("assets/idle_loop.vrma");
+    let gpu = Gpu::new_headless().expect("headless GPU is required for avatar drop tests");
+    let renderer = Renderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT).unwrap();
+    let initial_request = startup_avatar_request(model_path.clone(), config.vrma_path.clone());
+    let initial = AvatarCandidate::prepare(&gpu, &renderer, &bundle_path, &initial_request)
+        .expect("bundled avatar prepares");
+    let mut widget = Widget::new(config);
+    widget.commit_avatar_candidate(initial);
+    let original_asset = widget.scene.models[0].asset.clone();
+
+    let directory = tempdir().unwrap();
+    let malformed_path = directory.path().join("malformed.vrm");
+    std::fs::write(&malformed_path, b"not a VRM").unwrap();
+    widget.handle_dropped_avatar_files(&[malformed_path]);
+    widget.process_pending_avatar_request(&gpu, &renderer);
+    assert!(widget.latest_avatar_load_error().is_some());
+    assert!(std::sync::Arc::ptr_eq(
+        &widget.scene.models[0].asset,
+        &original_asset
+    ));
+    assert!(std::sync::Arc::ptr_eq(
+        &widget.active_avatar.as_ref().unwrap().asset,
+        &original_asset
+    ));
+
+    widget.handle_dropped_avatar_files(&[model_path.clone()]);
+    widget.process_pending_avatar_request(&gpu, &renderer);
+    assert_eq!(widget.avatar_prepare_count, 2);
+    assert!(widget.latest_avatar_load_error().is_none());
+    assert_eq!(
+        widget.active_avatar.as_ref().unwrap().request.model_path,
+        model_path
+    );
+    assert!(std::sync::Arc::ptr_eq(
+        &widget.scene.models[0].asset,
+        &widget.active_avatar.as_ref().unwrap().asset
+    ));
+}
+
 fn assert_vec3_near(actual: Vec3, expected: Vec3, epsilon: f32) {
     assert!(
         (actual - expected).length() <= epsilon,

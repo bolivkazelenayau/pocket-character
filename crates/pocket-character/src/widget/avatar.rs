@@ -302,7 +302,14 @@ pub(crate) fn avatar_request_from_picker_result(
     selected: Option<PathBuf>,
     default_vrma_path: &Path,
 ) -> Option<AvatarLoadRequest> {
-    let path = selected?;
+    avatar_request_from_path(selected?, default_vrma_path)
+}
+
+/// Shared path conversion for the native picker and window file drops.
+pub(crate) fn avatar_request_from_path(
+    path: PathBuf,
+    default_vrma_path: &Path,
+) -> Option<AvatarLoadRequest> {
     let extension = path.extension()?.to_str()?;
     if !extension.eq_ignore_ascii_case("vrm") {
         return None;
@@ -417,6 +424,7 @@ fn extension_declaration_contains(json: &Value, key: &str, name: &str) -> Result
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum AvatarLoadErrorKind {
+    UnsupportedFile,
     UnsupportedVrm,
     NativeMtoonUnsupported,
     VrmParse,
@@ -428,6 +436,7 @@ pub(super) enum AvatarLoadErrorKind {
 impl AvatarLoadErrorKind {
     fn ui_message(self) -> &'static str {
         match self {
+            Self::UnsupportedFile => "Drop a .vrm avatar file.",
             Self::UnsupportedVrm => "Unsupported VRM format.",
             Self::NativeMtoonUnsupported => "Native MToon cannot render this avatar. See log.",
             Self::VrmParse => "VRM parse failed.",
@@ -2020,6 +2029,10 @@ mod tests {
     fn avatar_ui_error_categories_are_explicit() {
         let diagnostic = anyhow!("synthetic failure");
         let expected = [
+            (
+                AvatarLoadErrorKind::UnsupportedFile,
+                "Drop a .vrm avatar file.",
+            ),
             (
                 AvatarLoadErrorKind::UnsupportedVrm,
                 "Unsupported VRM format.",

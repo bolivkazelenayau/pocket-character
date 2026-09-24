@@ -59,6 +59,7 @@ interface ControlsState {
   smaa_pending: boolean;
   avatar_status: AvatarStatus;
   avatar_error: string | null;
+  avatar_drop_hovered: boolean;
   window: WindowControlsState;
 }
 
@@ -309,6 +310,7 @@ function pollControls(): void {
           avatar_status?: unknown;
           avatar_loading?: unknown;
           avatar_error?: unknown;
+          avatar_drop_hovered?: unknown;
           window?: unknown;
           x?: unknown;
           y?: unknown;
@@ -325,6 +327,7 @@ function pollControls(): void {
                   : "error"
               : msg.avatar_status;
           const avatarError = msg.avatar_error === undefined ? null : msg.avatar_error;
+          const avatarDropHovered = msg.avatar_drop_hovered === undefined ? false : msg.avatar_drop_hovered;
           const mtoonMode = msg.mtoon_render_mode === undefined ? "auto" : msg.mtoon_render_mode;
           if (
             !window ||
@@ -349,6 +352,7 @@ function pollControls(): void {
             typeof msg.smaa_pending !== "boolean" ||
             !isAvatarStatus(avatarStatus) ||
             (avatarError !== null && typeof avatarError !== "string") ||
+            typeof avatarDropHovered !== "boolean" ||
             !Number.isFinite(msg.effective_fov_deg) ||
             !Number.isFinite(msg.effective_distance_scale) ||
             !Number.isFinite(msg.headroom) ||
@@ -379,6 +383,7 @@ function pollControls(): void {
             smaa_pending: msg.smaa_pending,
             avatar_status: avatarStatus,
             avatar_error: avatarError,
+            avatar_drop_hovered: avatarDropHovered,
             window,
           });
         } else if (
@@ -1019,18 +1024,29 @@ export default function ControlsMenu() {
   // Display formatting only. Rust computes the next value and applies all
   // safety/persistence semantics after receiving the semantic action.
   return (
-    <View debugName="ControlsMenu" class="absolute bottom-[14] left-[14] w-[246]">
-      {settingsVisible() ? (
-        activePage() === "camera" ? <CameraPanel /> : activePage() === "graphics" ? <GraphicsPanel /> : <WindowPanel />
-      ) : (
-        <Focusable
-          debugName="OpenSettings"
-          class="h-[24] w-[84] flex-col items-center justify-center rounded-sm bg-[#172b3be8] focus:bg-[#2b5167] active:bg-[#3a6f88]"
-          onPress={openSettings}
-        >
-          <Text class="text-xs text-[#e8f1f8]">Settings</Text>
-        </Focusable>
-      )}
+    <View debugName="ControlsMenu" class="absolute top-[0] left-[0] h-full w-full">
+      {controls()?.avatar_drop_hovered ? (
+        <View debugName="AvatarDropNotice" class="absolute top-[14] right-[14] h-[28] w-[246] flex-col items-center justify-center rounded-sm bg-[#17354ae8]">
+          <Text class="text-xs text-[#b9e5ff]">Drop VRM to load</Text>
+        </View>
+      ) : controls()?.avatar_status === "error" && (!settingsVisible() || activePage() === "window") ? (
+        <View debugName="AvatarDropError" class="absolute top-[14] right-[14] h-[44] w-[246] flex-col justify-center rounded-sm bg-[#4a2529e8] px-[8]">
+          <Text class="text-xs text-[#ffd1d1]">{controls()?.avatar_error ?? "Avatar could not be loaded."}</Text>
+        </View>
+      ) : null}
+      <View class="absolute bottom-[14] left-[14] w-[246]">
+        {settingsVisible() ? (
+          activePage() === "camera" ? <CameraPanel /> : activePage() === "graphics" ? <GraphicsPanel /> : <WindowPanel />
+        ) : (
+          <Focusable
+            debugName="OpenSettings"
+            class="h-[24] w-[84] flex-col items-center justify-center rounded-sm bg-[#172b3be8] focus:bg-[#2b5167] active:bg-[#3a6f88]"
+            onPress={openSettings}
+          >
+            <Text class="text-xs text-[#e8f1f8]">Settings</Text>
+          </Focusable>
+        )}
+      </View>
     </View>
   );
 }

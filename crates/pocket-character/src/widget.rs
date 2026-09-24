@@ -40,7 +40,8 @@ mod node_constraint;
 use aa::AaRuntime;
 use avatar::{
     ActiveAvatar, AvatarCandidate, AvatarLoadErrorKind, AvatarLoadRequest, AvatarLoadStatus,
-    AvatarRuntimeError, AvatarSceneSlot, avatar_request_from_picker_result, startup_avatar_request,
+    AvatarRuntimeError, AvatarSceneSlot, avatar_request_from_path,
+    avatar_request_from_picker_result, startup_avatar_request,
 };
 #[cfg(test)]
 use camera::CameraRuntimeAdjustments;
@@ -314,6 +315,7 @@ pub struct Widget {
     active_avatar: Option<ActiveAvatar>,
     pending_avatar_request: Option<AvatarLoadRequest>,
     avatar_load_status: AvatarLoadStatus,
+    avatar_drop_hovered: bool,
     #[cfg(test)]
     avatar_prepare_count: usize,
 
@@ -414,6 +416,7 @@ impl Widget {
             active_avatar: None,
             pending_avatar_request: None,
             avatar_load_status: AvatarLoadStatus::default(),
+            avatar_drop_hovered: false,
             #[cfg(test)]
             avatar_prepare_count: 0,
             scene: Scene::default(),
@@ -523,6 +526,25 @@ impl Widget {
         #[cfg(not(windows))]
         {
             log::warn!("Open Avatar is only available on Windows");
+        }
+    }
+
+    fn handle_dropped_avatar_files(&mut self, paths: &[PathBuf]) {
+        if paths.is_empty() {
+            return;
+        }
+        if let Some(request) = paths
+            .iter()
+            .find_map(|path| avatar_request_from_path(path.clone(), &self.cfg.vrma_path))
+        {
+            self.request_avatar_replacement(request);
+        } else {
+            let error = anyhow::anyhow!("no .vrm file in dropped paths");
+            log::warn!("avatar drop rejected: {error}");
+            self.avatar_load_status.fail(AvatarRuntimeError::new(
+                AvatarLoadErrorKind::UnsupportedFile,
+                &error,
+            ));
         }
     }
 
@@ -1574,6 +1596,8 @@ impl Game for Widget {
 
     fn frame(&mut self, dt: f32, input: &Input) {
         self.render_fps.record(dt);
+        self.avatar_drop_hovered = input.file_hovered();
+        self.handle_dropped_avatar_files(input.dropped_files());
         self.buffer_menu_pointer(input);
         self.buffer_menu_input(input);
 
@@ -1722,6 +1746,7 @@ impl Game for Widget {
                             snapshot.smaa_pending(),
                             avatar_status,
                             avatar_error,
+                            self.avatar_drop_hovered,
                             window_snapshot,
                         )?;
                         for pointer_frame in pointer_frames {

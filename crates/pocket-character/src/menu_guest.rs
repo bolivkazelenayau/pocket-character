@@ -346,6 +346,7 @@ struct MenuState {
     smaa_pending: bool,
     avatar_status: String,
     avatar_error: Option<String>,
+    avatar_drop_hovered: bool,
     window: MenuWindowState,
 }
 
@@ -466,6 +467,7 @@ impl MenuGuest {
         smaa_pending: bool,
         avatar_status: &str,
         avatar_error: Option<&str>,
+        avatar_drop_hovered: bool,
         window: MenuWindowState,
     ) -> Result<()> {
         let state = MenuState {
@@ -490,6 +492,7 @@ impl MenuGuest {
             smaa_pending,
             avatar_status: avatar_status.to_owned(),
             avatar_error: avatar_error.map(str::to_owned),
+            avatar_drop_hovered,
             window,
         };
         let line = serde_json::to_string(&state).context("serialize menu state")?;
@@ -698,6 +701,7 @@ mod tests {
             smaa_pending: false,
             avatar_status: "loading".to_owned(),
             avatar_error: Some("avatar failed".to_owned()),
+            avatar_drop_hovered: true,
             window: MenuWindowState {
                 configured_width: 450,
                 configured_height: 600,
@@ -741,6 +745,7 @@ mod tests {
         assert_eq!(value["smaa_pending"], false);
         assert_eq!(value["avatar_status"], "loading");
         assert_eq!(value["avatar_error"], "avatar failed");
+        assert_eq!(value["avatar_drop_hovered"], true);
         assert_eq!(value["window"]["configured_width"], 450);
         assert_eq!(value["window"]["current_width_logical"], 450);
         assert_eq!(value["window"]["applied_always_on_top"], true);
