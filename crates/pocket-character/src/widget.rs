@@ -8,6 +8,8 @@
 
 use std::fmt::Display;
 use std::path::PathBuf;
+#[cfg(windows)]
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -338,6 +340,8 @@ pub struct Widget {
     window_physical_size: Option<(u32, u32)>,
     window_scale_factor: f64,
     window_runtime_state: Option<WindowRuntimeState>,
+    #[cfg(windows)]
+    native_window: Option<Arc<pocket3d::winit::window::Window>>,
     window_runtime_request: WindowRuntimeRequest,
     window_observation_generation: u64,
     pending_window_size_request: Option<PendingWindowSizeRequest>,
@@ -438,6 +442,8 @@ impl Widget {
             window_physical_size: None,
             window_scale_factor: DEFAULT_WINDOW_SCALE_FACTOR,
             window_runtime_state: None,
+            #[cfg(windows)]
+            native_window: None,
             window_runtime_request: WindowRuntimeRequest::default(),
             window_observation_generation: 0,
             pending_window_size_request: None,
@@ -524,9 +530,14 @@ impl Widget {
     fn open_avatar_picker(&mut self) {
         #[cfg(windows)]
         {
+            let Some(window) = self.native_window.as_ref() else {
+                log::error!("Open Avatar requires the native owner window");
+                return;
+            };
             let selected = rfd::FileDialog::new()
                 .set_title("Open Avatar")
                 .add_filter("VRM avatar", &["vrm"])
+                .set_parent(window.as_ref())
                 .pick_file();
             if let Some(request) = avatar_request_from_picker_result(selected, &self.cfg.vrma_path)
             {
@@ -1570,6 +1581,11 @@ fn apply_expression(active: &ActiveAvatar, scene: &mut Scene, name: &str, w: f32
 }
 
 impl Game for Widget {
+    #[cfg(windows)]
+    fn window_ready(&mut self, window: Arc<pocket3d::winit::window::Window>) {
+        self.native_window = Some(window);
+    }
+
     fn window_runtime_state(&mut self, state: WindowRuntimeState) {
         self.window_runtime_state = Some(state);
         self.window_physical_size = Some(state.inner_size_px);
