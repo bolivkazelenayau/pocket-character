@@ -242,10 +242,45 @@ impl WindowSettings {
 }
 
 /// Avatar behavior preferences. Expression and clip inputs remain avatar-owned.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LookAtMode {
+    Off,
+    #[default]
+    Window,
+    Global,
+}
+
+impl LookAtMode {
+    fn from_json_value(value: &Value) -> Option<Self> {
+        match value {
+            Value::Bool(false) => Some(Self::Off),
+            Value::Bool(true) => Some(Self::Window),
+            Value::String(mode) => match mode.as_str() {
+                "off" => Some(Self::Off),
+                "window" => Some(Self::Window),
+                "global" => Some(Self::Global),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for LookAtMode {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        Ok(Self::from_json_value(&value).unwrap_or_default())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AvatarBehaviorSettings {
-    #[serde(default = "default_enabled", deserialize_with = "deserialize_enabled")]
-    pub look_at: bool,
+    #[serde(default, alias = "look_at", alias = "look_at_enabled")]
+    pub look_at_mode: LookAtMode,
     #[serde(default = "default_enabled", deserialize_with = "deserialize_enabled")]
     pub auto_blink: bool,
 }
@@ -253,7 +288,7 @@ pub struct AvatarBehaviorSettings {
 impl Default for AvatarBehaviorSettings {
     fn default() -> Self {
         Self {
-            look_at: true,
+            look_at_mode: LookAtMode::Window,
             auto_blink: true,
         }
     }
@@ -775,14 +810,36 @@ mod tests {
     #[test]
     fn avatar_behavior_defaults_and_round_trips_without_changing_expression_state() {
         let legacy = AppSettings::from_json(r#"{"schema_version":1}"#).unwrap();
-        assert!(legacy.avatar_behavior.look_at);
+        assert_eq!(legacy.avatar_behavior.look_at_mode, LookAtMode::Window);
         assert!(legacy.avatar_behavior.auto_blink);
 
         let mut settings = legacy;
-        settings.avatar_behavior.look_at = false;
+        settings.avatar_behavior.look_at_mode = LookAtMode::Global;
         settings.avatar_behavior.auto_blink = false;
         let restored = AppSettings::from_json(&serde_json::to_string(&settings).unwrap()).unwrap();
         assert_eq!(restored.avatar_behavior, settings.avatar_behavior);
+    }
+
+    #[test]
+    fn legacy_look_at_booleans_migrate_to_modes() {
+        for (legacy, expected) in [(false, LookAtMode::Off), (true, LookAtMode::Window)] {
+            let json = format!(r#"{{"avatar_behavior":{{"look_at":{legacy}}}}}"#);
+            let settings = AppSettings::from_json(&json).unwrap();
+            assert_eq!(settings.avatar_behavior.look_at_mode, expected);
+            let saved = serde_json::to_value(&settings).unwrap();
+            assert_eq!(
+                saved["avatar_behavior"]["look_at_mode"],
+                serde_json::json!(match expected {
+                    LookAtMode::Off => "off",
+                    LookAtMode::Window => "window",
+                    LookAtMode::Global => "global",
+                })
+            );
+            assert!(saved["avatar_behavior"].get("look_at").is_none());
+        }
+        let alias =
+            AppSettings::from_json(r#"{"avatar_behavior":{"look_at_enabled":false}}"#).unwrap();
+        assert_eq!(alias.avatar_behavior.look_at_mode, LookAtMode::Off);
     }
 
     #[test]

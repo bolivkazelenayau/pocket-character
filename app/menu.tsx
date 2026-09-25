@@ -42,7 +42,7 @@ import { binaryWeight, decodeExpressions, sliderWeight, type ExpressionState } f
 /// intentionally separate: the guest only renders these facts and never
 /// predicts whether a renderer request will apply.
 interface ControlsState {
-  look_at_enabled: boolean;
+  look_at_mode: "off" | "window" | "global";
   auto_blink_enabled: boolean;
   avatar_generation: number;
   expressions: ExpressionState[];
@@ -357,7 +357,7 @@ function pollControls(): void {
           avatar_error?: unknown;
           avatar_drop_hovered?: unknown;
           avatar_generation?: unknown;
-          look_at_enabled?: unknown;
+          look_at_mode?: unknown;
           auto_blink_enabled?: unknown;
           expressions?: unknown;
           window?: unknown;
@@ -404,7 +404,7 @@ function pollControls(): void {
             !isAvatarStatus(avatarStatus) ||
             (avatarError !== null && typeof avatarError !== "string") ||
             typeof avatarDropHovered !== "boolean" ||
-            (msg.look_at_enabled !== undefined && typeof msg.look_at_enabled !== "boolean") ||
+            (msg.look_at_mode !== undefined && msg.look_at_mode !== "off" && msg.look_at_mode !== "window" && msg.look_at_mode !== "global") ||
             (msg.auto_blink_enabled !== undefined && typeof msg.auto_blink_enabled !== "boolean") ||
             !Number.isFinite(msg.effective_fov_deg) ||
             !Number.isFinite(msg.effective_distance_scale) ||
@@ -424,7 +424,7 @@ function pollControls(): void {
             setExpressionPage(0);
           }
           setControls({
-            look_at_enabled: (msg.look_at_enabled as boolean | undefined) ?? true,
+            look_at_mode: (msg.look_at_mode as ControlsState["look_at_mode"] | undefined) ?? "window",
             auto_blink_enabled: (msg.auto_blink_enabled as boolean | undefined) ?? true,
             effective_fov_deg: msg.effective_fov_deg,
             effective_distance_scale: msg.effective_distance_scale,
@@ -643,14 +643,19 @@ function ToggleOption(props: {
   label: string;
   selected: boolean;
   onPress: () => void;
+  wide?: boolean;
 }) {
   return (
     <Focusable
       debugName={props.debugName}
       class={
         props.selected
-          ? "h-[18] w-[28] flex-col items-center justify-center rounded-sm bg-[#2b5167]"
-          : "h-[18] w-[28] flex-col items-center justify-center rounded-sm bg-[#172b3b] focus:bg-[#2b5167] active:bg-[#3a6f88]"
+          ? props.wide
+            ? "h-[18] w-[52] flex-col items-center justify-center rounded-sm bg-[#2b5167]"
+            : "h-[18] w-[28] flex-col items-center justify-center rounded-sm bg-[#2b5167]"
+          : props.wide
+            ? "h-[18] w-[52] flex-col items-center justify-center rounded-sm bg-[#172b3b] focus:bg-[#2b5167] active:bg-[#3a6f88]"
+            : "h-[18] w-[28] flex-col items-center justify-center rounded-sm bg-[#172b3b] focus:bg-[#2b5167] active:bg-[#3a6f88]"
       }
       onPress={props.onPress}
     >
@@ -892,7 +897,26 @@ function GraphicsPanel() {
   );
 }
 
-function AvatarBehaviorRow(props: { label: string; enabled: boolean; action: "set_look_at" | "set_auto_blink"; debugName: string }) {
+function LookAtModeRow(props: { mode: ControlsState["look_at_mode"] }) {
+  return (
+    <View debugName="LookAtRow" class="h-[18] flex-row items-center">
+      <Text class="min-w-[48] flex-1 text-xs text-[#9fb3c8]">LookAt</Text>
+      <View class="shrink-0 flex-row gap-[2]">
+        {(["off", "window", "global"] as const).map((mode) => (
+          <ToggleOption
+            debugName={`LookAt${mode}`}
+            label={mode === "off" ? "Off" : mode === "window" ? "Window" : "Global"}
+            selected={props.mode === mode}
+            wide
+            onPress={() => sendAction("set_look_at", mode)}
+          />
+        ))}
+      </View>
+    </View>
+  );
+}
+
+function AvatarBehaviorRow(props: { label: string; enabled: boolean; action: "set_auto_blink"; debugName: string }) {
   return (
     <View debugName={`${props.debugName}Row`} class="h-[18] flex-row items-center">
       <Text class="min-w-[48] flex-1 text-xs text-[#9fb3c8]">{props.label}</Text>
@@ -1029,7 +1053,7 @@ function CameraPanel() {
         <Text class="text-xs font-bold text-[#7fd0ff]">AVATAR BEHAVIOR</Text>
       </View>
       <View class="flex-col gap-[2]">
-        <AvatarBehaviorRow label="LookAt" enabled={controls()?.look_at_enabled ?? true} action="set_look_at" debugName="LookAt" />
+        <LookAtModeRow mode={controls()?.look_at_mode ?? "window"} />
         <AvatarBehaviorRow label="Auto Blink" enabled={controls()?.auto_blink_enabled ?? true} action="set_auto_blink" debugName="AutoBlink" />
       </View>
     </SettingsFrame>

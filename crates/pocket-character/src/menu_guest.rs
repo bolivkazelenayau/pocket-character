@@ -191,7 +191,7 @@ pub(crate) enum MenuAction {
     RequestMsaa(AntiAliasingPreference),
     RequestSmaa(bool),
     SetMtoonRenderMode(crate::settings::MtoonRenderMode),
-    SetLookAt(bool),
+    SetLookAt(crate::settings::LookAtMode),
     SetAutoBlink(bool),
     RestoreDefaults,
     OpenAvatar,
@@ -323,7 +323,12 @@ fn decode_menu_action(line: &str) -> Option<MenuAction> {
         "set_look_at" => wire
             .value
             .as_ref()
-            .and_then(|value| value.as_bool())
+            .and_then(|value| match value.as_str()? {
+                "off" => Some(crate::settings::LookAtMode::Off),
+                "window" => Some(crate::settings::LookAtMode::Window),
+                "global" => Some(crate::settings::LookAtMode::Global),
+                _ => None,
+            })
             .map(MenuAction::SetLookAt),
         "set_auto_blink" => wire
             .value
@@ -377,7 +382,7 @@ struct MenuState {
     window: MenuWindowState,
     expressions: Vec<MenuExpressionState>,
     avatar_generation: u32,
-    look_at_enabled: bool,
+    look_at_mode: crate::settings::LookAtMode,
     auto_blink_enabled: bool,
 }
 
@@ -511,7 +516,7 @@ impl MenuGuest {
         window: MenuWindowState,
         expressions: Vec<MenuExpressionState>,
         avatar_generation: u32,
-        look_at_enabled: bool,
+        look_at_mode: crate::settings::LookAtMode,
         auto_blink_enabled: bool,
     ) -> Result<()> {
         let state = MenuState {
@@ -540,7 +545,7 @@ impl MenuGuest {
             window,
             expressions,
             avatar_generation,
-            look_at_enabled,
+            look_at_mode,
             auto_blink_enabled,
         };
         let line = serde_json::to_string(&state).context("serialize menu state")?;
@@ -772,7 +777,7 @@ mod tests {
                 custom: false,
             }],
             avatar_generation: 4,
-            look_at_enabled: false,
+            look_at_mode: crate::settings::LookAtMode::Off,
             auto_blink_enabled: true,
         })
         .unwrap();
@@ -811,6 +816,7 @@ mod tests {
         assert_eq!(value["expressions"][0]["name"], "happy");
         assert_eq!(value["expressions"][0]["index"], 2);
         assert_eq!(value["avatar_generation"], 4);
+        assert_eq!(value["look_at_mode"], "off");
     }
 
     #[test]
@@ -943,8 +949,12 @@ mod tests {
                 MenuAction::SetMtoonRenderMode(crate::settings::MtoonRenderMode::Fallback),
             ),
             (
-                r#"{"t":"action","action":"set_look_at","value":false}"#,
-                MenuAction::SetLookAt(false),
+                r#"{"t":"action","action":"set_look_at","value":"global"}"#,
+                MenuAction::SetLookAt(crate::settings::LookAtMode::Global),
+            ),
+            (
+                r#"{"t":"action","action":"set_look_at","value":"window"}"#,
+                MenuAction::SetLookAt(crate::settings::LookAtMode::Window),
             ),
             (
                 r#"{"t":"action","action":"set_auto_blink","value":true}"#,

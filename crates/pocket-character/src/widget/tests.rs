@@ -1,6 +1,8 @@
 use super::*;
 use crate::menu_guest::MenuAction;
-use crate::settings::{AntiAliasingPreference, AppSettings, RenderSettings, WindowSettings};
+use crate::settings::{
+    AntiAliasingPreference, AppSettings, LookAtMode, RenderSettings, WindowSettings,
+};
 use glam::{Vec2, Vec3};
 use pocket3d::app::{Game, WindowRuntimeRequest, WindowRuntimeState};
 use tempfile::tempdir;
@@ -158,6 +160,43 @@ fn mouse_target_preserves_screen_axis_directions() {
     for target in [left, right, up, down] {
         assert!((target.z - -3.75).abs() <= 1.0e-4);
     }
+}
+
+#[test]
+fn global_cursor_projects_outside_viewport_through_same_camera_path() {
+    let camera = Camera::default();
+    let viewport = (450, 600);
+    let head = Vec3::new(0.0, 1.5, -5.0);
+    let fallback = Vec3::new(4.0, 5.0, 6.0);
+    let outside = Vec2::new(-300.0, 300.0);
+    assert_eq!(
+        resolved_mouse_target(&camera, Some(outside), viewport, head, fallback),
+        fallback
+    );
+    let global =
+        resolved_mouse_target_with_bounds(&camera, Some(outside), viewport, head, fallback, true);
+    let center =
+        mouse_target_from_screen(&camera, Vec2::new(225.0, 300.0), viewport, head).unwrap();
+    assert!(global.x < center.x);
+    assert_ne!(global, fallback);
+}
+
+#[cfg(windows)]
+#[test]
+fn global_cursor_uses_signed_physical_desktop_coordinates() {
+    assert_eq!(
+        client_cursor_from_screen((-1800, 250), (-1920, 100)),
+        Vec2::new(120.0, 150.0)
+    );
+    // At 150% DPI the client origin and OS cursor are both already physical pixels.
+    assert_eq!(
+        client_cursor_from_screen((975, 600), (900, 450)),
+        Vec2::new(75.0, 150.0)
+    );
+    assert_eq!(
+        client_cursor_from_screen((-2000, 0), (-1920, 100)),
+        Vec2::new(-80.0, -100.0)
+    );
 }
 
 #[test]
@@ -522,7 +561,7 @@ fn avatar_behavior_actions_persist_across_settings_and_route_changes() {
     let mut widget =
         Widget::new_with_settings_path(test_config(), AppSettings::default(), Some(path.clone()));
 
-    widget.apply_control_action(ControlAction::SetLookAt(false));
+    widget.apply_control_action(ControlAction::SetLookAt(LookAtMode::Off));
     widget.apply_control_action(ControlAction::SetAutoBlink(false));
     widget.open_settings();
     widget.close_settings();
@@ -532,26 +571,101 @@ fn avatar_behavior_actions_persist_across_settings_and_route_changes() {
     widget.apply_control_action(ControlAction::SetMtoonRenderMode(
         crate::settings::MtoonRenderMode::Native,
     ));
-    assert!(!widget.settings.avatar_behavior.look_at);
+    assert_eq!(
+        widget.settings.avatar_behavior.look_at_mode,
+        LookAtMode::Off
+    );
     assert!(!widget.settings.avatar_behavior.auto_blink);
     assert_eq!(
         AppSettings::load_from_path(&path).avatar_behavior,
         widget.settings.avatar_behavior
     );
 
-    widget.apply_control_action(ControlAction::SetLookAt(true));
+    widget.apply_control_action(ControlAction::SetLookAt(LookAtMode::Global));
     widget.apply_control_action(ControlAction::SetAutoBlink(true));
-    assert!(widget.settings.avatar_behavior.look_at);
+    assert_eq!(
+        widget.settings.avatar_behavior.look_at_mode,
+        LookAtMode::Global
+    );
     assert!(widget.settings.avatar_behavior.auto_blink);
+    assert_eq!(
+        AppSettings::load_from_path(&path)
+            .avatar_behavior
+            .look_at_mode,
+        LookAtMode::Global
+    );
+    widget.apply_control_action(ControlAction::SetLookAt(LookAtMode::Window));
+    assert_eq!(
+        AppSettings::load_from_path(&path)
+            .avatar_behavior
+            .look_at_mode,
+        LookAtMode::Window
+    );
 }
 
 #[test]
-fn settings_pointer_capture_suspends_cursor_look_at_until_exit() {
-    assert!(cursor_drives_avatar_look_at(true, false, false));
-    assert!(!cursor_drives_avatar_look_at(false, false, false));
-    assert!(!cursor_drives_avatar_look_at(true, false, true));
-    assert!(!cursor_drives_avatar_look_at(true, true, false));
-    assert!(cursor_drives_avatar_look_at(true, false, false));
+fn window_is_ui_aware_and_global_tracks_through_settings_interaction() {
+    assert!(cursor_drives_avatar_look_at(
+        LookAtMode::Window,
+        false,
+        false
+    ));
+    assert!(!cursor_drives_avatar_look_at(LookAtMode::Off, false, false));
+    assert!(!cursor_drives_avatar_look_at(
+        LookAtMode::Window,
+        false,
+        true
+    ));
+    assert!(!cursor_drives_avatar_look_at(
+        LookAtMode::Window,
+        true,
+        false
+    ));
+    assert!(cursor_drives_avatar_look_at(
+        LookAtMode::Global,
+        false,
+        true
+    ));
+    assert!(cursor_drives_avatar_look_at(
+        LookAtMode::Global,
+        true,
+        false
+    ));
+    assert!(cursor_drives_avatar_look_at(LookAtMode::Global, true, true));
+    assert!(cursor_drives_avatar_look_at(
+        LookAtMode::Global,
+        false,
+        false
+    ));
+    // A mode change uses the next frame's gate immediately, with no latched
+    // suppression from the UI interaction in the previous mode.
+    assert!(!cursor_drives_avatar_look_at(
+        LookAtMode::Window,
+        true,
+        true
+    ));
+    assert!(cursor_drives_avatar_look_at(LookAtMode::Global, true, true));
+    assert!(!cursor_drives_avatar_look_at(LookAtMode::Off, true, true));
+}
+
+#[test]
+fn global_settings_slider_drag_updates_the_projected_gaze_target() {
+    let camera = Camera::default();
+    let viewport = (450, 600);
+    let head = Vec3::new(0.0, 1.5, -5.0);
+    let fallback = Vec3::new(4.0, 5.0, 6.0);
+    let target = |x| {
+        assert!(cursor_drives_avatar_look_at(LookAtMode::Global, true, true));
+        resolved_mouse_target_with_bounds(
+            &camera,
+            Some(Vec2::new(x, 350.0)),
+            viewport,
+            head,
+            fallback,
+            true,
+        )
+    };
+    assert!(target(80.0).x < target(180.0).x);
 }
 
 #[test]

@@ -29,7 +29,7 @@ use crate::menu_guest::{
     MenuAction, MenuGuest, MenuInputFrame, MenuInputModifiers, MenuTextInputCapture,
     MenuWindowState,
 };
-use crate::settings::{AntiAliasingPreference, AppSettings, CameraSettings};
+use crate::settings::{AntiAliasingPreference, AppSettings, CameraSettings, LookAtMode};
 
 mod aa;
 mod avatar;
@@ -156,11 +156,42 @@ fn native_drag_allowed_for_menu_pointer(menu_pointer_owned: bool) -> bool {
 }
 
 fn cursor_drives_avatar_look_at(
-    enabled: bool,
+    mode: LookAtMode,
     menu_pointer_owned: bool,
     pointer_over_ui: bool,
 ) -> bool {
-    enabled && !menu_pointer_owned && !pointer_over_ui
+    match mode {
+        LookAtMode::Off => false,
+        LookAtMode::Window => !menu_pointer_owned && !pointer_over_ui,
+        LookAtMode::Global => true,
+    }
+}
+
+#[cfg(windows)]
+fn client_cursor_from_screen(screen: (i32, i32), client_origin: (i32, i32)) -> Vec2 {
+    // Both GetCursorPos and winit's inner_position use desktop physical pixels.
+    // Keep the subtraction signed for monitors left/above the primary display.
+    Vec2::new(
+        (i64::from(screen.0) - i64::from(client_origin.0)) as f32,
+        (i64::from(screen.1) - i64::from(client_origin.1)) as f32,
+    )
+}
+
+#[cfg(windows)]
+fn global_cursor_for_window(window: &pocket3d::winit::window::Window) -> Option<Vec2> {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+    let mut position = POINT { x: 0, y: 0 };
+    // SAFETY: position is a valid writable POINT for this synchronous Win32 call.
+    if unsafe { GetCursorPos(&mut position) } == 0 {
+        return None;
+    }
+    let origin = window.inner_position().ok()?;
+    Some(client_cursor_from_screen(
+        (position.x, position.y),
+        (origin.x, origin.y),
+    ))
 }
 
 /// Intersect a world-space ray with a plane. Invalid, parallel, and
@@ -203,12 +234,23 @@ fn mouse_target_from_screen(
     viewport: (u32, u32),
     head_world: Vec3,
 ) -> Option<Vec3> {
+    project_mouse_target(camera, cursor, viewport, head_world, false)
+}
+
+fn project_mouse_target(
+    camera: &Camera,
+    cursor: Vec2,
+    viewport: (u32, u32),
+    head_world: Vec3,
+    allow_outside_viewport: bool,
+) -> Option<Vec3> {
     Camera::aspect_for_viewport(viewport)?;
     if !cursor.is_finite()
-        || cursor.x < 0.0
-        || cursor.y < 0.0
-        || cursor.x > viewport.0 as f32
-        || cursor.y > viewport.1 as f32
+        || (!allow_outside_viewport
+            && (cursor.x < 0.0
+                || cursor.y < 0.0
+                || cursor.x > viewport.0 as f32
+                || cursor.y > viewport.1 as f32))
         || !head_world.is_finite()
     {
         return None;
@@ -228,6 +270,21 @@ fn resolved_mouse_target(
 ) -> Vec3 {
     cursor
         .and_then(|cursor| mouse_target_from_screen(camera, cursor, viewport, head_world))
+        .unwrap_or(fallback)
+}
+
+fn resolved_mouse_target_with_bounds(
+    camera: &Camera,
+    cursor: Option<Vec2>,
+    viewport: (u32, u32),
+    head_world: Vec3,
+    fallback: Vec3,
+    allow_outside_viewport: bool,
+) -> Vec3 {
+    cursor
+        .and_then(|cursor| {
+            project_mouse_target(camera, cursor, viewport, head_world, allow_outside_viewport)
+        })
         .unwrap_or(fallback)
 }
 
@@ -484,7 +541,7 @@ impl Widget {
         }
     }
 
-    fn update_mouse_tracking_target(&mut self, cursor: Option<Vec2>) {
+    fn update_mouse_tracking_target(&mut self, cursor: Option<Vec2>, global: bool) {
         let Some(active) = self.active_avatar.as_ref() else {
             return;
         };
@@ -511,7 +568,18 @@ impl Widget {
             .window_physical_size
             .or(self.viewport_size)
             .unwrap_or(self.cfg.size);
-        let target = resolved_mouse_target(&self.camera, cursor, viewport, head_world, fallback);
+        let target = if global {
+            resolved_mouse_target_with_bounds(
+                &self.camera,
+                cursor,
+                viewport,
+                head_world,
+                fallback,
+                true,
+            )
+        } else {
+            resolved_mouse_target(&self.camera, cursor, viewport, head_world, fallback)
+        };
 
         if let Some(active) = self.active_avatar.as_mut() {
             active.sim.mouse_target = target;
@@ -1321,8 +1389,8 @@ impl Widget {
                 }
             }
             ControlAction::SetLookAt(value) => {
-                if self.settings.avatar_behavior.look_at != value {
-                    self.settings.avatar_behavior.look_at = value;
+                if self.settings.avatar_behavior.look_at_mode != value {
+                    self.settings.avatar_behavior.look_at_mode = value;
                     self.persist_settings();
                 }
             }
@@ -1724,15 +1792,28 @@ impl Game for Widget {
                 TickEvent::HoverEnd
             });
         }
-        let pointer_over_ui = input
-            .cursor()
-            .is_some_and(|cursor| self.menu_owns_pointer(cursor));
-        if cursor_drives_avatar_look_at(
-            self.settings.avatar_behavior.look_at,
-            self.menu_pointer_owned,
-            pointer_over_ui,
-        ) {
-            self.update_mouse_tracking_target(input.cursor());
+        let look_at_mode = self.settings.avatar_behavior.look_at_mode;
+        #[cfg(windows)]
+        let global_cursor = (look_at_mode == LookAtMode::Global)
+            .then(|| {
+                self.native_window
+                    .as_ref()
+                    .and_then(|window| global_cursor_for_window(window))
+            })
+            .flatten();
+        #[cfg(not(windows))]
+        let global_cursor: Option<Vec2> = None;
+        let cursor = if look_at_mode == LookAtMode::Global {
+            global_cursor
+        } else {
+            input.cursor()
+        };
+        // Window mode is UI-aware. Global mode deliberately follows the
+        // physical cursor through Settings hover and drag interactions.
+        let pointer_over_ui = look_at_mode == LookAtMode::Window
+            && cursor.is_some_and(|cursor| self.menu_owns_pointer(cursor));
+        if cursor_drives_avatar_look_at(look_at_mode, self.menu_pointer_owned, pointer_over_ui) {
+            self.update_mouse_tracking_target(cursor, look_at_mode == LookAtMode::Global);
         }
     }
 
@@ -1749,8 +1830,8 @@ impl Game for Widget {
         let guest_turn = {
             let active = self.active_avatar.as_mut().expect("active avatar checked");
             let scene_slot = active.scene_slot;
-            let look_at_enabled =
-                self.settings.avatar_behavior.look_at || active.sim.tracking != TrackingMode::Mouse;
+            let look_at_enabled = self.settings.avatar_behavior.look_at_mode != LookAtMode::Off
+                || active.sim.tracking != TrackingMode::Mouse;
             let out = active.advance_pose(
                 scene_slot.get_mut(&mut self.scene),
                 dt,
@@ -1848,7 +1929,7 @@ impl Game for Widget {
                             window_snapshot,
                             expressions,
                             self.avatar_generation,
-                            self.settings.avatar_behavior.look_at,
+                            self.settings.avatar_behavior.look_at_mode,
                             self.settings.avatar_behavior.auto_blink,
                         )?;
                         for pointer_frame in pointer_frames {

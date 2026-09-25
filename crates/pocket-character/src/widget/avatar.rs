@@ -3763,13 +3763,18 @@ mod tests {
             active.sim.tracking = TrackingMode::Mouse;
             active.sim.mouse_target = Vec3::new(1.25, 1.75, 4.0);
         }
-        widget.settings.avatar_behavior.look_at = false;
+        widget.settings.avatar_behavior.look_at_mode = crate::settings::LookAtMode::Off;
         <Widget as Game>::tick(&mut widget, 0.25, &Input::default());
         let active = widget.active_avatar.as_ref().unwrap();
         let rest = active.asset.skeleton.rest[left_eye].rotation;
         assert!(active.locals[left_eye].rotation.angle_between(rest) < 1.0e-4);
 
-        widget.settings.avatar_behavior.look_at = true;
+        widget.settings.avatar_behavior.look_at_mode = crate::settings::LookAtMode::Window;
+        <Widget as Game>::tick(&mut widget, 0.25, &Input::default());
+        let active = widget.active_avatar.as_ref().unwrap();
+        assert!(active.locals[left_eye].rotation.angle_between(rest) > 1.0e-4);
+
+        widget.settings.avatar_behavior.look_at_mode = crate::settings::LookAtMode::Global;
         <Widget as Game>::tick(&mut widget, 0.25, &Input::default());
         let active = widget.active_avatar.as_ref().unwrap();
         assert!(active.locals[left_eye].rotation.angle_between(rest) > 1.0e-4);
