@@ -313,6 +313,7 @@ pub struct Widget {
     /// kept in `scene.models` at `active.scene_slot`; all replacement inputs
     /// are prepared as an `AvatarCandidate` before this value changes.
     active_avatar: Option<ActiveAvatar>,
+    avatar_generation: u32,
     pending_avatar_request: Option<AvatarLoadRequest>,
     avatar_load_status: AvatarLoadStatus,
     avatar_drop_hovered: bool,
@@ -414,6 +415,7 @@ impl Widget {
             menu: None,
             menu_health: MenuHealth::default(),
             active_avatar: None,
+            avatar_generation: 0,
             pending_avatar_request: None,
             avatar_load_status: AvatarLoadStatus::default(),
             avatar_drop_hovered: false,
@@ -585,6 +587,7 @@ impl Widget {
         }
 
         self.active_avatar = Some(active);
+        self.avatar_generation = self.avatar_generation.wrapping_add(1);
         self.avatar_load_status.succeed();
         self.reapply_camera();
     }
@@ -886,6 +889,9 @@ impl Widget {
             MenuAction::SettingsClosed => ControlAction::SettingsClosed,
             MenuAction::RestoreDefaults => ControlAction::RestoreDefaults,
             MenuAction::OpenAvatar => unreachable!("OpenAvatar is handled before control actions"),
+            MenuAction::SetExpression(_, _, _) | MenuAction::ResetExpressions(_) => {
+                unreachable!("expression actions are avatar-owned")
+            }
         }
     }
 
@@ -1052,11 +1058,36 @@ impl Widget {
     }
 
     fn apply_menu_action(&mut self, action: MenuAction) -> ControlsSnapshot {
-        if matches!(action, MenuAction::OpenAvatar) {
-            self.open_avatar_picker();
-            self.controls_snapshot()
-        } else {
-            self.apply_control_action(self.menu_control_action(action))
+        match action {
+            MenuAction::OpenAvatar => {
+                self.open_avatar_picker();
+                self.controls_snapshot()
+            }
+            MenuAction::SetExpression(generation, index, weight) => {
+                if generation != self.avatar_generation {
+                    return self.controls_snapshot();
+                }
+                if let Some(active) = self.active_avatar.as_mut()
+                    && let ResolvedExpressionRuntime::Vrm1(runtime) = &mut active.expressions
+                    && runtime.set_manual_input(index, weight)
+                {
+                    runtime.compose_if_needed(&mut self.scene, active.scene_slot, self.last_blink);
+                }
+                self.controls_snapshot()
+            }
+            MenuAction::ResetExpressions(generation) => {
+                if generation != self.avatar_generation {
+                    return self.controls_snapshot();
+                }
+                if let Some(active) = self.active_avatar.as_mut()
+                    && let ResolvedExpressionRuntime::Vrm1(runtime) = &mut active.expressions
+                    && runtime.reset_manual_inputs()
+                {
+                    runtime.compose_if_needed(&mut self.scene, active.scene_slot, self.last_blink);
+                }
+                self.controls_snapshot()
+            }
+            other => self.apply_control_action(self.menu_control_action(other)),
         }
     }
 
@@ -1718,6 +1749,14 @@ impl Game for Widget {
             let window_snapshot = self.menu_window_state();
             let avatar_status = self.avatar_load_status.ui_status();
             let avatar_error = self.avatar_load_status.ui_error_message();
+            let expressions = self
+                .active_avatar
+                .as_ref()
+                .and_then(|active| match &active.expressions {
+                    ResolvedExpressionRuntime::Vrm1(runtime) => Some(runtime.manual_state()),
+                    ResolvedExpressionRuntime::Vrm0Legacy => None,
+                })
+                .unwrap_or_default();
             let scale_factor = self.window_scale_factor;
             let pointer_frames = std::mem::take(&mut self.pending_menu_pointer);
             let input_frames = self.take_pending_menu_input();
@@ -1748,6 +1787,8 @@ impl Game for Widget {
                             avatar_error,
                             self.avatar_drop_hovered,
                             window_snapshot,
+                            expressions,
+                            self.avatar_generation,
                         )?;
                         for pointer_frame in pointer_frames {
                             if pointer_frame.cancelled {

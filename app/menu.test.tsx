@@ -24,13 +24,13 @@ function testHost(
   outgoing: unknown[],
   textUpdates: string[],
   onSend: (message: unknown) => void,
-  focusState: { id: number; hitRect: { x: number; y: number; width: number; height: number } | null },
+  focusState: { id: number; hitId?: number; activeId?: number; destroyed?: number[]; hitRect: { x: number; y: number; width: number; height: number } | null },
 ): HostOps & { __viewport: { w: number; h: number } } {
   let nextNode = 2;
   return {
     __viewport: { w: 450, h: 600 },
     createNode: () => nextNode++,
-    destroyNode: () => {},
+    destroyNode: (id) => { focusState.destroyed?.push(id); },
     insertBefore: () => {},
     removeChild: () => {},
     setStyle: () => {},
@@ -45,12 +45,12 @@ function testHost(
     setFocus: (id) => {
       focusState.id = id;
     },
-    setActive: () => {},
+    setActive: (id, active) => { focusState.activeId = active ? id : 0; },
     hitTest: (x, y) => {
       if (x < 0 || y < 0 || x >= 450 || y >= 600) return 0;
       const rect = focusState.hitRect;
       return rect && x >= rect.x && y >= rect.y && x < rect.x + rect.width && y < rect.y + rect.height
-        ? focusState.id
+        ? (focusState.hitId ?? focusState.id)
         : 0;
     },
     layoutOf: (id) => {
@@ -212,6 +212,7 @@ describe("PocketUI camera menu snap regression", () => {
       await import(`${pathToFileURL(join(bundleDirectory, "menu.js")).href}?test=menu`);
       const frame = global.frame;
       expect(frame).toBeDefined();
+      expect(textUpdates).toEqual(expect.arrayContaining(["CAMERA", "GRAPHICS", "WINDOW", "EXPRESSIONS"]));
       expect(textUpdates).toContain("ORIENTATION");
       const clickField = (x: number, y: number) => {
         const rect = { x: x - 21, y: y - 9, width: 42, height: 18 };
@@ -267,7 +268,7 @@ describe("PocketUI camera menu snap regression", () => {
 
       // From the focused Camera tab, walk the actual focus order to YawValue,
       // click it through the host hit-test bridge, then commit a precise edit.
-      for (let i = 0; i < 13; i++) {
+      for (let i = 0; i < 14; i++) {
         frame!(BTN_DOWN);
         frame!(0);
       }
@@ -426,8 +427,12 @@ describe("PocketUI camera menu snap regression", () => {
 
       // The third tab is present in the retained focus order and uses the
       // same inline editor path for its logical-size fields.
-      for (let i = 0; i < 8; i++) {
+      for (let i = 0; i < 20; i++) {
         frame!(BTN_UP);
+        frame!(0);
+      }
+      for (let i = 0; i < 2; i++) {
+        frame!(BTN_DOWN);
         frame!(0);
       }
       frame!(BTN_CIRCLE);
@@ -435,7 +440,7 @@ describe("PocketUI camera menu snap regression", () => {
       expect(textUpdates).toContain("SIZE");
       expect(textUpdates).toEqual(expect.arrayContaining(["Width", "720", "Height", "700"]));
 
-      for (let i = 0; i < 3; i++) {
+      for (let i = 0; i < 4; i++) {
         frame!(BTN_DOWN);
         frame!(0);
       }
@@ -494,6 +499,181 @@ describe("PocketUI camera menu snap regression", () => {
         ),
       ).toBe(true);
 
+    } finally {
+      delete global.frame;
+      delete global.ui;
+      if (bundleDirectory) await rm(bundleDirectory, { recursive: true, force: true });
+    }
+  });
+
+  test("expression slider drag and Reset all emit avatar-scoped actions", async () => {
+    const state = JSON.parse(stateLine()) as Record<string, unknown>;
+    state.avatar_generation = 7;
+    state.expressions = [{ index: 2, name: "happy", weight: 0, binary: false, custom: false }];
+    const incoming = [JSON.stringify(state)];
+    const outgoing: unknown[] = [];
+    const textUpdates: string[] = [];
+    const focusState = { id: 0, hitRect: null as { x: number; y: number; width: number; height: number } | null };
+    const host = testHost(incoming, outgoing, textUpdates, () => {}, focusState);
+    const global = globalThis as typeof globalThis & { ui?: HostOps; frame?: (buttons: number) => void };
+    global.ui = host;
+    let bundleDirectory: string | null = null;
+    try {
+      bundleDirectory = await mkdtemp(join(tmpdir(), "pocket-character-expression-menu-"));
+      const build = Bun.spawn(
+        ["bun", "vendor/pocketjs/tools/build.ts", "app/menu.tsx", "--density=2", `--outdir=${bundleDirectory}`],
+        { cwd: join(import.meta.dir, ".."), stdout: "pipe", stderr: "pipe" },
+      );
+      if (await build.exited !== 0) throw new Error(await new Response(build.stderr).text());
+      await import(`${pathToFileURL(join(bundleDirectory, "menu.js")).href}?test=expression`);
+      const frame = global.frame;
+      expect(frame).toBeDefined();
+      frame!(0);
+      for (let i = 0; i < 4; i++) { frame!(BTN_DOWN); frame!(0); }
+      frame!(BTN_CIRCLE);
+      frame!(0);
+      expect(textUpdates).toContain("EXPRESSIONS (1)");
+      for (let i = 0; i < 5; i++) { frame!(BTN_DOWN); frame!(0); }
+      focusState.hitRect = { x: 30, y: 350, width: 100, height: 16 };
+      incoming.push(JSON.stringify({ t: "mouse", x: 80, y: 358, d: true }));
+      frame!(0);
+      incoming.push(JSON.stringify({ t: "mouse", x: 120, y: 358, d: true }));
+      frame!(0);
+      incoming.push(JSON.stringify({ t: "mouse", x: 120, y: 358, d: false }));
+      frame!(0);
+      expect(outgoing).toContainEqual({ t: "action", action: "set_expression", value: { generation: 7, index: 2, weight: 0.5 } });
+      expect(outgoing).toContainEqual({ t: "action", action: "set_expression", value: { generation: 7, index: 2, weight: 0.9 } });
+      focusState.hitRect = null;
+      frame!(BTN_UP);
+      frame!(0);
+      frame!(BTN_CIRCLE);
+      frame!(0);
+      expect(outgoing).toContainEqual({ t: "action", action: "reset_expressions", value: 7 });
+    } finally {
+      delete global.frame;
+      delete global.ui;
+      if (bundleDirectory) await rm(bundleDirectory, { recursive: true, force: true });
+    }
+  });
+
+  test("pagination focus does not stick to Prev while hovering or dragging an expression slider", async () => {
+    const state = JSON.parse(stateLine()) as Record<string, unknown>;
+    state.avatar_generation = 8;
+    state.expressions = Array.from({ length: 5 }, (_, index) => ({
+      index, name: `expression${index}`, weight: 0, binary: false, custom: true,
+    }));
+    const incoming = [JSON.stringify(state)];
+    const outgoing: unknown[] = [];
+    const textUpdates: string[] = [];
+    const focusState = { id: 0, hitId: undefined as number | undefined, activeId: 0, destroyed: [] as number[], hitRect: null as { x: number; y: number; width: number; height: number } | null };
+    const host = testHost(incoming, outgoing, textUpdates, () => {}, focusState);
+    const global = globalThis as typeof globalThis & { ui?: HostOps; frame?: (buttons: number) => void };
+    global.ui = host;
+    let bundleDirectory: string | null = null;
+    try {
+      bundleDirectory = await mkdtemp(join(tmpdir(), "pocket-character-expression-hover-"));
+      const build = Bun.spawn(
+        ["bun", "vendor/pocketjs/tools/build.ts", "app/menu.tsx", "--density=2", `--outdir=${bundleDirectory}`],
+        { cwd: join(import.meta.dir, ".."), stdout: "pipe", stderr: "pipe" },
+      );
+      if (await build.exited !== 0) throw new Error(await new Response(build.stderr).text());
+      await import(`${pathToFileURL(join(bundleDirectory, "menu.js")).href}?test=expression-hover`);
+      const frame = global.frame!;
+      const down = () => { frame(BTN_DOWN); frame(0); };
+      const mouse = (x: number, y: number, pressed = false) => {
+        incoming.push(JSON.stringify({ t: "mouse", x, y, d: pressed }));
+        frame(0);
+      };
+      frame(0);
+      for (let index = 0; index < 4; index++) down();
+      frame(BTN_CIRCLE); frame(0);
+      for (let index = 0; index < 5; index++) down(); // tabs, Reset all, first slider
+      const sliderId = focusState.id;
+      for (let index = 0; index < 4; index++) down(); // remaining sliders, then Prev
+      const prevId = focusState.id;
+      down(); // Next
+      const nextId = focusState.id;
+      expect(new Set([sliderId, prevId, nextId]).size).toBe(3);
+
+      focusState.hitRect = { x: 30, y: 484, width: 42, height: 18 };
+      focusState.hitId = prevId;
+      mouse(50, 490);
+      expect(focusState.id).toBe(prevId);
+
+      focusState.hitRect = { x: 30, y: 350, width: 100, height: 16 };
+      focusState.hitId = sliderId;
+      mouse(80, 358);
+      expect(focusState.id).toBe(sliderId);
+      for (let tick = 0; tick < 4; tick++) {
+        incoming.push(JSON.stringify(state));
+        frame(0); // host state changes, but the real pointer remains stationary
+        expect(focusState.id).toBe(sliderId);
+        expect(focusState.destroyed).not.toContain(sliderId);
+      }
+      mouse(220, 358);
+      expect(focusState.id).toBe(0);
+      mouse(80, 358);
+      expect(focusState.id).toBe(sliderId);
+      focusState.hitRect = { x: 30, y: 484, width: 42, height: 18 };
+      focusState.hitId = prevId;
+      mouse(50, 490);
+      expect(focusState.id).toBe(prevId);
+      focusState.hitRect = { x: 30, y: 350, width: 100, height: 16 };
+      focusState.hitId = sliderId;
+      mouse(80, 358);
+      expect(focusState.id).toBe(sliderId);
+      mouse(80, 358, true);
+      expect(focusState.id).toBe(sliderId);
+      expect(focusState.activeId).toBe(sliderId);
+      expect(outgoing).toContainEqual({ t: "action", action: "set_expression", value: { generation: 8, index: 0, weight: 0.5 } });
+
+      ((state.expressions as Record<string, unknown>[])[0]).weight = 0.5;
+      for (let tick = 0; tick < 3; tick++) {
+        incoming.push(JSON.stringify(state));
+        frame(0);
+        expect(focusState.id).toBe(sliderId);
+        expect(focusState.activeId).toBe(sliderId);
+      }
+      mouse(110, 358, true);
+      expect(outgoing).toContainEqual({ t: "action", action: "set_expression", value: { generation: 8, index: 0, weight: 0.8 } });
+      expect(focusState.id).toBe(sliderId);
+      expect(focusState.activeId).toBe(sliderId);
+
+      // A drag over pagination is still owned by the slider, not a page press.
+      focusState.hitRect = { x: 30, y: 484, width: 42, height: 18 };
+      focusState.hitId = prevId;
+      mouse(50, 490, true);
+      expect(focusState.id).toBe(sliderId);
+      mouse(50, 490);
+      expect(focusState.id).toBe(prevId);
+      expect(focusState.activeId).toBe(0);
+
+      // Echo the host's accepted weight; page navigation must only change rows.
+      incoming.push(JSON.stringify(state));
+      frame(0);
+
+      focusState.hitRect = { x: 172, y: 484, width: 42, height: 18 };
+      focusState.hitId = nextId;
+      mouse(190, 490);
+      expect(focusState.id).toBe(nextId);
+      mouse(171, 490);
+      expect(focusState.id).toBe(0);
+      mouse(190, 490, true);
+      mouse(190, 490);
+      expect(textUpdates).toContain("2 / 2");
+      expect(focusState.id).toBe(nextId);
+      expect(textUpdates).toContain("expression4");
+      const beforeReturn = textUpdates.length;
+      focusState.hitRect = { x: 30, y: 484, width: 42, height: 18 };
+      focusState.hitId = prevId;
+      mouse(50, 490, true);
+      mouse(50, 490);
+      expect(textUpdates.slice(beforeReturn)).toContain("0.50");
+
+      incoming.push(JSON.stringify({ ...state, avatar_generation: 9, expressions: [{ ...(state.expressions as Record<string, unknown>[])[0], weight: 0 }] }));
+      frame(0);
+      expect(textUpdates).toContain("EXPRESSIONS (1)");
+      expect(focusState.id).toBe(0);
     } finally {
       delete global.frame;
       delete global.ui;

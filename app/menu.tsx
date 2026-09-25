@@ -3,7 +3,7 @@
 // over the 3D character. Rust owns camera and AA policy; this guest renders
 // authoritative snapshots, emits semantic button intents, and exposes
 // generic text-input ownership for future editable widgets.
-import { createSignal, type JSX } from "solid-js";
+import { createSignal, Index, type JSX } from "solid-js";
 import { Focusable, Text, View, type NodeMirror } from "@pocketjs/framework/components";
 import { virtualNow } from "@pocketjs/framework/clock";
 import { getOps } from "@pocketjs/framework/solid";
@@ -35,12 +35,15 @@ import {
 } from "./inline-number-field-geometry";
 import { PointerRepeat, type RepeatAction } from "./menu-repeat";
 import { type TextInputCursorArea, textInput } from "./text-input";
+import { binaryWeight, decodeExpressions, sliderWeight, type ExpressionState } from "./expression-controls";
 
 /// Authoritative facts pushed by the Rust host (MenuState in
 /// crates/pocket-character/src/menu_guest.rs). Requested and effective AA are
 /// intentionally separate: the guest only renders these facts and never
 /// predicts whether a renderer request will apply.
 interface ControlsState {
+  avatar_generation: number;
+  expressions: ExpressionState[];
   effective_fov_deg: number;
   effective_distance_scale: number;
   headroom: number;
@@ -105,14 +108,16 @@ type ActionName =
   | "settings_closed"
   | "restore_defaults"
   | "open_avatar"
-  | "set_mtoon_render_mode";
+  | "set_mtoon_render_mode"
+  | "reset_expressions";
 
 // Latest host facts, or null before the first svc line arrives.
 const [controls, setControls] = createSignal<ControlsState | null>(null);
-type SettingsPage = "camera" | "graphics" | "window";
+type SettingsPage = "camera" | "graphics" | "window" | "expressions";
 // Page/confirmation state is guest-only. Visibility has an explicit host
 // lifecycle because Rust owns the temporary safe-window constraint.
 const [activePage, setActivePage] = createSignal<SettingsPage>("camera");
+const [expressionPage, setExpressionPage] = createSignal(0);
 const [confirmingRestoreDefaults, setConfirmingRestoreDefaults] = createSignal(false);
 const [settingsVisible, setSettingsVisible] = createSignal(true);
 
@@ -122,6 +127,7 @@ const [settingsVisible, setSettingsVisible] = createSignal(true);
 let pointerDown = false;
 let pressedTarget: ReturnType<typeof hitFocusable> = null;
 type PointerTarget = NonNullable<ReturnType<typeof hitFocusable>>;
+let pointerHover: PointerTarget | null = null;
 const pointerRepeat = new PointerRepeat<PointerTarget>();
 
 function sendAction(action: ActionName, value?: number | boolean | string): boolean {
@@ -161,12 +167,23 @@ function repeatActionFor(target: ReturnType<typeof hitFocusable>): RepeatAction 
 }
 
 function cancelPointerInteraction(): void {
+  expressionDrag = null;
+  pointerHover = null;
   pointerRepeat.cancel();
   cancelInlineNumberFields();
   pointerDown = false;
   pressedTarget = null;
   setActiveNode(null);
 }
+
+function sendExpression(generation: number, index: number, weight: number): boolean {
+  const ops = getOps();
+  if (!ops.svcOpen || !ops.svcSend || !ops.svcOpen("controls")) return false;
+  ops.svcSend(JSON.stringify({ t: "action", action: "set_expression", value: { generation, index, weight } }));
+  return true;
+}
+
+let expressionDrag: { target: PointerTarget; generation: number; index: number; x: number; width: number } | null = null;
 
 function switchPage(page: SettingsPage): void {
   // A page switch can be activated by a d-pad press without going through
@@ -248,8 +265,32 @@ function isAvatarStatus(value: unknown): value is AvatarStatus {
 
 function handleMouse(x: number, y: number, down: boolean): void {
   const target = hitFocusable(x, y);
-  focusNode(target);
-
+  pointerHover = target;
+  if (expressionDrag) {
+    if (down) {
+      // Capture owns the visual focus while dragging; physical hover may be
+      // over a different control, but it must not steal the drag or highlight.
+      focusNode(expressionDrag.target);
+      sendExpression(expressionDrag.generation, expressionDrag.index, sliderWeight(x, expressionDrag));
+    } else {
+      expressionDrag = null;
+      setActiveNode(null);
+      focusNode(pointerHover);
+    }
+    return;
+  }
+  focusNode(pointerHover);
+  if (down && !pointerDown && target?.debugName?.startsWith("ExpressionSlider:")) {
+    const index = Number(target.debugName.slice("ExpressionSlider:".length));
+    const ops = getOps();
+    const bounds = ops.layoutOf ? layoutBoundsFromInlineNumberNode(target, ops.layoutOf) : null;
+    if (Number.isSafeInteger(index) && bounds) {
+      expressionDrag = { target, generation: controls()?.avatar_generation ?? 0, index, x: bounds.x, width: bounds.width };
+      setActiveNode(target);
+      sendExpression(expressionDrag.generation, index, sliderWeight(x, expressionDrag));
+      return;
+    }
+  }
   if (down) {
     if (!pointerDown) {
       // Restore is a destructive-flow boundary. Cancel the two-phase field
@@ -311,6 +352,8 @@ function pollControls(): void {
           avatar_loading?: unknown;
           avatar_error?: unknown;
           avatar_drop_hovered?: unknown;
+          avatar_generation?: unknown;
+          expressions?: unknown;
           window?: unknown;
           x?: unknown;
           y?: unknown;
@@ -329,8 +372,10 @@ function pollControls(): void {
           const avatarError = msg.avatar_error === undefined ? null : msg.avatar_error;
           const avatarDropHovered = msg.avatar_drop_hovered === undefined ? false : msg.avatar_drop_hovered;
           const mtoonMode = msg.mtoon_render_mode === undefined ? "auto" : msg.mtoon_render_mode;
+          const expressions = decodeExpressions(msg.expressions ?? []);
           if (
-            !window ||
+            !window || !expressions ||
+            (msg.avatar_generation !== undefined && (!Number.isSafeInteger(msg.avatar_generation) || (msg.avatar_generation as number) < 0)) ||
             typeof msg.effective_fov_deg !== "number" ||
             typeof msg.effective_distance_scale !== "number" ||
             typeof msg.headroom !== "number" ||
@@ -364,6 +409,12 @@ function pollControls(): void {
             !Number.isFinite(msg.roll_snap_deg) ||
             !Number.isFinite(msg.effective_msaa)
           ) continue;
+          const avatarGeneration = (msg.avatar_generation as number | undefined) ?? 0;
+          if (controls()?.avatar_generation !== undefined && controls()?.avatar_generation !== avatarGeneration) {
+            cancelPointerInteraction();
+            focusNode(null);
+            setExpressionPage(0);
+          }
           setControls({
             effective_fov_deg: msg.effective_fov_deg,
             effective_distance_scale: msg.effective_distance_scale,
@@ -385,6 +436,8 @@ function pollControls(): void {
             avatar_error: avatarError,
             avatar_drop_hovered: avatarDropHovered,
             window,
+            expressions,
+            avatar_generation: avatarGeneration,
           });
         } else if (
           msg.t === "mouse" &&
@@ -597,21 +650,25 @@ function ToggleOption(props: {
 }
 
 function PageTabs() {
+  // Tab widths and the original 4px gaps fill the 380px panel's 348px inner width.
   const tabClass = (page: SettingsPage): string =>
     activePage() === page
-      ? "h-[24] flex-1 flex-col items-center justify-center rounded-sm bg-[#2b5167]"
-      : "h-[24] flex-1 flex-col items-center justify-center rounded-sm bg-[#172b3b] focus:bg-[#2b5167] active:bg-[#3a6f88]";
+      ? "h-[24] shrink-0 flex-col items-center justify-center rounded-sm bg-[#2b5167]"
+      : "h-[24] shrink-0 flex-col items-center justify-center rounded-sm bg-[#172b3b] focus:bg-[#2b5167] active:bg-[#3a6f88]";
 
   return (
     <View debugName="SettingsTabs" class="h-[24] w-full flex-row gap-[4]">
-      <Focusable debugName="CameraTab" class={tabClass("camera")} onPress={() => switchPage("camera")}>
+      <Focusable debugName="CameraTab" class={tabClass("camera")} style={{ width: 72 }} onPress={() => switchPage("camera")}>
         <Text class="text-sm text-[#e8f1f8]">CAMERA</Text>
       </Focusable>
-      <Focusable debugName="GraphicsTab" class={tabClass("graphics")} onPress={() => switchPage("graphics")}>
+      <Focusable debugName="GraphicsTab" class={tabClass("graphics")} style={{ width: 84 }} onPress={() => switchPage("graphics")}>
         <Text class="text-sm text-[#e8f1f8]">GRAPHICS</Text>
       </Focusable>
-      <Focusable debugName="WindowTab" class={tabClass("window")} onPress={() => switchPage("window")}>
+      <Focusable debugName="WindowTab" class={tabClass("window")} style={{ width: 74 }} onPress={() => switchPage("window")}>
         <Text class="text-sm text-[#e8f1f8]">WINDOW</Text>
+      </Focusable>
+      <Focusable debugName="ExpressionsTab" class={tabClass("expressions")} style={{ width: 106 }} onPress={() => switchPage("expressions")}>
+        <Text class="text-sm text-[#e8f1f8]">EXPRESSIONS</Text>
       </Focusable>
     </View>
   );
@@ -622,7 +679,7 @@ function SettingsFrame(props: { panelClass: string; children: JSX.Element }) {
     <View debugName="SettingsFrame" class={props.panelClass}>
       <PageTabs />
       <View class="relative top-[2] mt-[4] h-[1] w-full bg-[#33c6ff4d]" />
-      <View class="w-[184] flex-col">{props.children}</View>
+      <View class="w-full flex-col">{props.children}</View>
       <View class="mt-[12] w-full flex-col">
         <View class="h-[1] w-full bg-[#33c6ff4d]" />
         {confirmingRestoreDefaults() ? (
@@ -666,10 +723,66 @@ function SettingsFrame(props: { panelClass: string; children: JSX.Element }) {
   );
 }
 
+// Each row occupies 39 px (6 top margin + 17 label + 16 control). Four rows
+// fit the reserved 160 px body, keeping navigation and the footer stationary.
+const EXPRESSIONS_PER_PAGE = 4;
+
+function ExpressionsPanel() {
+  const all = () => controls()?.expressions ?? [];
+  const generation = () => controls()?.avatar_generation ?? 0;
+  const pageCount = () => Math.max(1, Math.ceil(all().length / EXPRESSIONS_PER_PAGE));
+  const page = () => Math.min(expressionPage(), pageCount() - 1);
+  const visible = () => all().slice(page() * EXPRESSIONS_PER_PAGE, (page() + 1) * EXPRESSIONS_PER_PAGE);
+  return (
+    <SettingsFrame panelClass="w-[380] flex-col rounded-md bg-[#0b1420e8] p-[16]">
+      <View class="mt-[6] h-[20] flex-row items-center justify-between">
+        <Text class="text-xs font-bold text-[#7fd0ff]">{`EXPRESSIONS (${all().length})`}</Text>
+        <Focusable debugName="ResetExpressions" class="h-[18] w-[56] flex-col items-center justify-center rounded-sm bg-[#172b3b] focus:bg-[#2b5167] active:bg-[#3a6f88]" onPress={() => sendAction("reset_expressions", generation())}>
+          <Text class="text-xs text-[#e8f1f8]">Reset all</Text>
+        </Focusable>
+      </View>
+      <View debugName="ExpressionRows" class="h-[160] w-full shrink-0 flex-col overflow-hidden">
+        {all().length === 0 ? <Text class="mt-[8] text-xs text-[#9fb3c8]">No VRM1 expressions on this avatar.</Text> : null}
+        <Index each={visible()}>{(expression) => (
+          <View debugName={`ExpressionRow:${expression().index}`} class="mt-[6] flex-col">
+            <View class="h-[17] flex-row items-center justify-between">
+              <Text class="w-[125] text-xs text-[#e8f1f8]">{expression().name}</Text>
+              <Text class="text-xs text-[#9fb3c8]">{expression().custom ? "Custom  " : ""}{expression().binary ? `Binary ${expression().weight.toFixed(0)}` : expression().weight.toFixed(2)}</Text>
+            </View>
+            {expression().binary ? (
+              <View class="flex-row gap-[4]">
+                <ToggleOption debugName={`ExpressionOff:${expression().index}`} label="Off" selected={expression().weight === 0} onPress={() => sendExpression(generation(), expression().index, binaryWeight(false))} />
+                <ToggleOption debugName={`ExpressionOn:${expression().index}`} label="On" selected={expression().weight > 0} onPress={() => sendExpression(generation(), expression().index, binaryWeight(true))} />
+              </View>
+            ) : (
+              <Focusable debugName={`ExpressionSlider:${expression().index}`} class="h-[16] w-full flex-col justify-center rounded-sm bg-[#172b3b] focus:bg-[#2b5167] active:bg-[#3a6f88]" onPress={() => sendExpression(generation(), expression().index, expression().weight >= 1 ? 0 : Math.round((expression().weight + 0.1) * 100) / 100)}>
+                <View class="h-[6] rounded-sm bg-[#7fd0ff]" style={{ width: Math.max(0, Math.min(348, expression().weight * 348)) }} />
+              </Focusable>
+            )}
+          </View>
+        )}</Index>
+      </View>
+      <View debugName="ExpressionPagination" class="mt-[8] h-[20] w-full shrink-0 flex-row items-center justify-between">
+        {pageCount() > 1 ? (
+          <>
+            <Focusable debugName="PreviousExpressions" class="h-[18] w-[42] flex-col items-center justify-center rounded-sm bg-[#172b3b] focus:bg-[#2b5167] active:bg-[#3a6f88]" onPress={() => setExpressionPage(Math.max(0, page() - 1))}>
+              <Text class="text-xs text-[#e8f1f8]">Prev</Text>
+            </Focusable>
+            <Text class="text-xs text-[#9fb3c8]">{`${page() + 1} / ${pageCount()}`}</Text>
+            <Focusable debugName="NextExpressions" class="h-[18] w-[42] flex-col items-center justify-center rounded-sm bg-[#172b3b] focus:bg-[#2b5167] active:bg-[#3a6f88]" onPress={() => setExpressionPage(Math.min(pageCount() - 1, page() + 1))}>
+              <Text class="text-xs text-[#e8f1f8]">Next</Text>
+            </Focusable>
+          </>
+        ) : null}
+      </View>
+    </SettingsFrame>
+  );
+}
+
 function GraphicsPanel() {
   const state = () => controls();
   return (
-    <SettingsFrame panelClass="w-[246] flex-col rounded-md bg-[#0b1420e8] p-[16]">
+    <SettingsFrame panelClass="w-[380] flex-col rounded-md bg-[#0b1420e8] p-[16]">
       <View class="mt-[6] flex-col">
         <View class="h-[18] flex-row items-center">
           <Text class="text-xs font-bold text-[#7fd0ff]">MSAA</Text>
@@ -774,7 +887,7 @@ function CameraPanel() {
   // slot offsets the taller tabs, preserving camera field, button, and native
   // capture geometry.
   return (
-    <SettingsFrame panelClass="w-[246] flex-col rounded-md bg-[#0b1420b4] p-[16]">
+    <SettingsFrame panelClass="w-[380] flex-col rounded-md bg-[#0b1420b4] p-[16]">
       <View class="mt-[6] flex-col gap-[3]">
         <View class="h-[16] flex-row items-center">
           <Text class="text-xs font-bold text-[#7fd0ff]">AVATAR</Text>
@@ -959,7 +1072,7 @@ function WindowToggleRow(props: {
 function WindowPanel() {
   const state = () => controls()?.window ?? null;
   return (
-    <SettingsFrame panelClass="w-[246] flex-col rounded-md bg-[#0b1420e8] p-[16]">
+    <SettingsFrame panelClass="w-[380] flex-col rounded-md bg-[#0b1420e8] p-[16]">
       <View class="mt-[6] h-[16] flex-row items-center">
         <Text class="text-xs font-bold text-[#7fd0ff]">SIZE</Text>
       </View>
@@ -1034,9 +1147,9 @@ export default function ControlsMenu() {
           <Text class="text-xs text-[#ffd1d1]">{controls()?.avatar_error ?? "Avatar could not be loaded."}</Text>
         </View>
       ) : null}
-      <View class="absolute bottom-[14] left-[14] w-[246]">
+      <View class="absolute bottom-[14] left-[14] w-[380]">
         {settingsVisible() ? (
-          activePage() === "camera" ? <CameraPanel /> : activePage() === "graphics" ? <GraphicsPanel /> : <WindowPanel />
+          activePage() === "camera" ? <CameraPanel /> : activePage() === "graphics" ? <GraphicsPanel /> : activePage() === "expressions" ? <ExpressionsPanel /> : <WindowPanel />
         ) : (
           <Focusable
             debugName="OpenSettings"

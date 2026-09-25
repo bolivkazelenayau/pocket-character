@@ -162,8 +162,10 @@ fn decode_text_input_state(line: &str) -> Option<MenuTextInputCapture> {
 /// Discrete intents accepted from the PocketUI controls guest. The guest only
 /// names an operation; the widget applies it to authoritative live camera/AA
 /// state or routes explicit Save/Reset operations through the existing path.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum MenuAction {
+    SetExpression(u32, usize, f32),
+    ResetExpressions(u32),
     DistanceDecrement,
     DistanceIncrement,
     FovDecrement,
@@ -209,6 +211,19 @@ fn decode_menu_action(line: &str) -> Option<MenuAction> {
         return None;
     }
     match wire.action.as_str() {
+        "set_expression" => {
+            let value = wire.value.as_ref()?;
+            let generation = u32::try_from(value.get("generation")?.as_u64()?).ok()?;
+            let index = usize::try_from(value.get("index")?.as_u64()?).ok()?;
+            let weight = finite_f32_value(value.get("weight")?)?;
+            Some(MenuAction::SetExpression(generation, index, weight))
+        }
+        "reset_expressions" => wire
+            .value
+            .as_ref()
+            .and_then(|value| value.as_u64())
+            .and_then(|value| u32::try_from(value).ok())
+            .map(MenuAction::ResetExpressions),
         "distance_decrement" => Some(MenuAction::DistanceDecrement),
         "distance_increment" => Some(MenuAction::DistanceIncrement),
         "fov_decrement" => Some(MenuAction::FovDecrement),
@@ -348,6 +363,17 @@ struct MenuState {
     avatar_error: Option<String>,
     avatar_drop_hovered: bool,
     window: MenuWindowState,
+    expressions: Vec<MenuExpressionState>,
+    avatar_generation: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub(crate) struct MenuExpressionState {
+    pub(crate) index: usize,
+    pub(crate) name: String,
+    pub(crate) weight: f32,
+    pub(crate) binary: bool,
+    pub(crate) custom: bool,
 }
 
 /// Host-authoritative persisted/runtime window facts rendered by the WINDOW
@@ -469,6 +495,8 @@ impl MenuGuest {
         avatar_error: Option<&str>,
         avatar_drop_hovered: bool,
         window: MenuWindowState,
+        expressions: Vec<MenuExpressionState>,
+        avatar_generation: u32,
     ) -> Result<()> {
         let state = MenuState {
             t: "state",
@@ -494,6 +522,8 @@ impl MenuGuest {
             avatar_error: avatar_error.map(str::to_owned),
             avatar_drop_hovered,
             window,
+            expressions,
+            avatar_generation,
         };
         let line = serde_json::to_string(&state).context("serialize menu state")?;
         self.surface.svc_push(line);
@@ -670,8 +700,9 @@ pub fn load_menu_assets(
 #[cfg(test)]
 mod tests {
     use super::{
-        MenuAction, MenuInputFrame, MenuInputModifiers, MenuState, MenuTextInputCapture,
-        MenuWindowState, decode_menu_action, decode_text_input_state, encode_input_frame,
+        MenuAction, MenuExpressionState, MenuInputFrame, MenuInputModifiers, MenuState,
+        MenuTextInputCapture, MenuWindowState, decode_menu_action, decode_text_input_state,
+        encode_input_frame,
     };
     use crate::settings::AntiAliasingPreference;
     use glam::Vec2;
@@ -715,6 +746,14 @@ mod tests {
                 effective_max_fps: Some(60.0),
                 cli_max_fps_override: None,
             },
+            expressions: vec![MenuExpressionState {
+                index: 2,
+                name: "happy".into(),
+                weight: 0.4,
+                binary: false,
+                custom: false,
+            }],
+            avatar_generation: 4,
         })
         .unwrap();
 
@@ -749,6 +788,35 @@ mod tests {
         assert_eq!(value["window"]["configured_width"], 450);
         assert_eq!(value["window"]["current_width_logical"], 450);
         assert_eq!(value["window"]["applied_always_on_top"], true);
+        assert_eq!(value["expressions"][0]["name"], "happy");
+        assert_eq!(value["expressions"][0]["index"], 2);
+        assert_eq!(value["avatar_generation"], 4);
+    }
+
+    #[test]
+    fn expression_actions_are_validated_before_reaching_avatar_state() {
+        assert_eq!(
+            decode_menu_action(
+                r#"{"t":"action","action":"set_expression","value":{"generation":4,"index":3,"weight":0.4}}"#
+            ),
+            Some(MenuAction::SetExpression(4, 3, 0.4))
+        );
+        assert_eq!(
+            decode_menu_action(r#"{"t":"action","action":"reset_expressions","value":4}"#),
+            Some(MenuAction::ResetExpressions(4))
+        );
+        assert_eq!(
+            decode_menu_action(
+                r#"{"t":"action","action":"set_expression","value":{"generation":4,"index":-1,"weight":0.4}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            decode_menu_action(
+                r#"{"t":"action","action":"set_expression","value":{"generation":4,"index":3,"weight":"bad"}}"#
+            ),
+            None
+        );
     }
 
     #[test]

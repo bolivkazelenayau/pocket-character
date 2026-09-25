@@ -2418,6 +2418,7 @@ mod tests {
     #[test]
     fn local_avatar_sample_dual_route_switch_latency() {
         use super::super::controls::ControlAction;
+        use crate::menu_guest::MenuAction;
         use crate::settings::MtoonRenderMode;
 
         let fixture = Path::new(r"C:\Users\Breeze\Downloads\AvatarSample_VRM1.0.vrm");
@@ -2448,6 +2449,49 @@ mod tests {
         widget.commit_avatar_candidate(candidate);
         let asset = widget.active_avatar.as_ref().unwrap().asset.clone();
         assert!(asset.native_mtoon_material_count > 0);
+        let expression_index = match &widget.active_avatar.as_ref().unwrap().expressions {
+            ResolvedExpressionRuntime::Vrm1(runtime) => {
+                let state = runtime.manual_state();
+                assert_eq!(
+                    state.len(),
+                    14,
+                    "AvatarSample should expose all authored expressions"
+                );
+                state
+                    .iter()
+                    .find(|expression| expression.name == "happy")
+                    .unwrap()
+                    .index
+            }
+            ResolvedExpressionRuntime::Vrm0Legacy => panic!("AvatarSample must be VRM1"),
+        };
+        widget.apply_menu_action(MenuAction::SetExpression(
+            widget.avatar_generation,
+            expression_index,
+            0.7,
+        ));
+        widget.apply_menu_action(MenuAction::SetExpression(
+            widget.avatar_generation.wrapping_sub(1),
+            expression_index,
+            1.0,
+        ));
+        let happy_bind = match &widget.active_avatar.as_ref().unwrap().expressions {
+            ResolvedExpressionRuntime::Vrm1(runtime) => runtime.expressions[expression_index]
+                .morph_binds
+                .first()
+                .map(|bind| (bind.mesh_slot, bind.target)),
+            ResolvedExpressionRuntime::Vrm0Legacy => None,
+        }
+        .expect("AvatarSample happy must have a morph bind");
+        let manual_morph_weight = widget.scene.models[0]
+            .morph
+            .as_ref()
+            .unwrap()
+            .weight(happy_bind.0, happy_bind.1);
+        assert!(
+            manual_morph_weight > 0.0,
+            "manual happy must reach the existing morph evaluator"
+        );
         let mut samples = Vec::new();
         for index in 0..40 {
             let mode = if index % 2 == 0 {
@@ -2461,7 +2505,44 @@ mod tests {
             assert_eq!(widget.avatar_prepare_count, 0);
             assert!(widget.pending_avatar_request.is_none());
             assert!(Arc::ptr_eq(&widget.scene.models[0].asset, &asset));
+            let ResolvedExpressionRuntime::Vrm1(runtime) =
+                &widget.active_avatar.as_ref().unwrap().expressions
+            else {
+                unreachable!()
+            };
+            assert_eq!(
+                runtime
+                    .manual_state()
+                    .iter()
+                    .find(|expression| expression.name == "happy")
+                    .unwrap()
+                    .weight,
+                0.7
+            );
         }
+        widget.apply_menu_action(MenuAction::ResetExpressions(widget.avatar_generation));
+        let ResolvedExpressionRuntime::Vrm1(runtime) =
+            &widget.active_avatar.as_ref().unwrap().expressions
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            runtime
+                .manual_state()
+                .iter()
+                .find(|expression| expression.name == "happy")
+                .unwrap()
+                .weight,
+            0.0
+        );
+        assert!(
+            widget.scene.models[0]
+                .morph
+                .as_ref()
+                .unwrap()
+                .weight(happy_bind.0, happy_bind.1)
+                < manual_morph_weight
+        );
         samples.sort();
         eprintln!(
             "AvatarSample dual-route settings switch median: {:?}",
@@ -2851,6 +2932,11 @@ mod tests {
             .iter()
             .find(|expression| expression.name == "happy")
             .expect("Seed-san happy expression must resolve");
+        let happy_index = runtime
+            .expressions
+            .iter()
+            .position(|expression| expression.name == "happy")
+            .unwrap();
         assert!(happy.is_binary);
         assert!(!happy.morph_binds.is_empty());
         assert_eq!(happy.texture_transform_binds.len(), 1);
@@ -2872,7 +2958,7 @@ mod tests {
         let ResolvedExpressionRuntime::Vrm1(runtime) = &mut active.expressions else {
             unreachable!()
         };
-        assert!(runtime.set_input("happy", 1.0));
+        assert!(runtime.set_manual_input(happy_index, 1.0));
         runtime.compose_if_needed(&mut scene, slot, 0.0);
         let composed = scene.models[0].materials.get(11).unwrap();
         let mut transformed_roles = 0;
@@ -2901,7 +2987,7 @@ mod tests {
             morph_target.2
         );
 
-        assert!(runtime.set_input("happy", 0.0));
+        assert!(runtime.reset_manual_inputs());
         runtime.compose_if_needed(&mut scene, slot, 0.0);
         assert_eq!(scene.models[0].materials.get(11).unwrap(), &authored);
     }
@@ -3962,6 +4048,38 @@ mod tests {
         let (instance, mut active) = first.into_parts(slot);
         let mut scene = Scene::default();
         scene.models.push(instance);
+        if let ResolvedExpressionRuntime::Vrm1(runtime) = &mut active.expressions {
+            let index = runtime
+                .manual_state()
+                .iter()
+                .find(|expression| expression.name == "lookLeft")
+                .unwrap()
+                .index;
+            assert!(runtime.set_manual_input(index, 0.7));
+        }
+        let failed = AvatarCandidate::prepare(
+            &gpu,
+            &renderer,
+            &bundle,
+            &AvatarLoadRequest::new(
+                first_file.path().with_extension("missing.vrm"),
+                None,
+                "Malformed",
+            ),
+        );
+        assert!(failed.is_err());
+        let ResolvedExpressionRuntime::Vrm1(old_runtime) = &active.expressions else {
+            unreachable!()
+        };
+        assert_eq!(
+            old_runtime
+                .manual_state()
+                .iter()
+                .find(|expression| expression.name == "lookLeft")
+                .unwrap()
+                .weight,
+            0.7
+        );
         let (mesh_slot, target) = match &mut active.expressions {
             ResolvedExpressionRuntime::Vrm1(runtime) => {
                 let bind = runtime
@@ -4001,6 +4119,18 @@ mod tests {
             .weight(mesh_slot, target);
         assert_ne!(replacement_initial_weight, 1.0);
         let (replacement, mut replacement_active) = second.into_parts(slot);
+        let ResolvedExpressionRuntime::Vrm1(new_runtime) = &replacement_active.expressions else {
+            unreachable!()
+        };
+        assert_eq!(
+            new_runtime
+                .manual_state()
+                .iter()
+                .find(|expression| expression.name == "lookLeft")
+                .unwrap()
+                .weight,
+            0.0
+        );
         slot.replace(&mut scene, replacement);
         if let ResolvedExpressionRuntime::Vrm1(runtime) = &mut replacement_active.expressions {
             runtime.compose_if_needed(&mut scene, slot, 0.0);
@@ -4013,5 +4143,119 @@ mod tests {
                 .weight(mesh_slot, target),
             replacement_initial_weight
         );
+    }
+
+    #[test]
+    fn expression_menu_state_switches_only_after_successful_avatar_commit() {
+        use crate::menu_guest::MenuAction;
+
+        let gpu = Gpu::new_headless().expect("headless GPU is required for VRM1 integration");
+        let renderer = Renderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT).unwrap();
+        let bundle = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../dist/character.js");
+        let (first_file, _, _, _) =
+            generated_vrm1_avatar(false, Some("expression"), ConstraintFixture::None);
+        let (second_file, _, _, _) = generated_vrm1_avatar(false, None, ConstraintFixture::None);
+        let mut widget = Widget::new(WidgetConfig {
+            model_path: first_file.path().to_owned(),
+            vrma_path: PathBuf::new(),
+            bundle_path: bundle.clone(),
+            menu_bundle_path: PathBuf::new(),
+            menu_pak_path: PathBuf::new(),
+            size: (450, 600),
+            cli_max_fps_override: None,
+            frames: None,
+        });
+        let first = AvatarCandidate::prepare(
+            &gpu,
+            &renderer,
+            &bundle,
+            &AvatarLoadRequest::new(first_file.path().to_owned(), None, "First"),
+        )
+        .unwrap();
+        widget.commit_avatar_candidate(first);
+        let first_generation = widget.avatar_generation;
+        let (first_names, look_index) = match &widget.active_avatar.as_ref().unwrap().expressions {
+            ResolvedExpressionRuntime::Vrm1(runtime) => {
+                let state = runtime.manual_state();
+                let index = state
+                    .iter()
+                    .find(|expression| expression.name == "lookLeft")
+                    .unwrap()
+                    .index;
+                (
+                    state
+                        .iter()
+                        .map(|expression| expression.name.clone())
+                        .collect::<Vec<_>>(),
+                    index,
+                )
+            }
+            ResolvedExpressionRuntime::Vrm0Legacy => unreachable!(),
+        };
+        widget.apply_menu_action(MenuAction::SetExpression(
+            first_generation,
+            look_index,
+            0.65,
+        ));
+        let missing = first_file.path().with_extension("missing.vrm");
+        widget.request_avatar_replacement(AvatarLoadRequest::new(missing, None, "Malformed"));
+        widget.process_pending_avatar_request(&gpu, &renderer);
+        assert_eq!(widget.avatar_generation, first_generation);
+        let ResolvedExpressionRuntime::Vrm1(runtime) =
+            &widget.active_avatar.as_ref().unwrap().expressions
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            runtime
+                .manual_state()
+                .iter()
+                .map(|expression| expression.name.clone())
+                .collect::<Vec<_>>(),
+            first_names
+        );
+        assert_eq!(
+            runtime
+                .manual_state()
+                .iter()
+                .find(|expression| expression.name == "lookLeft")
+                .unwrap()
+                .weight,
+            0.65
+        );
+
+        widget.request_avatar_replacement(AvatarLoadRequest::new(
+            second_file.path().to_owned(),
+            None,
+            "Second",
+        ));
+        widget.process_pending_avatar_request(&gpu, &renderer);
+        assert_ne!(widget.avatar_generation, first_generation);
+        let ResolvedExpressionRuntime::Vrm1(runtime) =
+            &widget.active_avatar.as_ref().unwrap().expressions
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            runtime
+                .manual_state()
+                .iter()
+                .map(|expression| expression.name.as_str())
+                .collect::<Vec<_>>(),
+            ["blink"]
+        );
+        assert!(
+            runtime
+                .manual_state()
+                .iter()
+                .all(|expression| expression.weight == 0.0)
+        );
+        widget.apply_menu_action(MenuAction::SetExpression(first_generation, 0, 1.0));
+        let ResolvedExpressionRuntime::Vrm1(runtime) =
+            &widget.active_avatar.as_ref().unwrap().expressions
+        else {
+            unreachable!()
+        };
+        assert_eq!(runtime.manual_state()[0].weight, 0.0);
     }
 }

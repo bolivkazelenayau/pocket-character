@@ -51,6 +51,7 @@ pub(super) struct ResolvedTextureTransformBind {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct ResolvedExpression {
     pub(super) name: String,
+    pub(super) is_custom: bool,
     pub(super) morph_binds: Vec<ResolvedMorphBind>,
     pub(super) material_color_binds: Vec<ResolvedMaterialColorBind>,
     pub(super) texture_transform_binds: Vec<ResolvedTextureTransformBind>,
@@ -77,7 +78,9 @@ pub(super) enum ResolvedExpressionRuntime {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct Vrm1ExpressionRuntime {
     pub(super) expressions: Vec<ResolvedExpression>,
+    // Character guest (click/animation) and settings are independent sources.
     inputs: Vec<f32>,
+    manual_inputs: Vec<f32>,
     managed_targets: Vec<(usize, usize)>,
     procedural_blink: ProceduralBlinkSource,
     dirty: bool,
@@ -124,6 +127,7 @@ impl Vrm1ExpressionRuntime {
 
         Self {
             inputs: vec![0.0; expressions.len()],
+            manual_inputs: vec![0.0; expressions.len()],
             expressions,
             managed_targets,
             procedural_blink,
@@ -141,6 +145,91 @@ impl Vrm1ExpressionRuntime {
             .iter()
             .map(|expression| expression.name.clone())
             .collect()
+    }
+
+    pub(super) fn manual_state(&self) -> Vec<super::super::menu_guest::MenuExpressionState> {
+        const PRESETS: &[&str] = &[
+            "neutral",
+            "happy",
+            "angry",
+            "sad",
+            "relaxed",
+            "surprised",
+            "aa",
+            "ih",
+            "ou",
+            "ee",
+            "oh",
+            "blink",
+            "blinkLeft",
+            "blinkRight",
+            "lookUp",
+            "lookDown",
+            "lookLeft",
+            "lookRight",
+        ];
+        let mut indices: Vec<_> = (0..self.expressions.len()).collect();
+        indices.sort_by_key(|&index| {
+            let expression = &self.expressions[index];
+            if expression.is_custom {
+                (1, index)
+            } else {
+                (
+                    0,
+                    PRESETS
+                        .iter()
+                        .position(|name| *name == expression.name)
+                        .unwrap_or(PRESETS.len()),
+                )
+            }
+        });
+        indices
+            .into_iter()
+            .map(|index| {
+                let expression = &self.expressions[index];
+                super::super::menu_guest::MenuExpressionState {
+                    index,
+                    name: expression.name.clone(),
+                    weight: self.manual_inputs[index],
+                    binary: expression.is_binary,
+                    custom: expression.is_custom,
+                }
+            })
+            .collect()
+    }
+
+    pub(super) fn set_manual_input(&mut self, index: usize, value: f32) -> bool {
+        let (Some(expression), Some(input)) = (
+            self.expressions.get(index),
+            self.manual_inputs.get_mut(index),
+        ) else {
+            return false;
+        };
+        if !value.is_finite() {
+            return false;
+        }
+        let value = if expression.is_binary {
+            if value > 0.5 { 1.0 } else { 0.0 }
+        } else {
+            value.clamp(0.0, 1.0)
+        };
+        if *input == value {
+            return false;
+        }
+        *input = value;
+        self.dirty = true;
+        true
+    }
+
+    pub(super) fn reset_manual_inputs(&mut self) -> bool {
+        let changed = self.manual_inputs.iter().any(|&weight| weight != 0.0);
+        self.manual_inputs.fill(0.0);
+        self.dirty |= changed;
+        changed
+    }
+
+    fn combined_input(&self, index: usize) -> f32 {
+        self.inputs[index].max(self.manual_inputs[index])
     }
 
     pub(super) fn set_input(&mut self, name: &str, value: f32) -> bool {
@@ -294,7 +383,7 @@ impl Vrm1ExpressionRuntime {
         for (index, expression) in self.expressions.iter().enumerate() {
             let output = match expression.class {
                 ResolvedExpressionClass::Other => {
-                    expression_output(self.inputs[index], expression.is_binary)
+                    expression_output(self.combined_input(index), expression.is_binary)
                 }
                 ResolvedExpressionClass::Blink => {
                     let procedural = match self.procedural_blink {
@@ -309,7 +398,7 @@ impl Vrm1ExpressionRuntime {
                         _ => 0.0,
                     };
                     procedural_output(
-                        self.inputs[index].max(procedural),
+                        self.combined_input(index).max(procedural),
                         expression.is_binary,
                         blink_override.multiplier,
                         blink_override.active,
@@ -329,14 +418,14 @@ impl Vrm1ExpressionRuntime {
                         0.0
                     };
                     procedural_output(
-                        self.inputs[index].max(procedural),
+                        self.combined_input(index).max(procedural),
                         expression.is_binary,
                         look_at_override.multiplier,
                         look_at_override.active,
                     )
                 }
                 ResolvedExpressionClass::Mouth => procedural_output(
-                    self.inputs[index],
+                    self.combined_input(index),
                     expression.is_binary,
                     mouth_override.multiplier,
                     mouth_override.active,
@@ -358,7 +447,7 @@ impl Vrm1ExpressionRuntime {
             if expression.class == target {
                 continue;
             }
-            let output = expression_output(self.inputs[index], expression.is_binary);
+            let output = expression_output(self.combined_input(index), expression.is_binary);
             if output <= 0.0 {
                 continue;
             }
@@ -690,6 +779,7 @@ pub(super) fn resolve_vrm1(
         }
         resolved.push(ResolvedExpression {
             name: expression.name.clone(),
+            is_custom: expression.kind == Vrm1ExpressionKind::Custom,
             morph_binds,
             material_color_binds,
             texture_transform_binds,
@@ -730,6 +820,7 @@ mod tests {
     ) -> ResolvedExpression {
         ResolvedExpression {
             name: name.into(),
+            is_custom: false,
             morph_binds,
             material_color_binds: Vec::new(),
             texture_transform_binds: Vec::new(),
@@ -844,6 +935,175 @@ mod tests {
             Vrm1ExpressionOverride::None,
             vec![bind(0, target, 1.0)],
         )
+    }
+
+    #[test]
+    fn manual_state_orders_authored_presets_then_document_order_customs() {
+        let mut custom_a = expression(
+            "customB",
+            ResolvedExpressionClass::Other,
+            false,
+            Vrm1ExpressionOverride::None,
+            vec![bind(0, 0, 1.0)],
+        );
+        custom_a.is_custom = true;
+        let mut custom_b = custom_a.clone();
+        custom_b.name = "customA".into();
+        let runtime = runtime(vec![
+            custom_a,
+            expression(
+                "blink",
+                ResolvedExpressionClass::Blink,
+                false,
+                Vrm1ExpressionOverride::None,
+                vec![bind(0, 1, 1.0)],
+            ),
+            custom_b,
+            expression(
+                "happy",
+                ResolvedExpressionClass::Other,
+                false,
+                Vrm1ExpressionOverride::None,
+                vec![bind(0, 2, 1.0)],
+            ),
+        ]);
+        let state = runtime.manual_state();
+        assert_eq!(
+            state
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["happy", "blink", "customB", "customA"]
+        );
+        assert_eq!(
+            state.iter().map(|item| item.index).collect::<Vec<_>>(),
+            [3, 1, 0, 2]
+        );
+        assert_eq!(
+            state.iter().map(|item| item.custom).collect::<Vec<_>>(),
+            [false, false, true, true]
+        );
+    }
+
+    #[test]
+    fn manual_inputs_are_owned_by_each_expression_runtime() {
+        let definitions = vec![expression(
+            "happy",
+            ResolvedExpressionClass::Other,
+            false,
+            Vrm1ExpressionOverride::None,
+            vec![bind(0, 0, 1.0)],
+        )];
+        let mut first = runtime(definitions.clone());
+        let second = runtime(definitions);
+        first.set_manual_input(0, 0.8);
+        assert_eq!(first.manual_state()[0].weight, 0.8);
+        assert_eq!(second.manual_state()[0].weight, 0.0);
+    }
+
+    #[test]
+    fn manual_source_uses_existing_morph_binary_procedural_and_override_resolution() {
+        let mut happy = expression(
+            "happy",
+            ResolvedExpressionClass::Other,
+            false,
+            Vrm1ExpressionOverride::None,
+            vec![bind(0, 0, 1.0)],
+        );
+        happy.override_blink = Vrm1ExpressionOverride::Blend;
+        happy.override_look_at = Vrm1ExpressionOverride::Blend;
+        let mut runtime = runtime(vec![
+            happy,
+            expression(
+                "blink",
+                ResolvedExpressionClass::Blink,
+                false,
+                Vrm1ExpressionOverride::None,
+                vec![bind(0, 1, 1.0)],
+            ),
+            gaze("lookLeft", 2, false),
+            expression(
+                "binary",
+                ResolvedExpressionClass::Other,
+                true,
+                Vrm1ExpressionOverride::None,
+                vec![bind(0, 3, 1.0)],
+            ),
+        ]);
+        assert!(runtime.set_manual_input(0, 0.5));
+        assert!(runtime.set_manual_input(3, 0.8));
+        assert_eq!(runtime.manual_state()[3].weight, 1.0);
+        runtime.set_input("happy", 0.25);
+        assert_eq!(
+            runtime.composed_weights_with_look_at_for_test(
+                0.8,
+                Vrm1ExpressionLookAt {
+                    look_left: 0.6,
+                    ..Default::default()
+                }
+            ),
+            vec![((0, 0), 0.5), ((0, 1), 0.4), ((0, 2), 0.3), ((0, 3), 1.0)]
+        );
+        assert!(runtime.reset_manual_inputs());
+        assert_eq!(
+            runtime
+                .manual_state()
+                .iter()
+                .map(|item| item.weight)
+                .collect::<Vec<_>>(),
+            [0.0; 4]
+        );
+        assert_eq!(
+            runtime.composed_weights_with_look_at_for_test(
+                0.8,
+                Vrm1ExpressionLookAt {
+                    look_left: 0.6,
+                    ..Default::default()
+                }
+            ),
+            vec![((0, 0), 0.25), ((0, 1), 0.6), ((0, 2), 0.45000002)]
+        );
+        assert!(!runtime.reset_manual_inputs());
+    }
+
+    #[test]
+    fn manual_material_and_texture_bindings_use_stage_g_application() {
+        let materials = vec![mtoon_material()];
+        let mut states = MaterialStateSet::from_assets(&materials);
+        let authored = states.get(0).unwrap().clone();
+        let mut expression = expression(
+            "custom",
+            ResolvedExpressionClass::Other,
+            false,
+            Vrm1ExpressionOverride::None,
+            Vec::new(),
+        );
+        expression
+            .material_color_binds
+            .push(ResolvedMaterialColorBind {
+                material: 0,
+                kind: Vrm1MaterialColorBindType::Color,
+                target_value: [1.0, 0.0, 0.0, 0.4],
+            });
+        expression
+            .texture_transform_binds
+            .push(ResolvedTextureTransformBind {
+                material: 0,
+                scale: [2.0, 2.0],
+                offset: [0.5, 0.0],
+            });
+        let mut runtime = runtime(vec![expression]);
+        runtime.set_manual_input(0, 0.5);
+        let weight = runtime.effective_weights_for_test(0.0, Vrm1ExpressionLookAt::default())[0];
+        apply_material_expression(&mut states, &materials, &runtime.expressions[0], weight);
+        assert_ne!(
+            states.get(0).unwrap().base_color_factor,
+            authored.base_color_factor
+        );
+        assert_ne!(
+            states.get(0).unwrap().texture_transforms,
+            authored.texture_transforms
+        );
     }
 
     #[test]
