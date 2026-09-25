@@ -516,6 +516,45 @@ fn configured_dimension_edits_apply_after_settings_closes() {
 }
 
 #[test]
+fn avatar_behavior_actions_persist_across_settings_and_route_changes() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let mut widget =
+        Widget::new_with_settings_path(test_config(), AppSettings::default(), Some(path.clone()));
+
+    widget.apply_control_action(ControlAction::SetLookAt(false));
+    widget.apply_control_action(ControlAction::SetAutoBlink(false));
+    widget.open_settings();
+    widget.close_settings();
+    widget.apply_control_action(ControlAction::SetMtoonRenderMode(
+        crate::settings::MtoonRenderMode::Fallback,
+    ));
+    widget.apply_control_action(ControlAction::SetMtoonRenderMode(
+        crate::settings::MtoonRenderMode::Native,
+    ));
+    assert!(!widget.settings.avatar_behavior.look_at);
+    assert!(!widget.settings.avatar_behavior.auto_blink);
+    assert_eq!(
+        AppSettings::load_from_path(&path).avatar_behavior,
+        widget.settings.avatar_behavior
+    );
+
+    widget.apply_control_action(ControlAction::SetLookAt(true));
+    widget.apply_control_action(ControlAction::SetAutoBlink(true));
+    assert!(widget.settings.avatar_behavior.look_at);
+    assert!(widget.settings.avatar_behavior.auto_blink);
+}
+
+#[test]
+fn settings_pointer_capture_suspends_cursor_look_at_until_exit() {
+    assert!(cursor_drives_avatar_look_at(true, false, false));
+    assert!(!cursor_drives_avatar_look_at(false, false, false));
+    assert!(!cursor_drives_avatar_look_at(true, false, true));
+    assert!(!cursor_drives_avatar_look_at(true, true, false));
+    assert!(cursor_drives_avatar_look_at(true, false, false));
+}
+
+#[test]
 fn window_settings_snapshot_uses_observed_size_and_actions_keep_configured_values_separate() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("settings.json");
@@ -2688,8 +2727,11 @@ fn linked_snap_update_is_atomic_and_leaves_no_link_in_persisted_settings() {
     assert_eq!(persisted.camera.pitch_snap_deg, 10.0);
     assert_eq!(persisted.camera.roll_snap_deg, 20.0);
     let json = std::fs::read_to_string(&path).unwrap();
+    let document: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert!(
-        !json.to_ascii_lowercase().contains("link"),
+        document.get("link").is_none()
+            && document["camera"].get("link").is_none()
+            && document["camera"].get("snap_linked").is_none(),
         "Link is UI-only and must not appear in persisted JSON: {json}"
     );
 }

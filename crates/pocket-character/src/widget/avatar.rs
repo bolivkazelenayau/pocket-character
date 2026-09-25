@@ -915,6 +915,9 @@ impl AvatarCandidate {
             node_constraints,
             sim,
             animation,
+            look_at_enabled: true,
+            auto_blink_enabled: true,
+            previous_blink: 0.0,
         }
         .advance(instance, 0.0);
 
@@ -1037,7 +1040,14 @@ impl ActiveAvatar {
         }
     }
 
-    pub(super) fn advance_pose(&mut self, instance: &mut ModelInstance, dt: f32) -> SimOutputs {
+    pub(super) fn advance_pose(
+        &mut self,
+        instance: &mut ModelInstance,
+        dt: f32,
+        look_at_enabled: bool,
+        auto_blink_enabled: bool,
+        previous_blink: f32,
+    ) -> SimOutputs {
         let Self {
             asset,
             document,
@@ -1068,6 +1078,9 @@ impl ActiveAvatar {
             node_constraints,
             sim,
             animation,
+            look_at_enabled,
+            auto_blink_enabled,
+            previous_blink,
         }
         .advance(instance, dt)
     }
@@ -1089,6 +1102,9 @@ struct AvatarPoseState<'a> {
     node_constraints: &'a mut Option<Vrm1NodeConstraintRuntime>,
     sim: &'a mut CharacterSim,
     animation: &'a mut AvatarAnimationState,
+    look_at_enabled: bool,
+    auto_blink_enabled: bool,
+    previous_blink: f32,
 }
 
 impl AvatarPoseState<'_> {
@@ -1112,7 +1128,9 @@ impl AvatarPoseState<'_> {
             .skeleton
             .globals_from_locals(self.locals, self.globals);
         let mut procedural_look_at = pocket_vrm::Vrm1ExpressionLookAt::default();
-        if let Some(vrm) = self.document.vrm0() {
+        if self.look_at_enabled
+            && let Some(vrm) = self.document.vrm0()
+        {
             let head = vrm
                 .humanoid_node("head")
                 .map(|node| self.globals[node].w_axis.truncate());
@@ -1134,23 +1152,30 @@ impl AvatarPoseState<'_> {
                 );
             }
         }
-        if let Some(look_at) = self.look_at.as_ref() {
+        if self.look_at_enabled
+            && let Some(look_at) = self.look_at.as_ref()
+        {
             let target_model = self.presentation.model_point_from_world(out.look_target);
             let output = look_at.evaluate(target_model, self.locals, self.globals);
             output.apply_bone_rotations(self.locals);
             procedural_look_at = output.expression_weights();
         }
 
+        let blink = if self.auto_blink_enabled {
+            out.blink
+        } else {
+            0.0
+        };
         match self.expressions {
-            ResolvedExpressionRuntime::Vrm0Legacy if out.blink_changed => {
+            ResolvedExpressionRuntime::Vrm0Legacy if blink != self.previous_blink => {
                 if let Some(morph) = instance.morph.as_mut() {
                     for &(slot, target, weight) in self.blink_binds {
-                        morph.set_weight(slot, target, out.blink * weight);
+                        morph.set_weight(slot, target, blink * weight);
                     }
                 }
             }
             ResolvedExpressionRuntime::Vrm1(runtime) => {
-                runtime.compose_on_instance(instance, out.blink, procedural_look_at);
+                runtime.compose_on_instance(instance, blink, procedural_look_at);
             }
             ResolvedExpressionRuntime::Vrm0Legacy => {}
         }
@@ -3699,6 +3724,134 @@ mod tests {
             "SpringBone remains live after the tick"
         );
         assert!(active.locals[spine_node].rotation.is_finite());
+    }
+
+    #[test]
+    fn cursor_look_at_toggle_removes_and_restores_vrm1_bone_contribution() {
+        let gpu = Gpu::new_headless().expect("headless GPU is required for LookAt integration");
+        let renderer = Renderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT).unwrap();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let (model_file, _, _, _) =
+            generated_vrm1_avatar(true, Some("bone"), ConstraintFixture::ValidAimOptional);
+        let candidate = AvatarCandidate::prepare(
+            &gpu,
+            &renderer,
+            &root.join("dist/character.js"),
+            &AvatarLoadRequest::new(model_file.path().to_owned(), None, "ToggleLookAt"),
+        )
+        .unwrap();
+        let left_eye = match &candidate.document {
+            AvatarSemanticDocument::Vrm1(document) => document
+                .humanoid
+                .node_for(pocket_vrm::Vrm1HumanBone::LeftEye)
+                .unwrap(),
+            AvatarSemanticDocument::Vrm0(_) => unreachable!(),
+        };
+        let mut widget = Widget::new(WidgetConfig {
+            model_path: model_file.path().to_owned(),
+            vrma_path: root.join("assets/idle_loop.vrma"),
+            bundle_path: root.join("dist/character.js"),
+            menu_bundle_path: PathBuf::new(),
+            menu_pak_path: PathBuf::new(),
+            size: (450, 600),
+            cli_max_fps_override: None,
+            frames: None,
+        });
+        widget.commit_avatar_candidate(candidate);
+        {
+            let active = widget.active_avatar.as_mut().unwrap();
+            active.sim.tracking = TrackingMode::Mouse;
+            active.sim.mouse_target = Vec3::new(1.25, 1.75, 4.0);
+        }
+        widget.settings.avatar_behavior.look_at = false;
+        <Widget as Game>::tick(&mut widget, 0.25, &Input::default());
+        let active = widget.active_avatar.as_ref().unwrap();
+        let rest = active.asset.skeleton.rest[left_eye].rotation;
+        assert!(active.locals[left_eye].rotation.angle_between(rest) < 1.0e-4);
+
+        widget.settings.avatar_behavior.look_at = true;
+        <Widget as Game>::tick(&mut widget, 0.25, &Input::default());
+        let active = widget.active_avatar.as_ref().unwrap();
+        assert!(active.locals[left_eye].rotation.angle_between(rest) > 1.0e-4);
+    }
+
+    #[test]
+    fn auto_blink_toggle_removes_generated_source_but_preserves_manual_blink() {
+        let gpu = Gpu::new_headless().expect("headless GPU is required for blink integration");
+        let renderer = Renderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT).unwrap();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let (model_file, _, _, _) = generated_vrm1_avatar(true, None, ConstraintFixture::None);
+        let candidate = AvatarCandidate::prepare(
+            &gpu,
+            &renderer,
+            &root.join("dist/character.js"),
+            &AvatarLoadRequest::new(model_file.path().to_owned(), None, "ToggleBlink"),
+        )
+        .unwrap();
+        let mut widget = Widget::new(WidgetConfig {
+            model_path: model_file.path().to_owned(),
+            vrma_path: root.join("assets/idle_loop.vrma"),
+            bundle_path: root.join("dist/character.js"),
+            menu_bundle_path: PathBuf::new(),
+            menu_pak_path: PathBuf::new(),
+            size: (450, 600),
+            cli_max_fps_override: None,
+            frames: None,
+        });
+        widget.commit_avatar_candidate(candidate);
+        let (blink_index, mesh_slot, target) = {
+            let active = widget.active_avatar.as_ref().unwrap();
+            let ResolvedExpressionRuntime::Vrm1(runtime) = &active.expressions else {
+                unreachable!()
+            };
+            let (index, expression) = runtime
+                .expressions
+                .iter()
+                .enumerate()
+                .find(|(_, expression)| expression.name == "blink")
+                .unwrap();
+            let bind = expression.morph_binds.first().unwrap();
+            (index, bind.mesh_slot, bind.target)
+        };
+        for _ in 0..600 {
+            <Widget as Game>::tick(&mut widget, 1.0 / 60.0, &Input::default());
+            if widget.last_blink > 0.1 {
+                break;
+            }
+        }
+        assert!(
+            widget.last_blink > 0.1,
+            "automatic blink should occur within ten seconds"
+        );
+
+        widget.settings.avatar_behavior.auto_blink = false;
+        <Widget as Game>::tick(&mut widget, 1.0 / 60.0, &Input::default());
+        assert_eq!(widget.last_blink, 0.0);
+        let active = widget.active_avatar.as_ref().unwrap();
+        assert_eq!(
+            widget.scene.models[active.scene_slot.index()]
+                .morph
+                .as_ref()
+                .unwrap()
+                .weight(mesh_slot, target),
+            0.0
+        );
+
+        let active = widget.active_avatar.as_mut().unwrap();
+        let ResolvedExpressionRuntime::Vrm1(runtime) = &mut active.expressions else {
+            unreachable!()
+        };
+        assert!(runtime.set_manual_input(blink_index, 0.75));
+        <Widget as Game>::tick(&mut widget, 1.0 / 60.0, &Input::default());
+        let active = widget.active_avatar.as_ref().unwrap();
+        assert_eq!(
+            widget.scene.models[active.scene_slot.index()]
+                .morph
+                .as_ref()
+                .unwrap()
+                .weight(mesh_slot, target),
+            0.75
+        );
     }
 
     #[test]

@@ -241,6 +241,24 @@ impl WindowSettings {
     }
 }
 
+/// Avatar behavior preferences. Expression and clip inputs remain avatar-owned.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AvatarBehaviorSettings {
+    #[serde(default = "default_enabled", deserialize_with = "deserialize_enabled")]
+    pub look_at: bool,
+    #[serde(default = "default_enabled", deserialize_with = "deserialize_enabled")]
+    pub auto_blink: bool,
+}
+
+impl Default for AvatarBehaviorSettings {
+    fn default() -> Self {
+        Self {
+            look_at: true,
+            auto_blink: true,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MtoonRenderMode {
@@ -341,6 +359,8 @@ pub struct AppSettings {
     pub camera: CameraSettings,
     #[serde(default)]
     pub rendering: RenderSettings,
+    #[serde(default)]
+    pub avatar_behavior: AvatarBehaviorSettings,
 }
 
 impl Default for AppSettings {
@@ -350,6 +370,7 @@ impl Default for AppSettings {
             window: WindowSettings::default(),
             camera: CameraSettings::default(),
             rendering: RenderSettings::default(),
+            avatar_behavior: AvatarBehaviorSettings::default(),
         }
     }
 }
@@ -480,6 +501,7 @@ impl AppSettings {
             window: self.window.sanitized(),
             camera: self.camera.sanitized(),
             rendering: self.rendering.sanitized(),
+            avatar_behavior: self.avatar_behavior,
         }
     }
 
@@ -566,6 +588,17 @@ fn default_resizable() -> bool {
 
 fn default_always_on_top() -> bool {
     true
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+fn deserialize_enabled<'de, D>(deserializer: D) -> std::result::Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bool_or(deserializer, true)
 }
 
 fn default_fov_deg() -> f32 {
@@ -737,6 +770,19 @@ mod tests {
         assert_eq!(settings.rendering.max_fps, 60.0);
         assert!(!settings.rendering.smaa_enabled);
         assert_eq!(settings.rendering.mtoon_render_mode, MtoonRenderMode::Auto);
+    }
+
+    #[test]
+    fn avatar_behavior_defaults_and_round_trips_without_changing_expression_state() {
+        let legacy = AppSettings::from_json(r#"{"schema_version":1}"#).unwrap();
+        assert!(legacy.avatar_behavior.look_at);
+        assert!(legacy.avatar_behavior.auto_blink);
+
+        let mut settings = legacy;
+        settings.avatar_behavior.look_at = false;
+        settings.avatar_behavior.auto_blink = false;
+        let restored = AppSettings::from_json(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(restored.avatar_behavior, settings.avatar_behavior);
     }
 
     #[test]

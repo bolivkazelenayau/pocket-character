@@ -191,6 +191,8 @@ pub(crate) enum MenuAction {
     RequestMsaa(AntiAliasingPreference),
     RequestSmaa(bool),
     SetMtoonRenderMode(crate::settings::MtoonRenderMode),
+    SetLookAt(bool),
+    SetAutoBlink(bool),
     RestoreDefaults,
     OpenAvatar,
 }
@@ -318,6 +320,16 @@ fn decode_menu_action(line: &str) -> Option<MenuAction> {
             .value
             .and_then(|value| serde_json::from_value(value).ok())
             .map(MenuAction::SetMtoonRenderMode),
+        "set_look_at" => wire
+            .value
+            .as_ref()
+            .and_then(|value| value.as_bool())
+            .map(MenuAction::SetLookAt),
+        "set_auto_blink" => wire
+            .value
+            .as_ref()
+            .and_then(|value| value.as_bool())
+            .map(MenuAction::SetAutoBlink),
         "restore_defaults" => Some(MenuAction::RestoreDefaults),
         "open_avatar" => Some(MenuAction::OpenAvatar),
         _ => None,
@@ -365,6 +377,8 @@ struct MenuState {
     window: MenuWindowState,
     expressions: Vec<MenuExpressionState>,
     avatar_generation: u32,
+    look_at_enabled: bool,
+    auto_blink_enabled: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
@@ -497,6 +511,8 @@ impl MenuGuest {
         window: MenuWindowState,
         expressions: Vec<MenuExpressionState>,
         avatar_generation: u32,
+        look_at_enabled: bool,
+        auto_blink_enabled: bool,
     ) -> Result<()> {
         let state = MenuState {
             t: "state",
@@ -524,6 +540,8 @@ impl MenuGuest {
             window,
             expressions,
             avatar_generation,
+            look_at_enabled,
+            auto_blink_enabled,
         };
         let line = serde_json::to_string(&state).context("serialize menu state")?;
         self.surface.svc_push(line);
@@ -754,6 +772,8 @@ mod tests {
                 custom: false,
             }],
             avatar_generation: 4,
+            look_at_enabled: false,
+            auto_blink_enabled: true,
         })
         .unwrap();
 
@@ -921,6 +941,14 @@ mod tests {
             (
                 r#"{"t":"action","action":"set_mtoon_render_mode","value":"fallback"}"#,
                 MenuAction::SetMtoonRenderMode(crate::settings::MtoonRenderMode::Fallback),
+            ),
+            (
+                r#"{"t":"action","action":"set_look_at","value":false}"#,
+                MenuAction::SetLookAt(false),
+            ),
+            (
+                r#"{"t":"action","action":"set_auto_blink","value":true}"#,
+                MenuAction::SetAutoBlink(true),
             ),
             (
                 r#"{"t":"action","action":"restore_defaults"}"#,

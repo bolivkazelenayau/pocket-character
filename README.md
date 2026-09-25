@@ -18,6 +18,13 @@ measurement section below for the answer.
 - **Auto-blink** (sine 0.2 s envelope, 1–6 s uniform interval) and **idle eye
   saccades** (airi's interval distribution table), both from a deterministic
   seeded sim in `pocket-character-core`.
+- **Avatar Behavior** in Settings controls cursor LookAt and the generated
+  Auto Blink source independently. Semantic VRM1 blink and wink expressions
+  take precedence over Auto Blink; manually selected expressions and supported
+  skeletal VRMA animation remain active when Auto Blink is off. Morph weight
+  animation channels are currently outside the VRMA loader's scope, so a
+  morph-only authored wink cannot be identified automatically. Turn Auto Blink
+  off to prevent overlap with eye animation from a direct morph source.
 - **Spring bones** (hair / hood / bust) from the model's VRM data, solved by
   `pocket-vrm`'s verlet solver each tick.
 - **Widget window**: 450×600 (airi's stage geometry), transparent,

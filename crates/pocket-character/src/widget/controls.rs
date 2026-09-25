@@ -55,6 +55,8 @@ pub(crate) enum ControlAction {
     RequestMsaa(AntiAliasingPreference),
     RequestSmaa(bool),
     SetMtoonRenderMode(MtoonRenderMode),
+    SetLookAt(bool),
+    SetAutoBlink(bool),
     RestoreDefaults,
 }
 

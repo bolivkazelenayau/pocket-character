@@ -369,6 +369,23 @@ impl Vrm1ExpressionRuntime {
         } else {
             0.0
         };
+        // A semantic blink/wink supplied by the guest or Expressions UI owns
+        // the eye state. In particular, a left wink must not acquire an
+        // unrelated procedural right-eye closure. Other expressions still
+        // apply overrideBlink to the resulting blink class below.
+        let explicit_blink_active =
+            self.expressions
+                .iter()
+                .enumerate()
+                .any(|(index, expression)| {
+                    expression.class == ResolvedExpressionClass::Blink
+                        && expression_output(self.combined_input(index), expression.is_binary) > 0.0
+                });
+        let procedural_blink = if explicit_blink_active {
+            0.0
+        } else {
+            procedural_blink
+        };
         let blink_override = self.override_state(ResolvedExpressionClass::Blink, |expression| {
             expression.override_blink
         });
@@ -1199,6 +1216,34 @@ mod tests {
         assert_eq!(
             runtime.composed_weights_for_test(0.4),
             vec![((0, 0), 0.4), ((0, 1), 0.4)]
+        );
+    }
+
+    #[test]
+    fn semantic_wink_suppresses_automatic_pair_without_affecting_manual_eye() {
+        let mut runtime = runtime(vec![
+            expression(
+                "blinkLeft",
+                ResolvedExpressionClass::Blink,
+                false,
+                Vrm1ExpressionOverride::None,
+                vec![bind(0, 0, 1.0)],
+            ),
+            expression(
+                "blinkRight",
+                ResolvedExpressionClass::Blink,
+                false,
+                Vrm1ExpressionOverride::None,
+                vec![bind(0, 1, 1.0)],
+            ),
+        ]);
+        assert!(runtime.set_manual_input(0, 0.7));
+        assert_eq!(runtime.composed_weights_for_test(0.9), vec![((0, 0), 0.7)]);
+        assert_eq!(runtime.composed_weights_for_test(0.0), vec![((0, 0), 0.7)]);
+        assert!(runtime.set_manual_input(0, 0.0));
+        assert_eq!(
+            runtime.composed_weights_for_test(0.9),
+            vec![((0, 0), 0.9), ((0, 1), 0.9)]
         );
     }
 

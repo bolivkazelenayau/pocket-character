@@ -153,6 +153,14 @@ fn native_drag_allowed_for_menu_pointer(menu_pointer_owned: bool) -> bool {
     !menu_pointer_owned
 }
 
+fn cursor_drives_avatar_look_at(
+    enabled: bool,
+    menu_pointer_owned: bool,
+    pointer_over_ui: bool,
+) -> bool {
+    enabled && !menu_pointer_owned && !pointer_over_ui
+}
+
 /// Intersect a world-space ray with a plane. Invalid, parallel, and
 /// behind-camera intersections are rejected so callers can choose a stable
 /// fallback instead of retaining an obsolete target.
@@ -880,6 +888,8 @@ impl Widget {
             MenuAction::RequestMsaa(preference) => ControlAction::RequestMsaa(preference),
             MenuAction::RequestSmaa(enabled) => ControlAction::RequestSmaa(enabled),
             MenuAction::SetMtoonRenderMode(mode) => ControlAction::SetMtoonRenderMode(mode),
+            MenuAction::SetLookAt(value) => ControlAction::SetLookAt(value),
+            MenuAction::SetAutoBlink(value) => ControlAction::SetAutoBlink(value),
             MenuAction::SetWindowWidth(value) => ControlAction::SetWindowWidth(value),
             MenuAction::SetWindowHeight(value) => ControlAction::SetWindowHeight(value),
             MenuAction::SetWindowResizable(value) => ControlAction::SetWindowResizable(value),
@@ -1299,6 +1309,18 @@ impl Widget {
                     self.switch_mtoon_render_mode(mode);
                 }
             }
+            ControlAction::SetLookAt(value) => {
+                if self.settings.avatar_behavior.look_at != value {
+                    self.settings.avatar_behavior.look_at = value;
+                    self.persist_settings();
+                }
+            }
+            ControlAction::SetAutoBlink(value) => {
+                if self.settings.avatar_behavior.auto_blink != value {
+                    self.settings.avatar_behavior.auto_blink = value;
+                    self.persist_settings();
+                }
+            }
             ControlAction::SettingsOpened => self.open_settings(),
             ControlAction::SettingsClosed => self.close_settings(),
             ControlAction::RestoreDefaults => self.restore_defaults(),
@@ -1686,7 +1708,16 @@ impl Game for Widget {
                 TickEvent::HoverEnd
             });
         }
-        self.update_mouse_tracking_target(input.cursor());
+        let pointer_over_ui = input
+            .cursor()
+            .is_some_and(|cursor| self.menu_owns_pointer(cursor));
+        if cursor_drives_avatar_look_at(
+            self.settings.avatar_behavior.look_at,
+            self.menu_pointer_owned,
+            pointer_over_ui,
+        ) {
+            self.update_mouse_tracking_target(input.cursor());
+        }
     }
 
     fn tick(&mut self, dt: f32, _input: &Input) {
@@ -1702,7 +1733,20 @@ impl Game for Widget {
         let guest_turn = {
             let active = self.active_avatar.as_mut().expect("active avatar checked");
             let scene_slot = active.scene_slot;
-            let out = active.advance_pose(scene_slot.get_mut(&mut self.scene), dt);
+            let look_at_enabled =
+                self.settings.avatar_behavior.look_at || active.sim.tracking != TrackingMode::Mouse;
+            let out = active.advance_pose(
+                scene_slot.get_mut(&mut self.scene),
+                dt,
+                look_at_enabled,
+                self.settings.avatar_behavior.auto_blink,
+                self.last_blink,
+            );
+            let blink = if self.settings.avatar_behavior.auto_blink {
+                out.blink
+            } else {
+                0.0
+            };
 
             // --- guest turn ---------------------------------------------
             let mut events: Vec<TickEvent> = std::mem::take(&mut self.pending_events);
@@ -1712,7 +1756,7 @@ impl Game for Widget {
             self.pending_character_clicks = 0;
             let state = TickState {
                 t: self.tick_count as f64 * dt as f64,
-                blink: out.blink,
+                blink,
                 clip: active
                     .clips
                     .get(active.animation.clip_index)
@@ -1726,7 +1770,6 @@ impl Game for Widget {
                 fps: self.stats.fps(),
                 frame_ms: self.stats.frame_ms(),
             };
-            let blink = out.blink;
             (active.guest.turn(&state, &events), blink)
         };
         match guest_turn {
@@ -1789,6 +1832,8 @@ impl Game for Widget {
                             window_snapshot,
                             expressions,
                             self.avatar_generation,
+                            self.settings.avatar_behavior.look_at,
+                            self.settings.avatar_behavior.auto_blink,
                         )?;
                         for pointer_frame in pointer_frames {
                             if pointer_frame.cancelled {
