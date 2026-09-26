@@ -1109,7 +1109,10 @@ struct AvatarPoseState<'a> {
 
 impl AvatarPoseState<'_> {
     fn advance(self, instance: &mut ModelInstance, dt: f32) -> SimOutputs {
-        let out = self.sim.tick(dt);
+        let suspend_blink = self.auto_blink_enabled
+            && matches!(self.expressions, ResolvedExpressionRuntime::Vrm1(runtime)
+                if runtime.manual_blink_suppression() >= 0.95);
+        let out = self.sim.tick_with_blink_suspended(dt, suspend_blink);
 
         self.animation.clip_time += dt;
         let clip = self
@@ -2489,6 +2492,266 @@ mod tests {
                 "{mode:?} produced no visible avatar ({pixels} pixels)"
             );
         }
+    }
+
+    #[test]
+    fn generated_custom_expression_detects_distinct_overlapping_morph_targets() {
+        let (source_file, _, _, expression_node) =
+            generated_vrm1_avatar(false, None, ConstraintFixture::None);
+        let bytes = std::fs::read(source_file.path()).unwrap();
+        let glb = pocket_vrm::glb::parse_glb(&bytes).unwrap();
+        let mut json = glb.json;
+        let mesh = json["nodes"][expression_node]["mesh"].as_u64().unwrap() as usize;
+        let mut custom_target = None;
+        for primitive in json["meshes"][mesh]["primitives"].as_array_mut().unwrap() {
+            let targets = primitive["targets"].as_array_mut().unwrap();
+            let target = targets[1].clone();
+            assert_eq!(*custom_target.get_or_insert(targets.len()), targets.len());
+            targets.push(target);
+        }
+        json["extensions"]["VRMC_vrm"]["expressions"]["custom"] = serde_json::json!({
+            "UnrecognizedEyePose": {"morphTargetBinds": [
+                {"node": expression_node, "index": custom_target.unwrap(), "weight": 1.0}
+            ]},
+            "MaterialOnly": {"materialColorBinds": [
+                {"material": 0, "type": "color", "targetValue": [1.0, 0.0, 0.0, 1.0]}
+            ]}
+        });
+        let mut file = tempfile::Builder::new().suffix(".vrm").tempfile().unwrap();
+        file.write_all(&glb_with_json_and_bin(&json, glb.bin))
+            .unwrap();
+        let gpu = Gpu::new_headless().expect("headless GPU is required for conflict detection");
+        let renderer = Renderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT).unwrap();
+        let bundle = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../dist/character.js");
+        let candidate = AvatarCandidate::prepare(
+            &gpu,
+            &renderer,
+            &bundle,
+            &AvatarLoadRequest::new(file.path().to_owned(), None, "CustomEyes"),
+        )
+        .unwrap();
+        let ResolvedExpressionRuntime::Vrm1(mut runtime) = candidate.expressions else {
+            unreachable!()
+        };
+        let custom = runtime
+            .expressions
+            .iter()
+            .position(|e| e.name == "UnrecognizedEyePose")
+            .unwrap();
+        let blink = runtime
+            .expressions
+            .iter()
+            .find(|e| e.name == "blink")
+            .unwrap();
+        assert!(runtime.expressions[custom].is_custom);
+        assert!(runtime.expressions[custom].conflicts_with_blink);
+        assert_ne!(
+            runtime.expressions[custom].morph_binds[0].target,
+            blink.morph_binds[0].target
+        );
+        let material = runtime
+            .expressions
+            .iter()
+            .position(|e| e.name == "MaterialOnly")
+            .unwrap();
+        assert!(!runtime.expressions[material].conflicts_with_blink);
+        runtime.set_manual_input(material, 1.0);
+        assert_eq!(runtime.manual_blink_suppression(), 0.0);
+        runtime.set_manual_input(custom, 1.0);
+        assert_eq!(runtime.manual_blink_suppression(), 1.0);
+    }
+
+    #[test]
+    fn local_avatar_sample_weighted_blink_headless_acceptance_and_replacement() {
+        use super::super::controls::ControlAction;
+        use crate::menu_guest::MenuAction;
+        use crate::settings::MtoonRenderMode;
+
+        let fixture = Path::new(r"C:\Users\Breeze\Downloads\AvatarSample_VRM1.0.vrm");
+        if !fixture.is_file() {
+            eprintln!(
+                "skipping local blink acceptance fixture: {}",
+                fixture.display()
+            );
+            return;
+        }
+        let gpu = Gpu::new_headless().expect("headless GPU is required for blink acceptance");
+        let renderer = Renderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT).unwrap();
+        let bundle = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../dist/character.js");
+        let request = AvatarLoadRequest::new(fixture.to_owned(), None, "AvatarSampleBlink");
+        let candidate = AvatarCandidate::prepare(&gpu, &renderer, &bundle, &request).unwrap();
+        let mut widget = Widget::new(WidgetConfig {
+            model_path: fixture.to_owned(),
+            vrma_path: PathBuf::new(),
+            bundle_path: bundle.clone(),
+            menu_bundle_path: PathBuf::new(),
+            menu_pak_path: PathBuf::new(),
+            size: (450, 600),
+            cli_max_fps_override: None,
+            frames: None,
+        });
+        widget.commit_avatar_candidate(candidate);
+        let generation = widget.avatar_generation;
+        let (happy, mouth, blink_bind) = {
+            let ResolvedExpressionRuntime::Vrm1(runtime) =
+                &widget.active_avatar.as_ref().unwrap().expressions
+            else {
+                unreachable!()
+            };
+            let happy = runtime
+                .expressions
+                .iter()
+                .position(|e| e.name == "happy")
+                .unwrap();
+            let mouth = runtime
+                .expressions
+                .iter()
+                .position(|e| e.name == "aa")
+                .unwrap();
+            let blink = runtime
+                .expressions
+                .iter()
+                .find(|e| e.name == "blink")
+                .unwrap();
+            assert!(runtime.expressions[happy].conflicts_with_blink);
+            assert_eq!(
+                runtime.expressions[happy].override_blink,
+                pocket_vrm::Vrm1ExpressionOverride::None
+            );
+            assert!(!runtime.expressions[mouth].conflicts_with_blink);
+            assert_eq!(
+                runtime.expressions[mouth].morph_binds[0].mesh_slot,
+                blink.morph_binds[0].mesh_slot
+            );
+            assert_ne!(
+                runtime.expressions[happy].morph_binds[0].target,
+                blink.morph_binds[0].target
+            );
+            (happy, mouth, blink.morph_binds[0].clone())
+        };
+        let blink_weight = |runtime: &super::super::expression::Vrm1ExpressionRuntime, source| {
+            runtime
+                .composed_weights_for_test(source)
+                .into_iter()
+                .find(|(target, _)| *target == (blink_bind.mesh_slot, blink_bind.target))
+                .map_or(0.0, |(_, weight)| weight)
+        };
+        let mut previous = -1.0;
+        for weight in [1.0, 0.8, 0.6, 0.4, 0.0] {
+            widget.apply_menu_action(MenuAction::SetExpression(generation, happy, weight));
+            let ResolvedExpressionRuntime::Vrm1(runtime) =
+                &widget.active_avatar.as_ref().unwrap().expressions
+            else {
+                unreachable!()
+            };
+            let generated = blink_weight(runtime, 1.0);
+            assert!(generated >= previous);
+            if weight >= 0.95 {
+                assert_eq!(generated, 0.0);
+            }
+            if weight <= 0.5 {
+                assert_eq!(generated, 1.0);
+            }
+            eprintln!("AvatarSample happy={weight:.1}: generated peak={generated:.6}");
+            previous = generated;
+        }
+        widget.apply_menu_action(MenuAction::SetExpression(generation, mouth, 1.0));
+        let ResolvedExpressionRuntime::Vrm1(runtime) =
+            &widget.active_avatar.as_ref().unwrap().expressions
+        else {
+            unreachable!()
+        };
+        assert_eq!(blink_weight(runtime, 1.0), 1.0);
+        widget.apply_menu_action(MenuAction::ResetExpressions(generation));
+        // Enter full suppression during an actual generated blink.
+        for _ in 0..600 {
+            <Widget as Game>::tick(&mut widget, 1.0 / 60.0, &Input::default());
+            if widget.last_blink > 0.1 {
+                break;
+            }
+        }
+        assert!(widget.last_blink > 0.1);
+        widget.apply_menu_action(MenuAction::SetExpression(generation, happy, 1.0));
+        for _ in 0..600 {
+            <Widget as Game>::tick(&mut widget, 1.0 / 60.0, &Input::default());
+            assert_eq!(widget.last_blink, 0.0);
+            let active = widget.active_avatar.as_ref().unwrap();
+            assert_eq!(
+                widget.scene.models[active.scene_slot.index()]
+                    .morph
+                    .as_ref()
+                    .unwrap()
+                    .weight(blink_bind.mesh_slot, blink_bind.target),
+                0.0
+            );
+        }
+        for mode in [MtoonRenderMode::Native, MtoonRenderMode::Fallback] {
+            widget.apply_control_action(ControlAction::SetMtoonRenderMode(mode));
+            let ResolvedExpressionRuntime::Vrm1(runtime) =
+                &widget.active_avatar.as_ref().unwrap().expressions
+            else {
+                unreachable!()
+            };
+            assert_eq!(runtime.manual_blink_suppression(), 1.0);
+            assert_eq!(
+                runtime.composed_weights_for_test(0.0),
+                runtime.composed_weights_for_test(1.0)
+            );
+        }
+        // Failed replacement must preserve the active conflict and parked cycle.
+        widget.request_avatar_replacement(AvatarLoadRequest::new(
+            fixture.with_extension("missing.vrm"),
+            None,
+            "Missing",
+        ));
+        widget.process_pending_avatar_request(&gpu, &renderer);
+        assert_eq!(widget.avatar_generation, generation);
+        let ResolvedExpressionRuntime::Vrm1(runtime) =
+            &widget.active_avatar.as_ref().unwrap().expressions
+        else {
+            unreachable!()
+        };
+        assert_eq!(runtime.manual_blink_suppression(), 1.0);
+        widget.apply_menu_action(MenuAction::ResetExpressions(generation));
+        for _ in 0..30 {
+            <Widget as Game>::tick(&mut widget, 1.0 / 60.0, &Input::default());
+            assert_eq!(
+                widget.last_blink, 0.0,
+                "release must schedule a fresh blink"
+            );
+        }
+        assert!((0..360).any(|_| {
+            <Widget as Game>::tick(&mut widget, 1.0 / 60.0, &Input::default());
+            widget.last_blink > 0.1
+        }));
+        widget.apply_menu_action(MenuAction::SetExpression(generation, happy, 1.0));
+        <Widget as Game>::tick(&mut widget, 1.0 / 60.0, &Input::default());
+        // A replacement with no conflicting expressions gets fresh metadata,
+        // inputs and scheduler state; stale UI generation cannot change it.
+        let (replacement_file, _, _, _) =
+            generated_vrm1_avatar(false, None, ConstraintFixture::None);
+        let replacement = AvatarCandidate::prepare(
+            &gpu,
+            &renderer,
+            &bundle,
+            &AvatarLoadRequest::new(replacement_file.path().to_owned(), None, "Replacement"),
+        )
+        .unwrap();
+        widget.commit_avatar_candidate(replacement);
+        widget.apply_menu_action(MenuAction::SetExpression(generation, happy, 1.0));
+        let ResolvedExpressionRuntime::Vrm1(runtime) =
+            &widget.active_avatar.as_ref().unwrap().expressions
+        else {
+            unreachable!()
+        };
+        assert_eq!(runtime.manual_blink_suppression(), 0.0);
+        assert!(runtime.expressions.iter().all(|e| !e.conflicts_with_blink));
+        assert!(runtime.manual_state().iter().all(|e| e.weight == 0.0));
+        assert_eq!(widget.last_blink, 0.0);
+        assert!((0..600).any(|_| {
+            <Widget as Game>::tick(&mut widget, 1.0 / 60.0, &Input::default());
+            widget.last_blink > 0.1
+        }));
     }
 
     #[test]

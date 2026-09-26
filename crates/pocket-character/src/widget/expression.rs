@@ -57,6 +57,8 @@ pub(super) struct ResolvedExpression {
     pub(super) texture_transform_binds: Vec<ResolvedTextureTransformBind>,
     pub(super) is_binary: bool,
     pub(super) class: ResolvedExpressionClass,
+    // Derived once from position deltas, never from expression names.
+    pub(super) conflicts_with_blink: bool,
     pub(super) override_blink: Vrm1ExpressionOverride,
     pub(super) override_look_at: Vrm1ExpressionOverride,
     pub(super) override_mouth: Vrm1ExpressionOverride,
@@ -232,6 +234,18 @@ impl Vrm1ExpressionRuntime {
         self.inputs[index].max(self.manual_inputs[index])
     }
 
+    pub(super) fn manual_blink_suppression(&self) -> f32 {
+        self.expressions
+            .iter()
+            .zip(&self.manual_inputs)
+            .filter(|(expression, _)| expression.conflicts_with_blink)
+            .map(|(_, &weight)| {
+                let t = ((weight - 0.50) / (0.95 - 0.50)).clamp(0.0, 1.0);
+                t * t * (3.0 - 2.0 * t)
+            })
+            .fold(0.0, f32::max)
+    }
+
     pub(super) fn set_input(&mut self, name: &str, value: f32) -> bool {
         if !value.is_finite() {
             if !self.warned_nonfinite_input {
@@ -384,7 +398,7 @@ impl Vrm1ExpressionRuntime {
         let procedural_blink = if explicit_blink_active {
             0.0
         } else {
-            procedural_blink
+            procedural_blink * (1.0 - self.manual_blink_suppression())
         };
         let blink_override = self.override_state(ResolvedExpressionClass::Blink, |expression| {
             expression.override_blink
@@ -669,6 +683,73 @@ where
     any_supported_delta
 }
 
+// Primitive-local vertex indices are only comparable within the same mesh
+// slot and primitive. Normal-only deltas change shading, not eyelid geometry.
+type VertexDeformation = HashMap<(usize, usize, u32), glam::Vec3>;
+
+fn expression_deformation(
+    expression: &ResolvedExpression,
+    model: &ModelAsset,
+) -> VertexDeformation {
+    let mut deformation = VertexDeformation::new();
+    for bind in &expression.morph_binds {
+        for (primitive, morph_prim) in model.morph_meshes[bind.mesh_slot].prims.iter().enumerate() {
+            for &(vertex, delta) in &morph_prim.targets[bind.target].pos {
+                if delta.is_finite() {
+                    *deformation
+                        .entry((bind.mesh_slot, primitive, vertex))
+                        .or_default() += delta * bind.weight;
+                }
+            }
+        }
+    }
+    deformation
+}
+
+fn overlaps_blink_geometry(deformation: &VertexDeformation, blink: &VertexDeformation) -> bool {
+    // Require meaningful displacement (at least 10% of the authored blink at
+    // that vertex) over at least 20% of a blink's displacement energy. Weight
+    // by squared blink motion so tiny exported deltas and distant brow/cheek
+    // vertices cannot dominate by sheer count. Check each semantic blink
+    // separately so a unilateral eye pose can also yield procedural blinking.
+    let mut total = 0.0;
+    let mut overlap = 0.0;
+    for (vertex, delta) in blink {
+        let energy = delta.length_squared();
+        if !energy.is_finite() || energy <= 0.0 {
+            continue;
+        }
+        total += energy;
+        if deformation.get(vertex).is_some_and(|delta| {
+            let motion = delta.length_squared();
+            motion.is_finite() && motion >= energy * 0.01
+        }) {
+            overlap += energy;
+        }
+    }
+    total > 0.0 && overlap >= total * 0.20
+}
+
+fn derive_blink_conflicts(expressions: &mut [ResolvedExpression], model: &ModelAsset) {
+    let blink_geometry = expressions
+        .iter()
+        .filter(|expression| expression.class == ResolvedExpressionClass::Blink)
+        .map(|expression| expression_deformation(expression, model))
+        .collect::<Vec<_>>();
+    for expression in expressions {
+        // Explicit blink/wink already owns the eye state; this metadata only
+        // describes other expressions that may require generated blink to yield.
+        expression.conflicts_with_blink = expression.class != ResolvedExpressionClass::Blink
+            && !expression.morph_binds.is_empty()
+            && {
+                let deformation = expression_deformation(expression, model);
+                blink_geometry
+                    .iter()
+                    .any(|blink| overlaps_blink_geometry(&deformation, blink))
+            };
+    }
+}
+
 pub(super) fn resolve_vrm1(
     document: &Vrm1Doc,
     model: &ModelAsset,
@@ -802,11 +883,13 @@ pub(super) fn resolve_vrm1(
             texture_transform_binds,
             is_binary: expression.is_binary,
             class,
+            conflicts_with_blink: false,
             override_blink: expression.override_blink,
             override_look_at: expression.override_look_at,
             override_mouth: expression.override_mouth,
         });
     }
+    derive_blink_conflicts(&mut resolved, model);
     Ok(ResolvedExpressionRuntime::Vrm1(Vrm1ExpressionRuntime::new(
         resolved,
     )))
@@ -843,6 +926,7 @@ mod tests {
             texture_transform_binds: Vec::new(),
             is_binary,
             class,
+            conflicts_with_blink: false,
             override_blink,
             override_look_at: Vrm1ExpressionOverride::None,
             override_mouth: Vrm1ExpressionOverride::None,
@@ -952,6 +1036,197 @@ mod tests {
             Vrm1ExpressionOverride::None,
             vec![bind(0, target, 1.0)],
         )
+    }
+
+    #[test]
+    fn blink_geometry_overlap_requires_meaningful_shared_vertex_motion() {
+        use glam::Vec3;
+        let blink = VertexDeformation::from([
+            ((0, 0, 1), Vec3::Y),
+            ((0, 0, 2), Vec3::Y),
+            ((0, 0, 3), Vec3::Y * 0.001),
+        ]);
+        assert!(overlaps_blink_geometry(
+            &VertexDeformation::from([((0, 0, 1), Vec3::Y * 0.5)]),
+            &blink
+        ));
+        for key in [(0, 0, 4), (0, 1, 1), (1, 0, 1)] {
+            assert!(!overlaps_blink_geometry(
+                &VertexDeformation::from([(key, Vec3::Y)]),
+                &blink
+            ));
+        }
+        for (key, delta) in [((0, 0, 1), Vec3::Y * 0.001), ((0, 0, 3), Vec3::Y)] {
+            assert!(!overlaps_blink_geometry(
+                &VertexDeformation::from([(key, delta)]),
+                &blink
+            ));
+        }
+        assert!(!overlaps_blink_geometry(&VertexDeformation::new(), &blink));
+        assert!(!overlaps_blink_geometry(&blink, &VertexDeformation::new()));
+    }
+
+    fn conflict_runtime(override_blink: Vrm1ExpressionOverride) -> Vrm1ExpressionRuntime {
+        let mut conflict = expression(
+            "customEyePose",
+            ResolvedExpressionClass::Other,
+            false,
+            override_blink,
+            vec![bind(0, 1, 1.0)],
+        );
+        conflict.is_custom = true;
+        conflict.conflicts_with_blink = true;
+        runtime(vec![
+            expression(
+                "blink",
+                ResolvedExpressionClass::Blink,
+                false,
+                Vrm1ExpressionOverride::None,
+                vec![bind(0, 0, 1.0)],
+            ),
+            conflict,
+        ])
+    }
+
+    #[test]
+    fn manual_conflict_smoothly_yields_only_generated_blink() {
+        let mut runtime = conflict_runtime(Vrm1ExpressionOverride::None);
+        let mut previous = 0.8;
+        for weight in [0.0, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1.0] {
+            runtime.set_manual_input(1, weight);
+            let actual = runtime.effective_weights_for_test(0.8, Default::default())[0];
+            assert!(actual <= previous);
+            if weight <= 0.5 {
+                assert_eq!(actual, 0.8);
+            } else if weight < 0.95 {
+                assert!(actual < previous && actual > 0.0);
+            } else {
+                assert_eq!(actual, 0.0);
+            }
+            previous = actual;
+        }
+        // Guest weights remain authored inputs and do not trigger the heuristic.
+        runtime.reset_manual_inputs();
+        runtime.set_input("customEyePose", 1.0);
+        assert_eq!(
+            runtime.effective_weights_for_test(0.8, Default::default())[0],
+            0.8
+        );
+        runtime.set_manual_input(1, 1.0);
+        runtime.set_manual_input(0, 0.75);
+        assert_eq!(
+            runtime.effective_weights_for_test(0.8, Default::default())[0],
+            0.75
+        );
+        runtime.set_manual_input(0, 0.0);
+        runtime.set_input("blink", 0.65);
+        assert_eq!(
+            runtime.effective_weights_for_test(0.8, Default::default())[0],
+            0.65
+        );
+    }
+
+    #[test]
+    fn nonconflicting_and_material_only_manual_inputs_preserve_blink() {
+        let mut runtime = conflict_runtime(Vrm1ExpressionOverride::None);
+        runtime.expressions[1].conflicts_with_blink = false;
+        runtime.set_manual_input(1, 1.0);
+        assert_eq!(
+            runtime.effective_weights_for_test(0.8, Default::default())[0],
+            0.8
+        );
+        runtime.expressions[1].morph_binds.clear();
+        runtime.expressions[1]
+            .material_color_binds
+            .push(ResolvedMaterialColorBind {
+                material: 0,
+                kind: Vrm1MaterialColorBindType::Color,
+                target_value: [1.0; 4],
+            });
+        runtime.expressions[1]
+            .texture_transform_binds
+            .push(ResolvedTextureTransformBind {
+                material: 0,
+                scale: [2.0; 2],
+                offset: [0.5; 2],
+            });
+        assert_eq!(
+            runtime.effective_weights_for_test(0.8, Default::default())[0],
+            0.8
+        );
+    }
+
+    #[test]
+    fn multiple_manual_conflicts_use_maximum_and_reset_is_avatar_owned() {
+        let mut first = conflict_runtime(Vrm1ExpressionOverride::None);
+        let mut other = first.expressions[1].clone();
+        other.name = "anotherCustomPose".into();
+        let definitions = vec![
+            first.expressions[0].clone(),
+            first.expressions[1].clone(),
+            other,
+        ];
+        first = runtime(definitions.clone());
+        first.set_manual_input(1, 0.6);
+        let single = first.manual_blink_suppression();
+        first.set_manual_input(2, 0.6);
+        assert_eq!(first.manual_blink_suppression(), single);
+        assert!(single > 0.0 && single < 0.5);
+        first.set_manual_input(2, 0.8);
+        let t: f32 = (0.8 - 0.5) / 0.45;
+        assert!((first.manual_blink_suppression() - t * t * (3.0 - 2.0 * t)).abs() < 1e-6);
+        let replacement = runtime(definitions);
+        assert_eq!(replacement.manual_blink_suppression(), 0.0);
+        first.reset_manual_inputs();
+        assert_eq!(first.manual_blink_suppression(), 0.0);
+    }
+
+    #[test]
+    fn authored_blink_overrides_still_resolve_after_generated_yielding() {
+        let mut block = conflict_runtime(Vrm1ExpressionOverride::Block);
+        block.set_manual_input(1, 0.1);
+        assert_eq!(block.manual_blink_suppression(), 0.0);
+        assert_eq!(
+            block.effective_weights_for_test(0.8, Default::default())[0],
+            0.0
+        );
+        block.set_manual_input(0, 1.0);
+        assert_eq!(
+            block.effective_weights_for_test(0.8, Default::default())[0],
+            0.0
+        );
+        let mut blend = conflict_runtime(Vrm1ExpressionOverride::Blend);
+        blend.set_manual_input(1, 0.6);
+        let expected = 0.8 * (1.0 - blend.manual_blink_suppression()) * 0.4;
+        assert!(
+            (blend.effective_weights_for_test(0.8, Default::default())[0] - expected).abs() < 1e-6
+        );
+        blend.set_manual_input(0, 0.75);
+        assert!(
+            (blend.effective_weights_for_test(0.8, Default::default())[0] - 0.75 * 0.4).abs()
+                < 1e-6
+        );
+    }
+
+    #[test]
+    fn explicit_manual_wink_is_usable_at_full_conflict_suppression() {
+        let mut runtime = conflict_runtime(Vrm1ExpressionOverride::None);
+        runtime.expressions[0].name = "blinkLeft".into();
+        let mut right = runtime.expressions[0].clone();
+        right.name = "blinkRight".into();
+        right.morph_binds = vec![bind(0, 2, 1.0)];
+        runtime = Vrm1ExpressionRuntime::new(vec![
+            runtime.expressions[0].clone(),
+            runtime.expressions[1].clone(),
+            right,
+        ]);
+        runtime.set_manual_input(1, 1.0);
+        for (left, right) in [(0.75, 0.0), (0.0, 0.65)] {
+            runtime.set_manual_input(0, left);
+            runtime.set_manual_input(2, right);
+            let weights = runtime.effective_weights_for_test(0.8, Default::default());
+            assert_eq!((weights[0], weights[2]), (left, right));
+        }
     }
 
     #[test]

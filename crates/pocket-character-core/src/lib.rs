@@ -97,6 +97,7 @@ pub struct CharacterSim {
     time_since_blink: f32,
     next_blink: f32,
     last_blink_weight: f32,
+    blink_suspended: bool,
 
     // Saccades (airi useIdleEyeSaccades).
     time_since_saccade: f32,
@@ -118,6 +119,7 @@ impl CharacterSim {
             time_since_blink: 0.0,
             next_blink,
             last_blink_weight: 0.0,
+            blink_suspended: false,
             // airi starts with nextSaccadeAfter = -1: first tick fixates.
             time_since_saccade: 0.0,
             next_saccade: -1.0,
@@ -134,13 +136,35 @@ impl CharacterSim {
     }
 
     pub fn tick(&mut self, dt: f32) -> SimOutputs {
+        self.tick_with_blink_suspended(dt, false)
+    }
+
+    /// Park generated blinking while the host owns the eyelid pose. Release
+    /// schedules a fresh interval instead of exposing a hidden blink phase.
+    /// Saccades and look tracking continue normally.
+    pub fn tick_with_blink_suspended(&mut self, dt: f32, suspended: bool) -> SimOutputs {
         // --- blink ------------------------------------------------------
-        self.time_since_blink += dt;
-        if !self.blinking && self.time_since_blink >= self.next_blink {
+        if suspended != self.blink_suspended {
+            self.blinking = false;
+            self.blink_progress = 0.0;
+            self.time_since_blink = 0.0;
+            if !suspended {
+                self.next_blink = self.rng.range(BLINK_INTERVAL.0, BLINK_INTERVAL.1);
+            }
+            self.blink_suspended = suspended;
+        }
+        if !suspended {
+            self.time_since_blink += dt;
+        }
+        if !suspended && !self.blinking && self.time_since_blink >= self.next_blink {
             self.blinking = true;
             self.blink_progress = 0.0;
         }
-        let mut blink = self.last_blink_weight;
+        let mut blink = if suspended || !self.blinking {
+            0.0
+        } else {
+            self.last_blink_weight
+        };
         if self.blinking {
             self.blink_progress += dt / BLINK_DURATION;
             blink = (core::f32::consts::PI * self.blink_progress.min(1.0)).sin();
@@ -184,6 +208,31 @@ impl CharacterSim {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suspended_blink_discards_hidden_phase_and_schedules_fresh_interval() {
+        let mut sim = CharacterSim::new(42, Vec3::ZERO);
+        sim.blinking = true;
+        sim.blink_progress = 0.4;
+        sim.last_blink_weight = 0.9;
+        let parked = sim.tick_with_blink_suspended(1.0 / 60.0, true);
+        assert_eq!(parked.blink, 0.0);
+        assert!(parked.blink_changed);
+        for _ in 0..600 {
+            assert_eq!(sim.tick_with_blink_suspended(1.0 / 60.0, true).blink, 0.0);
+        }
+        assert_eq!(sim.blink_progress, 0.0);
+        assert_eq!(sim.time_since_blink, 0.0);
+        for _ in 0..59 {
+            assert_eq!(sim.tick(1.0 / 60.0).blink, 0.0);
+        }
+        assert!((BLINK_INTERVAL.0..=BLINK_INTERVAL.1).contains(&sim.next_blink));
+        assert!((0..360).any(|_| sim.tick(1.0 / 60.0).blink > 0.0));
+        let replacement = CharacterSim::new(42, Vec3::ZERO);
+        assert!(!replacement.blink_suspended);
+        assert!(!replacement.blinking);
+        assert_eq!(replacement.last_blink_weight, 0.0);
+    }
 
     #[test]
     fn deterministic() {
