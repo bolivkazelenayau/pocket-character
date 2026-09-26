@@ -2441,6 +2441,57 @@ mod tests {
     }
 
     #[test]
+    fn supplied_large_joint_vrm_renders_native_and_fallback_when_available() {
+        use crate::settings::MtoonRenderMode;
+
+        let Some(path) = std::env::var_os("POCKET_JOINT_PALETTE_VRM").map(PathBuf::from) else {
+            return;
+        };
+        let _ = env_logger::builder()
+            .is_test(true)
+            .filter_level(log::LevelFilter::Warn)
+            .filter_module("pocket_character", log::LevelFilter::Info)
+            .filter_module("pocket3d", log::LevelFilter::Info)
+            .try_init();
+        let gpu = Gpu::new_headless().expect("headless GPU is required for VRM acceptance");
+        let mut renderer = Renderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT).unwrap();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let bundle = root.join("dist/character.js");
+        for mode in [MtoonRenderMode::Native, MtoonRenderMode::Fallback] {
+            let mut request =
+                AvatarLoadRequest::new(path.clone(), None, "joint palette acceptance");
+            request.mtoon_render_mode = mode;
+            let candidate = AvatarCandidate::prepare(&gpu, &renderer, &bundle, &request)
+                .unwrap_or_else(|error| panic!("{mode:?} load failed: {error}"));
+            assert_eq!(
+                candidate
+                    .asset
+                    .skins
+                    .iter()
+                    .map(|skin| skin.joints.len())
+                    .sum::<usize>(),
+                561
+            );
+            assert_eq!(
+                candidate.asset.native_mtoon_material_count > 0,
+                mode == MtoonRenderMode::Native
+            );
+            let native_materials = candidate.asset.native_mtoon_material_count;
+            let pixels =
+                render_avatar_smoke(&gpu, &mut renderer, candidate.asset, "large-joint-vrm");
+            eprintln!(
+                "561-joint VRM {mode:?}: load/render succeeded, 35904 palette bytes, {native_materials} native materials, {pixels} visible pixels; device binding limit {} bytes, buffer limit {} bytes",
+                gpu.device.limits().max_storage_buffer_binding_size,
+                gpu.device.limits().max_buffer_size,
+            );
+            assert!(
+                pixels > 100,
+                "{mode:?} produced no visible avatar ({pixels} pixels)"
+            );
+        }
+    }
+
+    #[test]
     fn local_avatar_sample_dual_route_switch_latency() {
         use super::super::controls::ControlAction;
         use crate::menu_guest::MenuAction;
